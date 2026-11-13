@@ -1,0 +1,28 @@
+[package]
+name = "grx-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grx-core.workspace = true
+grx-transport = { path = "../grx-transport" }
+grx-video = { path = "../grx-video" }
+grx-input = { path = "../grx-input" }
+grx-render = { path = "../grx-render" }
+grx-audio = { path = "../grx-audio" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2 = "0.5"
+ctrlc = "3"
+# Manettes génériques (Switch Pro...) via Windows.Gaming.Input : pur Rust, aucune bibliothèque C.
+gilrs = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+# DualShock 4 / DualSense : implémentation HID Windows native (pur Rust, pas de cmake ni de C).
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[build-dependencies]
+winresource.workspace = true

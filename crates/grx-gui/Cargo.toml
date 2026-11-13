@@ -1,0 +1,33 @@
+[package]
+name = "grx-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grx-gui"
+path = "src/main.rs"
+
+[dependencies]
+grx-core.workspace = true
+grx-portmap = { path = "../grx-portmap" }
+grx-update.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+qrcode = { version = "0.14", default-features = false }
+arboard = { version = "3", default-features = false }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+rqrr = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winresource.workspace = true

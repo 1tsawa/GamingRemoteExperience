@@ -1,0 +1,16 @@
+[package]
+name = "grx-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+dirs.workspace = true
+curve25519-dalek = "4.1.3"

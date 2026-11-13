@@ -1,0 +1,20 @@
+# Sorties de compilation (target, target-setup, target-drag...)
+/target*/
+# Releases préparées par tools/release.ps1
+/dist/
+# Clés et secrets : la clé privée de signature vit dans %USERPROFILE%\.grx-release, JAMAIS ici
+*.key
+*.pem
+*.pfx
+signing.key*
+# Données d'exécution (identités, listes de confiance, jetons)
+identity.json
+trust.json
+hosts.json
+status.json
+# Divers
+*.log
+__pycache__/
+*.pyc
+.vs/
+.idea/

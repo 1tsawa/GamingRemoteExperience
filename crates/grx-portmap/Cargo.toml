@@ -1,0 +1,12 @@
+[package]
+name = "grx-portmap"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+igd-next = { version = "0.16", default-features = false }
+rand.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

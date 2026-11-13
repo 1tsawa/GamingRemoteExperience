@@ -1,0 +1,25 @@
+[package]
+name = "grx-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grx-core.workspace = true
+grx-transport = { path = "../grx-transport" }
+grx-video = { path = "../grx-video" }
+grx-audio = { path = "../grx-audio" }
+grx-input = { path = "../grx-input" }
+grx-portmap = { path = "../grx-portmap" }
+anyhow.workspace = true
+rand.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2 = "0.5"
+ctrlc = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[build-dependencies]
+winresource.workspace = true

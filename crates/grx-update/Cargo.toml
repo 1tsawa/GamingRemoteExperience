@@ -1,0 +1,26 @@
+[package]
+name = "grx-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mises à jour signées (Ed25519) de GamingRemoteExperience via GitHub Releases"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+data-encoding.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+ed25519-dalek = "2"
+semver = "1"
+ureq = "2"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[[bin]]
+name = "grx-release-tool"
+path = "src/bin/grx-release-tool.rs"

@@ -1,0 +1,12 @@
+[package]
+name = "grx-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transport media temps réel (vidéo/audio/entrées/contrôle) sans I/O, au-dessus des paquets chiffrés grx-core"
+
+# Le cœur est en Rust pur, sans I/O et sans dépendance externe.
+[dependencies]
+
+[dev-dependencies]
+grx-core = { path = "../grx-core" }
