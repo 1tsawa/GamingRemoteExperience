@@ -61,7 +61,7 @@ fn menu_drag_is_clamped_inside_window() {
 fn click_in_rows_does_not_drag() {
     let mut o = ov();
     o.open_menu();
-    let r = o.row_rect(row_index(Row::Stats));
+    let r = o.row_rect(o.row_index(Row::Stats));
     let center = (r.x + r.w / 2.0, r.y + r.h / 2.0);
     o.on_ev(Ev::Move(center.0, center.1));
     o.on_ev(Ev::Down(center.0, center.1));
@@ -179,7 +179,7 @@ fn presets_and_reset_rows() {
     assert_eq!(o.menu_pos, DEFAULT_MENU_POS);
     o.on_ev(Ev::Up);
     
-    o.focus = row_index(Row::StatsPos);
+    o.focus = o.row_index(Row::StatsPos);
     o.on_ev(Ev::Nav(Nav::Right));
     assert_eq!(o.stats_pos, Preset::Center.frac());
 }

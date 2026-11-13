@@ -22,6 +22,8 @@ windows = { version = "0.58", features = [
     "Win32_System_Performance",
     "Win32_Media",
     "Win32_Graphics_Gdi",
+    "Win32_Devices_Display",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

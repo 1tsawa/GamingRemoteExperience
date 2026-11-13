@@ -80,6 +80,7 @@ mod tests {
             injector: InjectorConfig::default(),
             initial_bitrate_bps: 20_000_000,
             max_bitrate_bps: 50_000_000,
+            display: None,
         }
     }
 

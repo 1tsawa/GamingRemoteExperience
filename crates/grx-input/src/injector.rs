@@ -194,6 +194,10 @@ impl<K: InputSink, G: GamepadSink> InputInjector<K, G> {
         &self.kb
     }
 
+    pub fn keyboard_mouse_mut(&mut self) -> &mut K {
+        &mut self.kb
+    }
+
     pub fn gamepads(&self) -> &G {
         &self.pad
     }

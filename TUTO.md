@@ -87,6 +87,7 @@ Options utiles de `run` :
 | `--no-input` | L'ami voit l'écran mais ne peut rien contrôler |
 | `--no-audio` | Pas de son |
 | `--fill` | Débit d'images constant même sur un écran fixe (utile pour mesurer) |
+| `--display 2` | Écran capturé au début de la session (1, 2… de gauche à droite, la liste s'affiche au lancement ; défaut : l'écran principal). L'ami peut en changer depuis son menu |
 
 > **Pare-feu Windows** : au premier lancement, Windows peut demander « Autoriser l'accès ». Cochez **Privé** et validez.
 > En cas de doute, `grx-host.exe firewall-help` affiche la commande à lancer en administrateur.
@@ -120,6 +121,7 @@ Options utiles de `run` :
 | `Ctrl+Maj+M` | **Menu en overlay** (comme Parsec), voir ci-dessous ; même raccourci pour le fermer (ou `Échap`) |
 | `Ctrl+Maj+S` | Statistiques détaillées à l'écran (FPS, débit, RTT, perte, latences, résolution, codec) |
 | `Ctrl+Maj+Q` | Déconnexion |
+| `Ctrl+Maj+←` / `Ctrl+Maj+→` | Écran précédent / suivant du PC host (s'il en a plusieurs) |
 | `F11` | Plein écran / fenêtré |
 | `F10` | Stats (FPS, débit, ping, pertes) dans le titre de la fenêtre |
 | `Ctrl+Alt+Maj+G` | Capture de la souris en mode relatif (jeux FPS) ; même raccourci pour sortir |
@@ -136,6 +138,7 @@ Ces raccourcis ne sont jamais envoyés au PC host.
 | Volume | curseur 0-100 % + bouton Son/Muet |
 | Bande passante max | plafond de débit envoyé au host, de 2 Mb/s jusqu'à « Auto » (= maximum du host, `--max-bitrate`) ; appliqué en ~1 s |
 | FPS max | 30 / 60 / 120 / 144 selon la fréquence de votre écran ; le host ne dépasse jamais son `--fps` (lancez-le avec `--fps 144` pour jouer à 144) |
+| Écran | un bouton par écran du PC host (« 1 », « 2 »… de gauche à droite, l'écran affiché en bleu ; au survol : nom et résolution, `*` = écran principal). Bascule en quelques dizaines de ms sans couper la session ni le son ; aussi `Ctrl+Maj+←/→`. Ligne absente si le host n'a qu'un écran |
 | Capture souris | active la capture relative à la fermeture du menu |
 | Verrouiller le clavier | `Win`, `Alt+Tab`, `Alt+Échap`, `Ctrl+Échap`, `Alt+Espace` partent au host au lieu d'agir sur votre PC (`Ctrl+Alt+Suppr` et `Win+L` restent à Windows) |
 | VSync | synchronisation verticale (désactivée par défaut : latence minimale) |
@@ -153,9 +156,9 @@ Ces raccourcis ne sont jamais envoyés au PC host.
 
 Les éléments restent toujours entièrement visibles : leur position est relative à la fenêtre, elle suit donc les redimensionnements et le passage en plein écran.
 
-**Réglages mémorisés** : positions, statistiques affichées, bouton flottant, volume/muet, VSync, capture souris, bande passante et FPS max sont enregistrés dans `overlay.json` (dossier de données du client, `%APPDATA%\GamingRemoteExperience\client`) et rétablis à la session suivante ; la bande passante et les FPS mémorisés sont renvoyés au host dès la connexion. Fichier supprimé ou abîmé = réglages par défaut. `--vsync` ou un `--volume` explicite l'emportent sur la valeur mémorisée.
+**Réglages mémorisés** : positions, statistiques affichées, bouton flottant, volume/muet, VSync, capture souris, bande passante, FPS max et écran choisi sont enregistrés dans `overlay.json` (dossier de données du client, `%APPDATA%\GamingRemoteExperience\client`) et rétablis à la session suivante ; la bande passante et les FPS mémorisés sont renvoyés au host dès la connexion, et l'écran choisi est redemandé s'il existe encore (même nom, résolution et position). Fichier supprimé ou abîmé = réglages par défaut. `--vsync` ou un `--volume` explicite l'emportent sur la valeur mémorisée.
 
-Le bas du menu affiche les limites du host et les plafonds qu'il a réellement appliqués. Un client en lecture seule peut aussi régler sa bande passante et ses FPS. Pas encore de choix de l'écran ni de la résolution du PC host (évolution future).
+Le bas du menu affiche les limites du host et les plafonds qu'il a réellement appliqués. Un client en lecture seule peut aussi régler sa bande passante et ses FPS, et choisir l'écran affiché. Les statistiques indiquent l'écran affiché (« 2/3 VG27A » = 2e écran sur 3). La souris (hors mode capture) vise bien l'écran affiché. Pas encore de choix de la résolution du PC host (évolution future).
 
 **Curseur** : le curseur affiché sur l'image est celui **du PC host** (forme personnalisée du jeu comprise, ex. World of Warcraft) ; votre curseur Windows est masqué au-dessus de la vidéo et réapparaît sur les bandes noires. Il reste affiché en mode capture souris, et disparaît quand le jeu le cache (caméra au clic droit). Pour retrouver l'ancien comportement (votre curseur Windows local, pas celui du host) : `--local-cursor`, par exemple `.\grx-client.exe play pc-ludo --local-cursor`.
 

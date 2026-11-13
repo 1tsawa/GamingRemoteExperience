@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use grx_core::displays::{DisplayInfo, DisplayList};
 use grx_core::stream_settings::{HostInfo, StreamSettings};
 use grx_render::winit::event::{ElementState, MouseButton as WinButton, MouseScrollDelta, WindowEvent};
 use grx_render::winit::keyboard::{KeyCode, PhysicalKey};
@@ -28,9 +29,13 @@ pub enum Hot {
     ToggleMenu,
     ToggleStats,
     Disconnect,
+    /// Écran distant précédent / suivant (Ctrl+Maj+← / →).
+    PrevDisplay,
+    NextDisplay,
 }
 
-/// `Ctrl+Maj+M` menu, `Ctrl+Maj+S` stats, `Ctrl+Maj+Q` déconnexion (sans Alt).
+/// `Ctrl+Maj+M` menu, `Ctrl+Maj+S` stats, `Ctrl+Maj+Q` déconnexion, `Ctrl+Maj+←/→` écran
+/// distant précédent/suivant (sans Alt).
 pub fn classify_hotkey(code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> Option<Hot> {
     if !ctrl || !shift || alt {
         return None;
@@ -39,6 +44,8 @@ pub fn classify_hotkey(code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> Opt
         KeyCode::KeyM => Some(Hot::ToggleMenu),
         KeyCode::KeyS => Some(Hot::ToggleStats),
         KeyCode::KeyQ => Some(Hot::Disconnect),
+        KeyCode::ArrowLeft => Some(Hot::PrevDisplay),
+        KeyCode::ArrowRight => Some(Hot::NextDisplay),
         _ => None,
     }
 }
@@ -53,6 +60,8 @@ pub enum Row {
     Volume,
     Bandwidth,
     Fps,
+    /// Écran distant (masquée s'il n'y en a qu'un).
+    Display,
     Capture,
     KbdLock,
     Vsync,
@@ -63,12 +72,13 @@ pub enum Row {
     Disconnect,
 }
 
-const ROWS: [Row; 13] = [
+const ROWS: [Row; 14] = [
     Row::Fullscreen,
     Row::Stats,
     Row::Volume,
     Row::Bandwidth,
     Row::Fps,
+    Row::Display,
     Row::Capture,
     Row::KbdLock,
     Row::Vsync,
@@ -89,6 +99,8 @@ pub enum Action {
     SendSettings(StreamSettings),
     SetKbdLock(bool),
     SetVsync(bool),
+    /// Demander au host de capturer l'écran d'index donné (`GRX-MON`).
+    SelectDisplay(u8),
     Disconnect,
     /// Menu ouvert : relâcher les entrées tenues côté host, suspendre la capture souris.
     MenuOpened,
@@ -145,6 +157,8 @@ enum Hit {
     Slider(Row),
     Mute,
     Segment(u32),
+    /// Bouton d'écran distant (index dans la liste du host).
+    Display(usize),
     /// Barre de titre du menu (poignée de déplacement).
     Title,
     /// Panneau des statistiques (déplaçable quand le menu est ouvert).
@@ -236,6 +250,14 @@ pub struct Overlay {
     pub monitor_hz: u32,
     /// Ligne d'état des manettes (vide : non affichée), mise à jour par `play.rs`.
     pub gamepads: String,
+    /// Écrans du host (`GRX-DSP`), vide avec un host ancien.
+    pub displays: Vec<DisplayInfo>,
+    /// Écran capturé (index dans `displays`).
+    pub active_display: Option<usize>,
+    /// Écran choisi par l'utilisateur ([`display_key`]), mémorisé dans `overlay.json`.
+    pub preferred_display: Option<String>,
+    /// Le choix mémorisé a déjà été redemandé au host pour cette connexion.
+    display_restored: bool,
     view_w: f32,
     view_h: f32,
     pub scale: f32,
@@ -272,6 +294,10 @@ impl Overlay {
             audio_enabled: true,
             monitor_hz: 60,
             gamepads: String::new(),
+            displays: Vec::new(),
+            active_display: None,
+            preferred_display: None,
+            display_restored: false,
             view_w: 1280.0,
             view_h: 720.0,
             scale: 1.0,
@@ -298,6 +324,7 @@ impl Overlay {
         self.capture = p.capture;
         self.bitrate_cap_mbps = p.bitrate_cap_mbps;
         self.fps_cap = p.fps_cap;
+        self.preferred_display = p.display.clone();
     }
 
     /// Préférences à mémoriser (positions + réglages du menu, aucun secret).
@@ -314,6 +341,7 @@ impl Overlay {
             capture: self.capture,
             bitrate_cap_mbps: self.bitrate_cap_mbps,
             fps_cap: self.fps_cap,
+            display: self.preferred_display.clone(),
             ..OverlayPrefs::default()
         }
     }
@@ -407,6 +435,66 @@ impl Overlay {
         self.fps_cap.unwrap_or_else(|| self.host.map_or(60, |h| h.host_fps))
     }
 
+    // ── écrans distants ──
+
+    /// Lignes affichées : « Écran » seulement si le host en propose plusieurs.
+    pub fn rows(&self) -> Vec<Row> {
+        ROWS.iter().copied().filter(|&r| r != Row::Display || self.displays.len() > 1).collect()
+    }
+
+    /// Position d'une ligne dans [`Self::rows`] (0 si elle est masquée).
+    pub fn row_index(&self, r: Row) -> usize {
+        self.rows().iter().position(|&x| x == r).unwrap_or(0)
+    }
+
+    fn focused_row(&self) -> Row {
+        let rows = self.rows();
+        rows[self.focus.min(rows.len() - 1)]
+    }
+
+    /// Nouvelle annonce du host. À la première annonce de la connexion, redemande l'écran
+    /// mémorisé s'il existe encore (et n'est pas déjà capturé).
+    pub fn set_displays(&mut self, l: DisplayList) -> Vec<Action> {
+        let focused = self.focused_row();
+        self.displays = l.displays;
+        self.active_display = l.active.map(usize::from).filter(|&i| i < self.displays.len());
+        self.focus = self.row_index(focused);
+        if self.display_restored {
+            return vec![];
+        }
+        self.display_restored = true;
+        let Some(want) = self.preferred_display.as_deref() else { return vec![] };
+        match self.displays.iter().position(|d| display_key(d) == want) {
+            Some(i) if Some(i) != self.active_display => {
+                self.active_display = Some(i);
+                vec![Action::SelectDisplay(i as u8)]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Choix de l'écran `i` (clic, clavier, raccourci).
+    pub fn select_display(&mut self, i: usize) -> Vec<Action> {
+        let Some(d) = self.displays.get(i) else { return vec![] };
+        self.preferred_display = Some(display_key(d));
+        if self.active_display == Some(i) {
+            return vec![];
+        }
+        // Affiché tout de suite ; l'annonce suivante du host confirme (ou corrige).
+        self.active_display = Some(i);
+        vec![Action::SelectDisplay(i as u8)]
+    }
+
+    /// Écran précédent (`dir` < 0) / suivant, en boucle. Rien avec un seul écran.
+    pub fn cycle_display(&mut self, dir: i32) -> Vec<Action> {
+        let n = self.displays.len() as i32;
+        if n < 2 {
+            return vec![];
+        }
+        let cur = self.active_display.map_or(0, |i| i as i32);
+        self.select_display((cur + dir.signum()).rem_euclid(n) as usize)
+    }
+
     // ── ouverture / fermeture ──
 
     pub fn open_menu(&mut self) -> Vec<Action> {
@@ -444,6 +532,8 @@ impl Overlay {
                 vec![]
             }
             Hot::Disconnect => vec![Action::Disconnect],
+            Hot::PrevDisplay => self.cycle_display(-1),
+            Hot::NextDisplay => self.cycle_display(1),
         }
     }
 
@@ -495,6 +585,7 @@ impl Overlay {
                     Some(Hit::Row(r) | Hit::Slider(r) | Hit::Preset(r, _)) => Some(r),
                     Some(Hit::Mute) => Some(Row::Volume),
                     Some(Hit::Segment(_)) => Some(Row::Fps),
+                    Some(Hit::Display(_)) => Some(Row::Display),
                     _ => None,
                 };
                 let a = match row {
@@ -507,18 +598,19 @@ impl Overlay {
                 if !self.menu_open {
                     return (false, vec![]);
                 }
+                let n_rows = self.rows().len();
                 let a = match n {
                     Nav::Up => {
-                        self.focus = (self.focus + ROWS.len() - 1) % ROWS.len();
+                        self.focus = (self.focus.min(n_rows - 1) + n_rows - 1) % n_rows;
                         vec![]
                     }
                     Nav::Down => {
-                        self.focus = (self.focus + 1) % ROWS.len();
+                        self.focus = (self.focus + 1) % n_rows;
                         vec![]
                     }
-                    Nav::Left => self.adjust(ROWS[self.focus], -1),
-                    Nav::Right => self.adjust(ROWS[self.focus], 1),
-                    Nav::Activate => self.activate(ROWS[self.focus]),
+                    Nav::Left => self.adjust(self.focused_row(), -1),
+                    Nav::Right => self.adjust(self.focused_row(), 1),
+                    Nav::Activate => self.activate(self.focused_row()),
                     Nav::Close => self.close_menu(),
                 };
                 (true, a)
@@ -540,26 +632,30 @@ impl Overlay {
                 vec![]
             }
             Some(Hit::Preset(r, i)) => {
-                self.focus = row_index(r);
+                self.focus = self.row_index(r);
                 self.apply_preset(r, i);
                 vec![]
             }
             Some(Hit::Mute) => {
-                self.focus = row_index(Row::Volume);
+                self.focus = self.row_index(Row::Volume);
                 self.muted = !self.muted;
                 vec![Action::SetVolume(self.effective_volume())]
             }
             Some(Hit::Segment(f)) => {
-                self.focus = row_index(Row::Fps);
+                self.focus = self.row_index(Row::Fps);
                 self.set_fps(f)
             }
+            Some(Hit::Display(i)) => {
+                self.focus = self.row_index(Row::Display);
+                self.select_display(i)
+            }
             Some(Hit::Slider(r)) => {
-                self.focus = row_index(r);
+                self.focus = self.row_index(r);
                 self.drag = Some(r);
                 self.slide(r, x)
             }
             Some(Hit::Row(r)) => {
-                self.focus = row_index(r);
+                self.focus = self.row_index(r);
                 self.activate(r)
             }
         }
@@ -702,6 +798,7 @@ impl Overlay {
                 self.cycle_preset(row, dir);
                 vec![]
             }
+            Row::Display => self.cycle_display(dir),
             // Les interrupteurs : droite = activer, gauche = désactiver.
             r => {
                 let on = dir > 0;
@@ -755,6 +852,7 @@ impl Overlay {
                 vec![Action::SetVolume(self.effective_volume())]
             }
             Row::Bandwidth | Row::Fps => vec![],
+            Row::Display => self.cycle_display(1),
             Row::MenuPos | Row::StatsPos => {
                 self.apply_preset(r, Preset::ALL.len());
                 vec![]
@@ -789,7 +887,7 @@ impl Overlay {
     fn panel_rect(&self) -> Rect {
         let help = if self.show_shortcuts { HELP_LINES.len() as f32 * HELP_LINE_H + 10.0 } else { 0.0 };
         let pads = if self.gamepads.is_empty() { 0.0 } else { PADS_H };
-        let h = TITLE_H + ROWS.len() as f32 * ROW_H + help + FOOTER_H + pads + 8.0;
+        let h = TITLE_H + self.rows().len() as f32 * ROW_H + help + FOOTER_H + pads + 8.0;
         let w = PANEL_W.min(self.view_w - 16.0).max(200.0);
         let (x, y) = place(self.menu_pos, (w, h), (self.view_w, self.view_h), MARGIN);
         Rect::new(x, y, w, h)
@@ -804,7 +902,7 @@ impl Overlay {
 
     /// Segments de la ligne « Position » : 5 préréglages + réinitialiser.
     fn preset_rects(&self, row: Row) -> Vec<Rect> {
-        let w = self.widget_rect(row_index(row));
+        let w = self.widget_rect(self.row_index(row));
         let n = Preset::ALL.len() + 1;
         let gap = 4.0;
         let sw = (w.w - gap * (n as f32 - 1.0)) / n as f32;
@@ -824,7 +922,7 @@ impl Overlay {
     }
 
     fn slider_rect(&self, row: Row) -> Option<Rect> {
-        let w = self.widget_rect(row_index(row));
+        let w = self.widget_rect(self.row_index(row));
         match row {
             Row::Volume => Some(Rect::new(w.x + 8.0, w.y, (w.w - 120.0).max(30.0), w.h)),
             Row::Bandwidth => Some(Rect::new(w.x + 8.0, w.y, (w.w - 96.0).max(30.0), w.h)),
@@ -833,16 +931,25 @@ impl Overlay {
     }
 
     fn mute_rect(&self) -> Rect {
-        let w = self.widget_rect(row_index(Row::Volume));
+        let w = self.widget_rect(self.row_index(Row::Volume));
         Rect::new(w.x + w.w - 58.0, w.y + 7.0, 58.0, w.h - 14.0)
     }
 
     fn segment_rects(&self) -> Vec<(u32, Rect)> {
-        let w = self.widget_rect(row_index(Row::Fps));
+        let w = self.widget_rect(self.row_index(Row::Fps));
         let opts = self.fps_options();
         let gap = 6.0;
         let sw = (w.w - gap * (opts.len() as f32 - 1.0)) / opts.len() as f32;
         opts.iter().enumerate().map(|(i, &f)| (f, Rect::new(w.x + i as f32 * (sw + gap), w.y + 7.0, sw, w.h - 14.0))).collect()
+    }
+
+    /// Boutons « 1 », « 2 »… de la ligne « Écran » (largeur bornée, alignés à gauche).
+    fn display_rects(&self) -> Vec<(usize, Rect)> {
+        let w = self.widget_rect(self.row_index(Row::Display));
+        let n = self.displays.len().max(1);
+        let gap = 6.0;
+        let sw = ((w.w - gap * (n as f32 - 1.0)) / n as f32).min(48.0);
+        (0..self.displays.len()).map(|i| (i, Rect::new(w.x + i as f32 * (sw + gap), w.y + 7.0, sw, w.h - 14.0))).collect()
     }
 
     fn close_rect(&self) -> Rect {
@@ -873,7 +980,7 @@ impl Overlay {
         if y < p.y + TITLE_H {
             return Some(Hit::Title);
         }
-        for (i, &r) in ROWS.iter().enumerate() {
+        for (i, &r) in self.rows().iter().enumerate() {
             if !self.row_rect(i).contains(x, y) {
                 continue;
             }
@@ -883,6 +990,11 @@ impl Overlay {
             if r == Row::Fps {
                 if let Some((f, _)) = self.segment_rects().into_iter().find(|(_, s)| s.contains(x, y)) {
                     return Some(Hit::Segment(f));
+                }
+            }
+            if r == Row::Display {
+                if let Some((d, _)) = self.display_rects().into_iter().find(|(_, s)| s.contains(x, y)) {
+                    return Some(Hit::Display(d));
                 }
             }
             if matches!(r, Row::MenuPos | Row::StatsPos) {
@@ -943,6 +1055,7 @@ impl Overlay {
                     ("Affichage".into(), format!("{:.2} ms", st.pres_ms)),
                     ("Capture→écran".into(), format!("~{:.1} ms", st.e2e_ms)),
                     ("Perdues/écartées".into(), format!("{} / {}", st.frames_lost, st.dropped)),
+                    ("Écran".into(), self.display_summary()),
                 ]
             }
         };
@@ -956,6 +1069,14 @@ impl Overlay {
             let y = r.y + 7.0 + i as f32 * lh;
             s.text(Rect::new(r.x + 12.0, y, 130.0, lh), k.as_str(), 12.5, DIM, Align::Left, Font::Mono);
             s.text(Rect::new(r.x + 140.0, y, r.w - 152.0, lh), v.as_str(), 12.5, TEXT, Align::Right, Font::Mono);
+        }
+    }
+
+    /// « 2/3 VG27A » (écran capturé / nombre d'écrans), « - » si le host ne l'annonce pas.
+    pub fn display_summary(&self) -> String {
+        match self.active_display.and_then(|i| self.displays.get(i).map(|d| (i, d))) {
+            Some((i, d)) => format!("{}/{} {}", i + 1, self.displays.len(), if d.name.is_empty() { "Écran" } else { &d.name }),
+            None => "-".into(),
         }
     }
 
@@ -1002,10 +1123,12 @@ impl Overlay {
             Some(Hit::Row(r) | Hit::Slider(r)) => Some(r),
             Some(Hit::Mute) => Some(Row::Volume),
             Some(Hit::Segment(_)) => Some(Row::Fps),
+            Some(Hit::Display(_)) => Some(Row::Display),
             Some(Hit::Preset(r, _)) => Some(r),
             _ => None,
         };
-        for (i, &row) in ROWS.iter().enumerate() {
+        let rows = self.rows();
+        for (i, &row) in rows.iter().enumerate() {
             let r = self.row_rect(i);
             let enabled = self.row_enabled(row);
             if row == Row::Disconnect {
@@ -1026,6 +1149,16 @@ impl Overlay {
             if let Some(Hit::Preset(r, j)) = self.hit() {
                 if r == row {
                     hint = Preset::ALL.get(j).map_or("Réinitialiser", |p| p.label()).to_string();
+                }
+            }
+            if row == Row::Display {
+                // Survol d'un bouton : nom et résolution de cet écran ; sinon l'écran capturé.
+                let shown = match self.hit() {
+                    Some(Hit::Display(j)) => Some(j),
+                    _ => self.active_display,
+                };
+                if let Some((j, d)) = shown.and_then(|j| self.displays.get(j).map(|d| (j, d))) {
+                    hint = display_hint(j, d);
                 }
             }
             let lc = if enabled { TEXT } else { DIM };
@@ -1066,6 +1199,25 @@ impl Overlay {
                         s.text(sr, f.to_string(), 13.0, col, Align::Center, Font::UiBold);
                     }
                 }
+                Row::Display => {
+                    let hov = match self.hit() {
+                        Some(Hit::Display(j)) => Some(j),
+                        _ => None,
+                    };
+                    for (j, sr) in self.display_rects() {
+                        let on = self.active_display == Some(j);
+                        let bg = if on {
+                            ACCENT
+                        } else if hov == Some(j) {
+                            TRACK.with_alpha(0.30)
+                        } else {
+                            TRACK.with_alpha(0.12)
+                        };
+                        s.fill(sr, 6.0, bg);
+                        let col = if on { Color::rgb(255, 255, 255) } else { TEXT };
+                        s.text(sr, (j + 1).to_string(), 13.0, col, Align::Center, Font::UiBold);
+                    }
+                }
                 Row::MenuPos | Row::StatsPos => {
                     let cur = if row == Row::MenuPos { self.menu_pos } else { self.stats_pos };
                     let sel = Preset::matching(cur);
@@ -1099,7 +1251,7 @@ impl Overlay {
             }
         }
 
-        let mut y = self.row_rect(ROWS.len() - 1).y + ROW_H + 4.0;
+        let mut y = self.row_rect(rows.len() - 1).y + ROW_H + 4.0;
         if self.show_shortcuts {
             for (k, d) in HELP_LINES {
                 let k = if k.is_empty() { self.capture_key.as_str() } else { k };
@@ -1128,12 +1280,13 @@ impl Overlay {
 }
 
 /// Lignes du panneau de statistiques quand elles sont disponibles (voir `draw_stats`).
-const STATS_LINES: usize = 10;
+const STATS_LINES: usize = 11;
 
-const HELP_LINES: [(&str, &str); 8] = [
+const HELP_LINES: [(&str, &str); 9] = [
     ("Ctrl+Maj+M", "Ouvrir / fermer ce menu"),
     ("Ctrl+Maj+S", "Statistiques à l'écran"),
     ("Ctrl+Maj+Q", "Déconnexion"),
+    ("Ctrl+Maj+\u{2190}/\u{2192}", "Écran distant précédent / suivant"),
     ("F11", "Plein écran / fenêtré"),
     ("F10", "Statistiques dans le titre"),
     ("", "Capture souris (mode relatif)"),
@@ -1141,8 +1294,24 @@ const HELP_LINES: [(&str, &str); 8] = [
     ("Alt+F4", "Quitter"),
 ];
 
-fn row_index(r: Row) -> usize {
-    ROWS.iter().position(|&x| x == r).unwrap_or(0)
+/// Info-bulle d'un bouton d'écran (sous le libellé, ~26 caractères) : « 2: VG27A 2560x1440 » ;
+/// un nom trop long est abrégé pour garder la résolution visible, `*` = écran principal.
+pub fn display_hint(i: usize, d: &DisplayInfo) -> String {
+    let dims = format!("{}x{}{}", d.width, d.height, if d.primary { "*" } else { "" });
+    let name = if d.name.is_empty() { "Écran" } else { d.name.as_str() };
+    let room = 26usize.saturating_sub(dims.len() + 4);
+    let name: String = if name.chars().count() > room {
+        name.chars().take(room.saturating_sub(1)).collect::<String>() + "\u{2026}"
+    } else {
+        name.to_string()
+    };
+    format!("{}: {name} {dims}", i + 1)
+}
+
+/// Identifiant mémorisé d'un écran du host : nom + taille + position (deux moniteurs du même
+/// modèle ont le même nom).
+pub fn display_key(d: &DisplayInfo) -> String {
+    format!("{} {}x{} @{},{}", d.name, d.width, d.height, d.left, d.top)
 }
 
 fn row_label(r: Row, capture_key: &str) -> (&'static str, String) {
@@ -1152,6 +1321,7 @@ fn row_label(r: Row, capture_key: &str) -> (&'static str, String) {
         Row::Volume => ("Volume", ""),
         Row::Bandwidth => ("Bande passante max", ""),
         Row::Fps => ("FPS max", ""),
+        Row::Display => ("Écran", "Ctrl+Maj+\u{2190}/\u{2192}"),
         Row::Capture => ("Capture souris", ""),
         Row::KbdLock => ("Verrouiller le clavier", "Win, Alt+Tab -> host"),
         Row::Vsync => ("VSync", ""),
@@ -1293,6 +1463,10 @@ impl OverlayInput {
 mod drag_tests;
 
 #[cfg(test)]
+#[path = "overlay_display_tests.rs"]
+mod display_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1367,32 +1541,32 @@ mod tests {
     fn toggles_by_click_and_keyboard() {
         let mut o = ov();
         o.open_menu();
-        let (x, y) = center(o.row_rect(row_index(Row::Fullscreen)));
+        let (x, y) = center(o.row_rect(o.row_index(Row::Fullscreen)));
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![Action::SetFullscreen(true)]);
         assert_eq!(o.on_ev(Ev::Nav(Nav::Activate)).1, vec![Action::SetFullscreen(false)]);
         // Navigation jusqu'à VSync puis droite = activer, droite encore = rien.
-        while ROWS[o.focus] != Row::Vsync {
+        while o.rows()[o.focus] != Row::Vsync {
             o.on_ev(Ev::Nav(Nav::Down));
         }
         assert_eq!(o.on_ev(Ev::Nav(Nav::Right)).1, vec![Action::SetVsync(true)]);
         assert_eq!(o.on_ev(Ev::Nav(Nav::Right)).1, vec![]);
         assert_eq!(o.on_ev(Ev::Nav(Nav::Left)).1, vec![Action::SetVsync(false)]);
         // Stats : sans action externe, juste l'état.
-        let (x, y) = center(o.row_rect(row_index(Row::Stats)));
+        let (x, y) = center(o.row_rect(o.row_index(Row::Stats)));
         o.on_ev(Ev::Down(x, y));
         assert!(o.show_stats);
         // Capture : différée à la fermeture.
-        let (x, y) = center(o.row_rect(row_index(Row::Capture)));
+        let (x, y) = center(o.row_rect(o.row_index(Row::Capture)));
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![]);
         assert!(o.capture);
-        let (x, y) = center(o.row_rect(row_index(Row::KbdLock)));
+        let (x, y) = center(o.row_rect(o.row_index(Row::KbdLock)));
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![Action::SetKbdLock(true)]);
-        let (x, y) = center(o.row_rect(row_index(Row::Disconnect)));
+        let (x, y) = center(o.row_rect(o.row_index(Row::Disconnect)));
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![Action::Disconnect]);
         // Wrap de la navigation.
         o.focus = 0;
         o.on_ev(Ev::Nav(Nav::Up));
-        assert_eq!(ROWS[o.focus], Row::Disconnect);
+        assert_eq!(o.rows()[o.focus], Row::Disconnect);
     }
 
     #[test]
@@ -1400,7 +1574,7 @@ mod tests {
         let mut o = ov();
         o.input_enabled = false;
         o.open_menu();
-        let (x, y) = center(o.row_rect(row_index(Row::KbdLock)));
+        let (x, y) = center(o.row_rect(o.row_index(Row::KbdLock)));
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![]);
         assert!(!o.kbd_lock);
     }
@@ -1423,7 +1597,7 @@ mod tests {
         o.on_ev(Ev::Up);
         assert_eq!(o.on_ev(Ev::Move(t.x, t.y)).1, vec![], "plus de glissement après relâchement");
         // Clavier : gauche depuis Auto = dernier palier < max.
-        o.focus = row_index(Row::Bandwidth);
+        o.focus = o.row_index(Row::Bandwidth);
         let (_, a) = o.on_ev(Ev::Nav(Nav::Left));
         assert_eq!(a, vec![Action::SendSettings(StreamSettings { max_bitrate_kbps: Some(40_000), max_fps: None })]);
         assert_eq!(o.bitrate_cap_mbps, Some(40));
@@ -1446,7 +1620,7 @@ mod tests {
         let (x, y) = center(r);
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![Action::SendSettings(StreamSettings { max_bitrate_kbps: None, max_fps: Some(30) })]);
         assert_eq!(o.on_ev(Ev::Down(x, y)).1, vec![], "même choix : rien à envoyer");
-        o.focus = row_index(Row::Fps);
+        o.focus = o.row_index(Row::Fps);
         assert_eq!(o.on_ev(Ev::Nav(Nav::Right)).1, vec![Action::SendSettings(StreamSettings { max_bitrate_kbps: None, max_fps: Some(60) })]);
     }
 
@@ -1466,7 +1640,7 @@ mod tests {
         let (_, a) = o.on_ev(Ev::Wheel(1.0));
         assert_eq!(a, vec![Action::SetVolume(0.55)]);
         o.audio_enabled = false;
-        o.focus = row_index(Row::Volume);
+        o.focus = o.row_index(Row::Volume);
         assert_eq!(o.on_ev(Ev::Nav(Nav::Activate)).1, vec![]);
     }
 

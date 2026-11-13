@@ -94,6 +94,8 @@ struct Ui {
     focused: AtomicBool,
     /// Le fil des manettes tourne.
     pads_on: AtomicBool,
+    /// Bascule d'écran demandée (mesure demande -> première image du nouvel écran).
+    display_switch: Mutex<Option<Instant>>,
 }
 
 impl Ui {
@@ -189,6 +191,7 @@ pub fn run(
         pads: Default::default(),
         focused: AtomicBool::new(true),
         pads_on: AtomicBool::new(false),
+        display_switch: Mutex::new(None),
     });
     let stop = Arc::new(AtomicBool::new(false));
     let outcome: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
@@ -392,6 +395,9 @@ fn video_loop(
     let mut err_logged = 0;
     // Pour l'overlay : résolution et codec du flux.
     let (mut res, mut codec_name) = ((0u32, 0u32), String::new());
+    // Liste d'écrans du host déjà vue ; bascule confirmée par le host, en attente de sa 1re image.
+    let mut displays_seen = 0u64;
+    let mut switch_confirmed: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) && !handle.is_closed() {
         if let ConnState::Closed(r) = conn.state() {
@@ -403,7 +409,35 @@ fn video_loop(
             break;
         }
 
+        // Écrans du host : liste/écran actif pour l'overlay, et choix mémorisé redemandé.
+        let ds = conn.displays_serial();
+        if ds != displays_seen {
+            displays_seen = ds;
+            if let (_, Some(l)) = conn.displays() {
+                let mut ov = ui.ov.lock().unwrap();
+                let before = ov.active_display;
+                let actions = ov.set_displays(l.clone());
+                println!("écrans du host : {} | capturé : {}", l.displays.len(), ov.display_summary());
+                for a in actions {
+                    if let crate::overlay::Action::SelectDisplay(i) = a {
+                        *ui.display_switch.lock().unwrap() = Some(Instant::now());
+                        send_display_select(&conn, i);
+                    }
+                }
+                if l.active.map(usize::from) != before || ui.display_switch.lock().unwrap().is_some() {
+                    switch_confirmed = *ui.display_switch.lock().unwrap();
+                }
+                handle.set_overlay(ov.scene());
+            }
+        }
+
         if let Some(f) = conn.recv_video_timeout(Duration::from_millis(20)) {
+            if f.keyframe {
+                if let Some(t0) = switch_confirmed.take() {
+                    *ui.display_switch.lock().unwrap() = None;
+                    println!("écran : première image clé après la bascule reçue {:.1} ms après la demande", t0.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
             let rx_ms = unix_micros().saturating_sub(f.pts_us) as f64 / 1000.0;
             sec_rx += 1;
             if dec.is_none() {
@@ -700,6 +734,10 @@ impl OverlayGlue {
                     });
                 }
                 Action::SetVsync(on) => self.handle.set_vsync(on),
+                Action::SelectDisplay(i) => {
+                    *ui.display_switch.lock().unwrap() = Some(Instant::now());
+                    send_display_select(&self.conn, i);
+                }
                 Action::Disconnect => {
                     println!("overlay : déconnexion demandée");
                     self.handle.close();
@@ -750,6 +788,12 @@ impl OverlayGlue {
             }
         }
     }
+}
+
+/// Demande au host de capturer l'écran `i` (`GRX-MON`).
+fn send_display_select(conn: &ClientConnection, i: u8) {
+    println!("overlay : écran {} demandé", i as u32 + 1);
+    conn.send_control(&grx_core::displays::DisplaySelect { index: i }.encode());
 }
 
 // ---------------------------------------------------------------------------------------------

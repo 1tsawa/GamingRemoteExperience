@@ -271,3 +271,14 @@ impl CursorTracker {
 #[cfg(test)]
 #[path = "cursor_tests.rs"]
 mod tests;
+
+/// Curseur système maintenant : `(affiché, x, y)` en pixels du bureau virtuel (physiques si le
+/// processus est « per-monitor DPI aware », comme `grx-host run`). `None` si l'appel échoue
+/// (bureau sécurisé…). Sert à repositionner le curseur distant juste après une bascule d'écran.
+pub fn cursor_screen_pos() -> Option<(bool, i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
+    let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+    // SAFETY : structure initialisée avec sa taille, pointeur valide le temps de l'appel.
+    unsafe { GetCursorInfo(&mut ci) }.ok()?;
+    Some((ci.flags.0 & CURSOR_SHOWING.0 != 0, ci.ptScreenPos.x, ci.ptScreenPos.y))
+}

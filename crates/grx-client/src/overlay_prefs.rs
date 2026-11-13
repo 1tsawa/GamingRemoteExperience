@@ -18,6 +18,8 @@ pub struct OverlayPrefs {
     pub capture: bool,                // false
     pub bitrate_cap_mbps: Option<u32>,// None
     pub fps_cap: Option<u32>,         // None
+    /// Écran distant choisi (`overlay::display_key`), redemandé à la connexion s'il existe encore.
+    pub display: Option<String>,      // None
 }
 
 impl Default for OverlayPrefs {
@@ -35,6 +37,7 @@ impl Default for OverlayPrefs {
             capture: false,
             bitrate_cap_mbps: None,
             fps_cap: None,
+            display: None,
         }
     }
 }
@@ -59,6 +62,8 @@ impl OverlayPrefs {
 
         self.bitrate_cap_mbps = self.bitrate_cap_mbps.map(|v| v.clamp(1, 1000));
         self.fps_cap = self.fps_cap.map(|v| v.clamp(10, 240));
+        // Clé d'écran bornée (fichier modifiable à la main).
+        self.display = self.display.filter(|d| !d.is_empty()).map(|d| d.chars().take(128).collect());
 
         self
     }
@@ -138,6 +143,15 @@ mod tests {
     }
 
     #[test]
+    fn display_choice_is_optional_and_bounded() {
+        // Ancien fichier sans le champ : None.
+        assert_eq!(OverlayPrefs::from_json(r#"{"volume":0.5}"#).display, None);
+        assert_eq!(OverlayPrefs::from_json(r#"{"display":""}"#).display, None);
+        let long = format!(r#"{{"display":"{}"}}"#, "x".repeat(500));
+        assert_eq!(OverlayPrefs::from_json(&long).display.unwrap().chars().count(), 128);
+    }
+
+    #[test]
     fn test_roundtrip_json() {
         let original = OverlayPrefs {
             version: 1,
@@ -152,6 +166,7 @@ mod tests {
             capture: true,
             bitrate_cap_mbps: Some(50),
             fps_cap: Some(60),
+            display: Some("VG27A 2560x1440 @-2560,0".into()),
         };
         let json = original.to_json();
         let loaded = OverlayPrefs::from_json(&json);

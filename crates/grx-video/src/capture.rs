@@ -22,9 +22,55 @@ pub struct OutputInfo {
     pub vendor_id: u32,
     pub width: u32,
     pub height: u32,
+    /// Coin supérieur gauche dans le bureau virtuel (pixels physiques, peut être négatif).
+    pub left: i32,
+    pub top: i32,
     pub attached_to_desktop: bool,
     /// Moniteur dont le coin supérieur gauche est en (0,0).
     pub primary: bool,
+    /// Nom GDI de la sortie (`\\.\DISPLAY1`), identifiant stable tant que la configuration ne change pas.
+    pub device_name: String,
+    /// Nom convivial du moniteur (DisplayConfig), vide si inconnu.
+    pub friendly_name: String,
+    /// Sortie indirecte (écran virtuel IddCx : Parsec VDD, écrans « fantômes »…).
+    pub is_virtual: bool,
+}
+
+impl OutputInfo {
+    /// Nom à afficher : nom du moniteur, sinon `DISPLAYn`.
+    pub fn display_name(&self) -> String {
+        if !self.friendly_name.is_empty() {
+            return self.friendly_name.clone();
+        }
+        self.device_name.trim_start_matches(r"\\.\").to_string()
+    }
+}
+
+/// Écrans capturables, dans l'ordre présenté à l'utilisateur : sorties rattachées au bureau
+/// (les sorties inactives/déconnectées sont exclues), de surface non nulle, une seule fois par
+/// nom GDI, triées de gauche à droite puis de haut en bas.
+pub fn capturable(outs: &[OutputInfo]) -> Vec<OutputInfo> {
+    let mut v: Vec<OutputInfo> = Vec::new();
+    for o in outs.iter().filter(|o| o.attached_to_desktop && o.width > 0 && o.height > 0) {
+        if !o.device_name.is_empty() && v.iter().any(|x| x.device_name == o.device_name) {
+            continue;
+        }
+        v.push(o.clone());
+    }
+    v.sort_by_key(|o| (o.left, o.top, o.adapter_index, o.output_index));
+    v
+}
+
+/// Nom de moniteur typique d'un pilote d'écran virtuel (IddCx : « VDD by MTT », Parsec VDA,
+/// IddSampleDriver…), dont la technologie de sortie n'est pas toujours déclarée « indirecte ».
+pub fn looks_virtual(friendly: &str) -> bool {
+    let f = friendly.to_ascii_lowercase();
+    ["vdd", "virtual", "parsec", "idd", "dummy", "spacedesk"].iter().any(|k| f.contains(k))
+}
+
+/// [`list_outputs`] filtré par [`capturable`].
+pub fn list_displays() -> Result<Vec<OutputInfo>> {
+    Ok(capturable(&list_outputs()?))
 }
 
 /// Une image capturée. La texture appartient à un ring interne de 3 textures :
@@ -56,6 +102,8 @@ pub struct ScreenCapturer {
     dupl: Option<IDXGIOutputDuplication>,
     width: u32,
     height: u32,
+    /// Position de la sortie dans le bureau virtuel (lue à chaque ouverture de la duplication).
+    origin: (i32, i32),
     format: DXGI_FORMAT,
     ring: Vec<ID3D11Texture2D>,
     ring_pos: usize,
@@ -71,6 +119,7 @@ pub struct ScreenCapturer {
 /// Liste les sorties de tous les adaptateurs matériels.
 pub fn list_outputs() -> Result<Vec<OutputInfo>> {
     let f = gpu::factory()?;
+    let names = crate::displayconfig::monitor_names();
     let mut v = Vec::new();
     let mut ai = 0;
     while let Ok(a) = unsafe { f.EnumAdapters1(ai) } {
@@ -79,6 +128,9 @@ pub fn list_outputs() -> Result<Vec<OutputInfo>> {
         while let Ok(o) = unsafe { a.EnumOutputs(oi) } {
             let d = unsafe { o.GetDesc() }.ctx("IDXGIOutput::GetDesc")?;
             let r: RECT = d.DesktopCoordinates;
+            let len = d.DeviceName.iter().position(|&c| c == 0).unwrap_or(d.DeviceName.len());
+            let device_name = String::from_utf16_lossy(&d.DeviceName[..len]);
+            let mon = names.get(&device_name).cloned().unwrap_or_default();
             v.push(OutputInfo {
                 adapter_index: ai,
                 output_index: oi,
@@ -86,8 +138,13 @@ pub fn list_outputs() -> Result<Vec<OutputInfo>> {
                 vendor_id: info.vendor_id,
                 width: (r.right - r.left).max(0) as u32,
                 height: (r.bottom - r.top).max(0) as u32,
+                left: r.left,
+                top: r.top,
                 attached_to_desktop: d.AttachedToDesktop.as_bool(),
                 primary: r.left == 0 && r.top == 0 && d.AttachedToDesktop.as_bool(),
+                device_name,
+                is_virtual: mon.is_virtual || looks_virtual(&mon.friendly),
+                friendly_name: mon.friendly,
             });
             oi += 1;
         }
@@ -132,6 +189,7 @@ impl ScreenCapturer {
             dupl: None,
             width: 0,
             height: 0,
+            origin: (0, 0),
             format: DXGI_FORMAT(0),
             ring: Vec::new(),
             ring_pos: 0,
@@ -189,15 +247,40 @@ impl ScreenCapturer {
         (self.adapter_index, self.output_index)
     }
 
+    /// Coin supérieur gauche de la sortie capturée dans le bureau virtuel.
+    pub fn origin(&self) -> (i32, i32) {
+        self.origin
+    }
+
+    /// Bascule à chaud vers une autre sortie du MÊME adaptateur : le device D3D11 (et donc
+    /// l'encodeur qui l'utilise) est conservé. En cas d'échec, la sortie précédente est rouverte.
+    /// La prochaine image peut avoir une autre taille (l'encodeur la met à l'échelle).
+    pub fn switch_output(&mut self, output_index: u32) -> Result<()> {
+        let prev = self.output_index;
+        self.output_index = output_index;
+        self.ring.clear();
+        self.last_idx = None;
+        match self.reopen() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.output_index = prev;
+                let _ = self.reopen();
+                Err(e)
+            }
+        }
+    }
+
     fn reopen(&mut self) -> Result<()> {
         self.dupl = None;
         self.have_image = false;
         let output = unsafe { self.adapter.EnumOutputs(self.output_index) }.ctx("EnumOutputs")?;
+        let od = unsafe { output.GetDesc() }.ctx("IDXGIOutput::GetDesc")?;
         let output1: IDXGIOutput1 = output.cast().ctx("IDXGIOutput1")?;
         let dupl = unsafe { output1.DuplicateOutput(&self.device) }.ctx("DuplicateOutput")?;
         let d = unsafe { dupl.GetDesc() };
         self.width = d.ModeDesc.Width;
         self.height = d.ModeDesc.Height;
+        self.origin = (od.DesktopCoordinates.left, od.DesktopCoordinates.top);
         self.dupl = Some(dupl);
         self.reopen_count += 1;
         Ok(())

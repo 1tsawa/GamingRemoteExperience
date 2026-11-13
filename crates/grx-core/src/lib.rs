@@ -8,6 +8,7 @@
 pub mod error;
 pub mod identity;
 pub mod invite;
+pub mod displays;
 pub mod profiles;
 pub mod session;
 pub mod stream_settings;

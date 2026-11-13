@@ -28,14 +28,16 @@
 
 mod capture;
 mod convert;
+mod displayconfig;
 pub mod cursor;
 mod encoder;
 mod error;
 mod gpu;
 pub mod nal;
 
-pub use capture::{list_outputs, CapturedFrame, OutputInfo, ScreenCapturer};
-pub use cursor::{CursorImage, CursorState, CursorTracker};
+pub use capture::{capturable, list_displays, list_outputs, CapturedFrame, OutputInfo, ScreenCapturer};
+pub use displayconfig::{monitor_names, MonitorName};
+pub use cursor::{cursor_screen_pos, CursorImage, CursorState, CursorTracker};
 pub use encoder::{Encoder, EncoderBackend};
 pub use error::{Result, VideoError};
 pub use gpu::{create_device_for_adapter, list_adapters, AdapterInfo};

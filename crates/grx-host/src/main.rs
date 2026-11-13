@@ -1,6 +1,7 @@
 mod access;
 mod control;
 mod cursor;
+mod display;
 mod firewall;
 mod pipeline;
 mod portmap_task;
@@ -136,6 +137,10 @@ enum Cmd {
         /// Inactivité (s) avant de fermer la session
         #[arg(long, default_value_t = 5.0)]
         idle_timeout: f64,
+        /// Écran capturé au début de chaque session (1, 2… de gauche à droite, voir le journal
+        /// de démarrage) ; défaut : l'écran principal. Le client peut en changer depuis son menu.
+        #[arg(long)]
+        display: Option<usize>,
     },
 }
 
@@ -214,7 +219,21 @@ fn main() -> Result<()> {
             block_win_key,
             no_audio,
             idle_timeout,
+            display,
         } => {
+            // Coordonnées physiques partout (DXGI, curseur, SendInput) même avec une mise à
+            // l'échelle Windows différente par écran.
+            set_dpi_aware();
+            let displays = grx_video::list_displays().unwrap_or_default();
+            println!("Écrans capturables :");
+            for (i, d) in displays.iter().enumerate() {
+                println!("  {}", display::describe(i, d));
+            }
+            let display = match display {
+                None => None,
+                Some(n) if n >= 1 && n <= displays.len() => Some(displays[n - 1].device_name.clone()),
+                Some(n) => bail!("--display {n} : écran inexistant (1 à {})", displays.len()),
+            };
             if fps == 0 || max_bitrate <= 0.0 || start_bitrate <= 0.0 || idle_timeout <= 0.0 {
                 bail!("--fps, --max-bitrate, --start-bitrate et --idle-timeout doivent être > 0");
             }
@@ -246,6 +265,7 @@ fn main() -> Result<()> {
                     },
                     initial_bitrate_bps: ((start_bitrate * 1e6) as u64).min(max_bps),
                     max_bitrate_bps: max_bps,
+                    display,
                 },
             };
             if no_input {
@@ -427,5 +447,17 @@ mod tests {
             }
         }
         assert!(Cli::try_parse_from(["grx-host", "set-role", "ABCD", "admin"]).is_err());
+    }
+}
+
+/// Processus « per-monitor DPI aware v2 » : sans ça, Windows virtualise les coordonnées du bureau
+/// (DXGI, curseur) quand la mise à l'échelle n'est pas de 100 %.
+fn set_dpi_aware() {
+    #[cfg(windows)]
+    // SAFETY : appel sans pointeur ; échoue sans effet si déjà fixé (manifeste, appel antérieur).
+    unsafe {
+        windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        );
     }
 }

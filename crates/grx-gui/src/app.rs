@@ -25,8 +25,8 @@ use crate::theme::{self, card, colored, danger_button, dot, muted, primary_butto
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Tab {
     #[default]
-    Host,
     Client,
+    Host,
 }
 
 /// Options de démonstration / test (cachées dans la ligne de commande).
@@ -387,7 +387,7 @@ impl App {
             ui.label(RichText::new("GamingRemoteExperience").heading().strong());
             ui.label(muted("Appairage"));
             ui.add_space(18.0);
-            for (tab, label) in [(Tab::Host, "Host — PC à contrôler"), (Tab::Client, "Client — PC qui contrôle")] {
+            for (tab, label) in [(Tab::Client, "Client — PC qui contrôle"), (Tab::Host, "Host — PC à contrôler")] {
                 let selected = self.tab == tab;
                 let text = RichText::new(label).size(15.5);
                 let btn = egui::Button::selectable(selected, if selected { text.strong() } else { text });

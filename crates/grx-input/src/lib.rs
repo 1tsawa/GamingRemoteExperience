@@ -20,6 +20,7 @@
 //! inj.release_all();
 //! ```
 
+pub mod absmap;
 pub mod client;
 pub mod ds4map;
 pub mod event;

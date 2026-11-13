@@ -36,7 +36,7 @@ struct Cli {
 
     // Options de démonstration / test : préparent l'état initial sans cliquer.
     /// Onglet affiché au démarrage
-    #[arg(long, value_enum, default_value = "host", hide = true)]
+    #[arg(long, value_enum, default_value = "client", hide = true)]
     tab: TabArg,
     /// Pré-remplit le champ « lien » de l'onglet Client
     #[arg(long, hide = true)]

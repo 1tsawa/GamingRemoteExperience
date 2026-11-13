@@ -29,10 +29,14 @@ use crate::injector::{InjectError, InputSink};
 /// Marqueur place dans `dwExtraInfo` des evenements injectes par GRX ("GRX\0").
 pub const INJECTED_MAGIC: usize = 0x4752_5800;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SendInputSink {
     /// Mapper `MouseAbs` sur tout le bureau virtuel (multi-ecrans) plutot que l'ecran principal.
     pub virtual_desktop: bool,
+    /// Ecran vise par `MouseAbs` (ecran capture + bureau virtuel, voir [`crate::absmap`]) : les
+    /// coordonnees normalisees dans l'image sont converties en coordonnees VIRTUALDESK. Prioritaire
+    /// sur `virtual_desktop` quand une cible est connue.
+    pub abs_target: Option<std::sync::Arc<crate::absmap::AbsTarget>>,
 }
 
 impl SendInputSink {
@@ -95,6 +99,12 @@ impl InputSink for SendInputSink {
     }
 
     fn mouse_move_abs(&mut self, x: u16, y: u16) -> Result<(), InjectError> {
+        if let Some((out, vdesk)) = self.abs_target.as_ref().and_then(|t| t.get()) {
+            if let Some((nx, ny)) = crate::absmap::map_abs(x, y, &out, &vdesk) {
+                let flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+                return self.send(&[mouse(nx as i32, ny as i32, 0, flags)]);
+            }
+        }
         let mut flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
         if self.virtual_desktop {
             flags |= MOUSEEVENTF_VIRTUALDESK;

@@ -180,6 +180,8 @@ struct Active {
     started: Instant,
     /// Curseur du host envoyé à part (forme fiable + position non fiable), voir `cursor.rs`.
     cursor: crate::cursor::CursorSender,
+    /// Génération de la liste d'écrans déjà annoncée au client (`GRX-DSP`).
+    displays_sent: u64,
 }
 
 impl Active {
@@ -538,6 +540,7 @@ fn start_session(sess: Session, peer: SocketAddr, view_only: bool, opts: &RunOpt
     let cursor = crate::cursor::CursorSender::new(pipeline.shared.cursor.clone());
     Active {
         cursor,
+        displays_sent: 0,
         sess,
         ep,
         peer,
@@ -631,6 +634,13 @@ fn drive(sock: &UdpSocket, a: &mut Active, opts: &RunOpts) -> Option<&'static st
                     let _ = a.ep.send_control(&reply);
                 }
             }
+            // Choix de l'écran capturé (overlay du client) : permis aussi en lecture seule.
+            Event::Control(m) if grx_core::displays::is_display_select(&m) => {
+                if let Some(sel) = grx_core::displays::DisplaySelect::decode(&m) {
+                    println!("  client : écran {} demandé", sel.index as u32 + 1);
+                    a.pipeline.shared.displays.request(sel.index);
+                }
+            }
             _ => {}
         }
     }
@@ -639,6 +649,11 @@ fn drive(sock: &UdpSocket, a: &mut Active, opts: &RunOpts) -> Option<&'static st
     }
     a.pipeline.shared.target_bps.store(a.ep.target_bitrate_bps(), Ordering::Relaxed);
     a.cursor.drive(&mut a.ep);
+    // Liste des écrans / écran actif : (ré)annoncée à chaque changement.
+    let g = a.pipeline.shared.displays.generation();
+    if g != a.displays_sent && a.ep.send_control(&a.pipeline.shared.displays.message().encode()).is_ok() {
+        a.displays_sent = g;
+    }
 
     // Émission.
     let mut sent = 0;
@@ -729,6 +744,7 @@ mod tests {
                 },
                 initial_bitrate_bps: 10_000_000,
                 max_bitrate_bps: 20_000_000,
+                display: None,
             },
         }
     }
@@ -1306,6 +1322,64 @@ mod tests {
         assert!(a.ep.stats().total_bitrate_bps <= 4_000_000);
         assert_eq!(a.pipeline.shared.max_fps.load(Ordering::Relaxed), 30);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn display_list_is_announced_and_selection_reaches_video_thread() {
+        use grx_core::displays::{DisplayList, DisplaySelect};
+        let mut srv = server();
+        let tok = invite(&mut srv);
+        let mut c = Client::new();
+        assert!(c.connect(&mut srv, Some(&tok)));
+        c.send_first_data(&mut srv);
+        let lists = |c: &mut Client, srv: &mut Server| {
+            srv.tick();
+            for p in c.drain() {
+                c.ep.handle_datagram(c.clock, &p);
+            }
+            let mut v = Vec::new();
+            while let Some(ev) = c.ep.poll_event() {
+                if let Event::Control(m) = ev {
+                    v.extend(DisplayList::decode(&m));
+                }
+            }
+            v
+        };
+        assert!(lists(&mut c, &mut srv).is_empty(), "rien tant que la liste est inconnue (pas de capture)");
+
+        // Le thread vidéo publierait ceci : deux écrans, le second capturé.
+        let out = |name: &str, left: i32, oi: u32| grx_video::OutputInfo {
+            adapter_index: 0,
+            output_index: oi,
+            adapter_name: "GPU".into(),
+            vendor_id: 0,
+            width: 2560,
+            height: 1440,
+            left,
+            top: 0,
+            attached_to_desktop: true,
+            primary: left == 0,
+            device_name: name.into(),
+            friendly_name: String::new(),
+            is_virtual: false,
+        };
+        let d = srv.active.as_ref().unwrap().pipeline.shared.displays.clone();
+        d.set_list(vec![out("DISPLAY2", -2560, 1), out("DISPLAY1", 0, 0)]);
+        d.set_active("DISPLAY1");
+        let l = lists(&mut c, &mut srv);
+        assert_eq!(l.len(), 1, "une seule annonce par changement");
+        assert_eq!((l[0].displays.len(), l[0].active), (2, Some(1)));
+        assert!(lists(&mut c, &mut srv).is_empty(), "pas de réannonce sans changement");
+
+        // Choix du client (plus un message malformé ignoré) -> demande pour le thread vidéo.
+        c.ep.send_control(&[b"GRX-MON".as_slice(), &[1, 99]].concat()).unwrap();
+        c.ep.send_control(&DisplaySelect { index: 0 }.encode()).unwrap();
+        for sealed in c.all_sealed() {
+            srv.handle_packet(&sealed, c.addr);
+        }
+        srv.tick();
+        assert_eq!(d.take_request().map(|o| o.output_index), Some(1));
+        assert!(d.take_request().is_none());
     }
 
     #[test]

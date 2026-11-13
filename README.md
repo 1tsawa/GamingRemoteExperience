@@ -31,6 +31,7 @@ cargo build --release -p grx-host -p grx-client     # binaires dans target\relea
 # 1. Lancer le host : il ouvre tout seul le port UDP 7777 sur la box (UPnP), voir plus bas
 target\release\grx-host.exe run --bind [::]:7777
 #    options : --codec hevc|h264  --fps 60  --max-bitrate 50  --fill  --no-input  --no-audio
+#              --display N (écran capturé au départ, 1 = le plus à gauche ; défaut : principal)
 #              --no-upnp  --external-port 7777  --upnp-lease 3600
 
 # 2. Dans une autre console : invitation à usage unique avec l'adresse publique détectée
@@ -65,8 +66,8 @@ Seul le **host** doit être joignable ; le client n'a rien à ouvrir. Il n'y a p
 - **État** : pendant l'exécution, `status.json` (dossier de données du host) contient `{pid, bind, started_ms, upnp: {ok, state, method, external_addr, lease_secs, error, warnings}, ipv6, firewall}` ; il est supprimé à l'arrêt. Diagnostic de la box : `cargo run -p grx-portmap --example probe -- info|list|get <port>`.
 
 ### Raccourcis du client `play`
-`Ctrl+Maj+M` **menu en overlay** (aussi via le bouton qui apparaît en haut au centre) · `Ctrl+Maj+S` stats à l'écran · `Ctrl+Maj+Q` déconnexion · `F11` plein écran · `F10` stats dans le titre · `Ctrl+Alt+Maj+G` (modifiable : `--capture-key`) capture souris relative · `Alt+F4` quitter.
-Menu (comme Parsec) : plein écran, statistiques détaillées, volume + muet, **bande passante max** et **FPS max** (envoyés au host, appliqués à chaud), capture souris, **verrouillage du clavier** (Win/Alt+Tab envoyés au host), VSync, bouton flottant, rappel des raccourcis, déconnexion. Menu ouvert : souris et clavier restent au client. Détails dans [TUTO.md](TUTO.md).
+`Ctrl+Maj+M` **menu en overlay** (aussi via le bouton qui apparaît en haut au centre) · `Ctrl+Maj+S` stats à l'écran · `Ctrl+Maj+Q` déconnexion · `Ctrl+Maj+←/→` écran distant précédent/suivant · `F11` plein écran · `F10` stats dans le titre · `Ctrl+Alt+Maj+G` (modifiable : `--capture-key`) capture souris relative · `Alt+F4` quitter.
+Menu (comme Parsec) : plein écran, statistiques détaillées, volume + muet, **bande passante max** et **FPS max** (envoyés au host, appliqués à chaud), **écran du host** capturé (s'il en a plusieurs : bascule à chaud, choix mémorisé), capture souris, **verrouillage du clavier** (Win/Alt+Tab envoyés au host), VSync, bouton flottant, rappel des raccourcis, déconnexion. Menu ouvert : souris et clavier restent au client. Détails dans [TUTO.md](TUTO.md).
 Options : `--no-input`, `--no-audio`, `--no-gamepad`, `--gamepad-as xbox|auto|ds4`, `--volume`, `--stats`, `--fullscreen`, `--vsync`, `--width/--height`, `--local-cursor`.
 
 ### Manettes

@@ -126,6 +126,8 @@ struct Shared {
     host_info: Mutex<Option<grx_core::stream_settings::HostInfo>>,
     /// Vibrations reçues du host (`GRX-RMB`), consommées par le fil des manettes.
     rumble: Mutex<VecDeque<grx_input::Rumble>>,
+    /// Dernière liste d'écrans du host (`GRX-DSP`) et compteur de réceptions (0 = jamais reçue).
+    displays: Mutex<(u64, Option<grx_core::displays::DisplayList>)>,
 }
 
 pub struct ClientConnection {
@@ -214,6 +216,7 @@ impl ClientConnection {
             cursor: Default::default(),
             host_info: Mutex::new(None),
             rumble: Mutex::new(VecDeque::new()),
+            displays: Mutex::new((0, None)),
         });
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let sh = shared.clone();
@@ -292,6 +295,17 @@ impl ClientConnection {
 
     pub fn host_info(&self) -> Option<grx_core::stream_settings::HostInfo> {
         *self.shared.host_info.lock().unwrap()
+    }
+
+    /// Dernière liste d'écrans annoncée par le host et son numéro de réception (0 = aucune,
+    /// host ancien) : un numéro qui change = liste ou écran actif à rafraîchir dans l'overlay.
+    pub fn displays(&self) -> (u64, Option<grx_core::displays::DisplayList>) {
+        self.shared.displays.lock().unwrap().clone()
+    }
+
+    /// Numéro de réception de la liste d'écrans (lecture bon marché, voir [`Self::displays`]).
+    pub fn displays_serial(&self) -> u64 {
+        self.shared.displays.lock().unwrap().0
     }
 
     pub fn state(&self) -> ConnState {
@@ -493,6 +507,12 @@ fn net_loop(sh: Arc<Shared>, sock: UdpSocket, sess: Session, cmd_rx: Receiver<Cm
                 Event::Control(m) if grx_core::stream_settings::is_host_info(&m) => {
                     if let Some(h) = grx_core::stream_settings::HostInfo::decode(&m) {
                         *sh.host_info.lock().unwrap() = Some(h);
+                    }
+                }
+                Event::Control(m) if grx_core::displays::is_display_list(&m) => {
+                    if let Some(l) = grx_core::displays::DisplayList::decode(&m) {
+                        let mut d = sh.displays.lock().unwrap();
+                        *d = (d.0 + 1, Some(l));
                     }
                 }
                 Event::Datagram(d) => {
