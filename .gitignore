@@ -18,3 +18,5 @@ __pycache__/
 *.pyc
 .vs/
 .idea/
+# FFmpeg LGPL téléchargé par tools/build-setup.ps1 (~95 Mo, jamais versionné)
+/third_party/ffmpeg/

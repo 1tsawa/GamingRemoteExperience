@@ -14,7 +14,7 @@ use crate::annexb;
 use crate::error::{RenderError, Result, WinCtx};
 use crate::gpu;
 use grx_video::mft_async::{self, AsyncMft, MftEvent};
-use grx_video::Codec;
+use grx_video::{Codec, PixelFormat};
 use std::sync::Once;
 use windows::core::{Interface, PWSTR, VARIANT};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -75,6 +75,12 @@ pub struct DecoderStats {
     pub frames_out: u64,
     /// Paquets ignorés car aucun IDR n'avait encore été reçu depuis `reset()`/le démarrage.
     pub skipped_waiting_idr: u64,
+    /// Appels `ProcessOutput` (diagnostic : une boucle serrée se voit ici).
+    pub process_output_calls: u64,
+    /// `MF_E_TRANSFORM_STREAM_CHANGE` traités (renégociation du type de sortie).
+    pub stream_changes: u64,
+    /// `reset()` / `flush()` (purge + attente d'un IDR).
+    pub resets: u64,
 }
 
 // SAFETY : la texture et l'IMFSample sont des objets D3D11/MF agiles ; le device est protégé
@@ -101,6 +107,34 @@ pub(crate) struct MfDecoder {
     async_out: Option<DecodedFrame>,
     /// Sous-type de sortie négocié (NV12, P010, AYUV, Y410).
     pub out_subtype: windows::core::GUID,
+    /// Format du flux annoncé par le host : la sortie du MFT doit lui correspondre (sinon le MFT
+    /// convertit chaque image, ex. NV12 -> P010/AYUV, sur le moteur Video Processing du GPU).
+    format_hint: PixelFormat,
+}
+
+/// Ordre de préférence des sorties du MFT pour un flux `f` : d'abord le format natif du flux
+/// (aucune conversion dans le MFT), puis les replis.
+pub(crate) fn output_preference(f: PixelFormat) -> [windows::core::GUID; 4] {
+    match f {
+        PixelFormat::Yuv420 => [MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_AYUV, MFVideoFormat_Y410],
+        PixelFormat::Yuv420P10 => [MFVideoFormat_P010, MFVideoFormat_NV12, MFVideoFormat_Y410, MFVideoFormat_AYUV],
+        PixelFormat::Yuv444 => [MFVideoFormat_AYUV, MFVideoFormat_Y410, MFVideoFormat_NV12, MFVideoFormat_P010],
+        _ => [MFVideoFormat_Y410, MFVideoFormat_AYUV, MFVideoFormat_P010, MFVideoFormat_NV12],
+    }
+}
+
+pub(crate) fn subtype_label(g: windows::core::GUID) -> &'static str {
+    if g == MFVideoFormat_NV12 {
+        "NV12"
+    } else if g == MFVideoFormat_P010 {
+        "P010"
+    } else if g == MFVideoFormat_AYUV {
+        "AYUV"
+    } else if g == MFVideoFormat_Y410 {
+        "Y410"
+    } else {
+        "?"
+    }
 }
 
 fn subtype(codec: Codec) -> windows::core::GUID {
@@ -181,6 +215,7 @@ impl MfDecoder {
             need_input: 0,
             async_out: None,
             out_subtype: MFVideoFormat_NV12,
+            format_hint: PixelFormat::Yuv420,
         };
         dec.configure()?;
         Ok(dec)
@@ -235,7 +270,10 @@ impl MfDecoder {
                 Err(_) => break,
             }
         }
-        for want in [MFVideoFormat_Y410, MFVideoFormat_AYUV, MFVideoFormat_P010, MFVideoFormat_NV12] {
+        // 0.2.2 préférait Y410 > AYUV > P010 > NV12 quel que soit le flux : un MFT qui propose P010
+        // ou AYUV pour un flux 8 bits 4:2:0 (pilotes Intel) convertissait alors CHAQUE image
+        // (moteur Video Processing saturé, latence). On suit désormais le format du flux.
+        for want in output_preference(self.format_hint) {
             let Some((_, t)) = offered.iter().find(|(g, _)| *g == want) else { continue };
             if unsafe { t.GetUINT64(&MF_MT_FRAME_SIZE) }.is_err() {
                 unsafe { t.SetUINT64(&MF_MT_FRAME_SIZE, (1920u64 << 32) | 1080) }.ctx("FRAME_SIZE(out)")?;
@@ -288,6 +326,21 @@ impl MfDecoder {
 
     pub fn stats(&self) -> DecoderStats {
         self.stats
+    }
+
+    /// Format attendu du flux (4:2:0/4:4:4, 8/10 bits) : choisit le type de sortie du MFT
+    /// correspondant (renégocié tout de suite s'il est déjà proposé).
+    pub fn set_format_hint(&mut self, f: PixelFormat) {
+        if self.format_hint == f {
+            return;
+        }
+        self.format_hint = f;
+        let _ = self.negotiate_output();
+    }
+
+    /// Sous-type de sortie négocié, lisible (« NV12 », « P010 »…).
+    pub fn output_label(&self) -> &'static str {
+        subtype_label(self.out_subtype)
     }
 
     /// `true` tant qu'un IDR n'a pas été reçu (au démarrage et après [`VideoDecoder::reset`]) :
@@ -373,6 +426,7 @@ impl MfDecoder {
             pEvents: std::mem::ManuallyDrop::new(None),
         };
         let mut status = 0u32;
+        self.stats.process_output_calls += 1;
         let r = unsafe { self.mft.ProcessOutput(0, std::slice::from_mut(&mut buf), &mut status) };
         let sample = unsafe { std::mem::ManuallyDrop::take(&mut buf.pSample) };
         let _events = unsafe { std::mem::ManuallyDrop::take(&mut buf.pEvents) };
@@ -383,7 +437,10 @@ impl MfDecoder {
                 }
                 Ok(())
             }
-            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => self.negotiate_output(),
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                self.stats.stream_changes += 1;
+                self.negotiate_output()
+            }
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(()),
             Err(e) => Err(RenderError::Win { context: "ProcessOutput(async)", source: e }),
         }
@@ -399,6 +456,7 @@ impl MfDecoder {
                 pEvents: std::mem::ManuallyDrop::new(None),
             };
             let mut status = 0u32;
+            self.stats.process_output_calls += 1;
             let r = unsafe { self.mft.ProcessOutput(0, std::slice::from_mut(&mut buf), &mut status) };
             let sample = unsafe { std::mem::ManuallyDrop::take(&mut buf.pSample) };
             let _events = unsafe { std::mem::ManuallyDrop::take(&mut buf.pEvents) };
@@ -409,6 +467,7 @@ impl MfDecoder {
                     }
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    self.stats.stream_changes += 1;
                     self.negotiate_output()?;
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
@@ -456,6 +515,7 @@ impl MfDecoder {
         }
         self.wait_idr = true;
         self.discontinuity = true;
+        self.stats.resets += 1;
         // Le MFT asynchrone redemande ses entrées après le redémarrage du flux.
         self.need_input = 0;
         self.async_out = None;

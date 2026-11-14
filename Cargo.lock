@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "grx-audio"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cc",
  "hound",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "grx-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "grx-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "grx-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "grx-host"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "grx-input"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "log",
  "thiserror 2.0.21",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "grx-portmap"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "igd-next",
  "rand 0.8.8",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "grx-render"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "grx-video",
@@ -1441,14 +1441,14 @@ dependencies = [
 
 [[package]]
 name = "grx-transport"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "grx-core",
 ]
 
 [[package]]
 name = "grx-update"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bzip2",
  "data-encoding",
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "grx-video"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "sha2",

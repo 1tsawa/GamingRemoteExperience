@@ -248,7 +248,7 @@ impl Default for HostRunOptions {
             encoder: EncoderChoice::default(),
             chroma: ChromaChoice::default(),
             fps: 60,
-            max_bitrate: 50,
+            max_bitrate: 30,
             start_bitrate: 20,
             fill: false,
             no_input: false,
@@ -324,7 +324,7 @@ impl HostRunOptions {
             a.push("--fps".into());
             a.push(self.fps.to_string());
         }
-        if self.max_bitrate != 50 {
+        if self.max_bitrate != 30 {
             a.push("--max-bitrate".into());
             a.push(self.max_bitrate.to_string());
         }
@@ -803,7 +803,7 @@ mod tests {
         let o: HostRunOptions = serde_json::from_str(r#"{"bind":"0.0.0.0:7777","fps":30}"#).unwrap();
         assert_eq!(o.fps, 30);
         assert!(o.upnp);
-        assert_eq!(o.max_bitrate, 50);
+        assert_eq!(o.max_bitrate, 30);
 
         let o: HostRunOptions = serde_json::from_str(r#"{"codec":"H264","champ_inconnu":1}"#).unwrap();
         assert_eq!(o.codec, CodecChoice::H264);

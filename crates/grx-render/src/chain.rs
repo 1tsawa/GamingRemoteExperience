@@ -223,15 +223,47 @@ pub fn create_with<T>(
     create_with_pref(codec, disabled, DecoderPref::Hardware, make)
 }
 
+/// Identifiant PCI d'Intel (`DXGI_ADAPTER_DESC.VendorId`).
+pub const VENDOR_INTEL: u32 = 0x8086;
+
+/// Ordre des voies pour l'adaptateur `vendor_id` : sur un GPU Intel, FFmpeg D3D11VA passe AVANT
+/// Media Foundation (le MFT de Microsoft y sature le moteur Video Processing, voie suivie par
+/// Moonlight) ; MF reste en repli. Ailleurs (NVIDIA, AMD, inconnu) : ordre inchangé.
+pub fn order_for_vendor(kinds: &mut [DecoderKind], vendor_id: u32) {
+    if vendor_id != VENDOR_INTEL {
+        return;
+    }
+    let mf = kinds.iter().position(|k| *k == DecoderKind::MediaFoundation);
+    let ff = kinds.iter().position(|k| *k == DecoderKind::FfmpegD3d11va);
+    if let (Some(m), Some(f)) = (mf, ff) {
+        if f > m {
+            kinds[m..=f].rotate_right(1);
+        }
+    }
+}
+
 /// Comme [`create_with`], sur les voies de `pref` ([`DecoderPref::chain`]).
 pub fn create_with_pref<T>(
     codec: Codec,
     disabled: &DisabledDecoders,
     pref: DecoderPref,
+    make: impl FnMut(DecoderKind) -> Result<T, String>,
+) -> Result<(T, DecoderKind, Vec<Attempt>), ChainError> {
+    create_with_pref_vendor(codec, disabled, pref, 0, make)
+}
+
+/// Comme [`create_with_pref`], ordre adapté au fabricant du GPU ([`order_for_vendor`]).
+pub fn create_with_pref_vendor<T>(
+    codec: Codec,
+    disabled: &DisabledDecoders,
+    pref: DecoderPref,
+    vendor_id: u32,
     mut make: impl FnMut(DecoderKind) -> Result<T, String>,
 ) -> Result<(T, DecoderKind, Vec<Attempt>), ChainError> {
     let mut attempts = Vec::new();
-    for &kind in pref.chain() {
+    let mut order = pref.chain().to_vec();
+    order_for_vendor(&mut order, vendor_id);
+    for kind in order {
         if disabled.is_disabled(kind, codec) {
             attempts.push(Attempt { kind, error: "désactivé (--disable-decoder)".into() });
             continue;
@@ -251,3 +283,7 @@ mod tests;
 #[cfg(test)]
 #[path = "chain_pref_tests.rs"]
 mod pref_tests;
+
+#[cfg(test)]
+#[path = "chain_vendor_tests.rs"]
+mod vendor_tests;

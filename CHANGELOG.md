@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3
+
+- Client : une seule conversion YUV→RGB (VideoProcessorBlt) par image ; curseur/calque/redimensionnement recopient l'image RGB, re-présentations plafonnées à la fréquence de l'écran (≤ 120 Hz).
+- Décodeur MF : sortie au format du flux (NV12 en 8 bits 4:2:0) au lieu de P010/AYUV/Y410 (conversion par image dans le MFT, GPU Intel saturé).
+- GPU Intel : FFmpeg D3D11VA préféré à Media Foundation (repli MF) ; FFmpeg LGPL 8.1 (avcodec/avutil/swresample) intégré au setup, SHA-256 épinglé.
+- Débit max par défaut 30 Mb/s (au lieu de 50) ; `--max-bitrate` inchangé.
+- RTT : une 1re mesure aberrante au démarrage ne fausse plus l'affichage pendant ~10 s.
+- `play --stats` : ligne `diag` (voie, Blt/s, Present/s, ProcessOutput/s, resets, IDR/s, décodeurs créés, renégociations, débit reçu) et bilan GPU.
+
 ## 0.2.2
 
 - Encodeurs AMD (AMF) et Intel (Quick Sync) via leurs MFT, choisis selon le GPU de l'écran capturé ; `run --encoder`.

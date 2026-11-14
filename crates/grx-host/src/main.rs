@@ -175,7 +175,9 @@ enum Cmd {
         #[arg(long, default_value_t = 60)]
         fps: u32,
         /// Bitrate vidéo maximal (Mb/s, FEC comprise) que le contrôle de débit peut atteindre
-        #[arg(long, default_value_t = 50.0)]
+        /// (30 par défaut depuis 0.2.3 : largement suffisant en 1440p60, ménage le décodeur des
+        /// portables ; montez-le pour du 4K ou du 120 FPS)
+        #[arg(long, default_value_t = 30.0)]
         max_bitrate: f64,
         /// Bitrate vidéo de départ (Mb/s)
         #[arg(long, default_value_t = 20.0)]

@@ -4,11 +4,13 @@
 # - ViGEmBus : installateur officiel téléchargé depuis les releases GitHub de nefarius/ViGEmBus
 #   (licence BSD-3), SHA-256 épinglé ci-dessous et signature Authenticode contrôlée. Toute
 #   différence = arrêt (jamais d'installateur de pilote non vérifié dans le setup).
-# - FFmpeg (facultatif) : décodeur de secours HEVC/AV1 (D3D11VA) si l'extension du Store manque.
-#   Intégré seulement si -FfmpegDir (défaut : third_party\ffmpeg) contient avcodec-62.dll,
-#   avutil-60.dll (+ swresample-6.dll si la build en dépend), LICENSE.txt (texte LGPL) et
-#   SOURCE.txt (provenance : URL de la build et des sources). Une build GPL est REFUSÉE
-#   (« --enable-gpl » / « --enable-nonfree » dans la configuration embarquée). Voir docs/ARCHITECTURE.md.
+# - FFmpeg (intégré par défaut depuis 0.2.3) : décodeur D3D11VA (préféré sur GPU Intel, secours
+#   HEVC/AV1 ailleurs). Sans -FfmpegDir, la build LGPL partagée épinglée ci-dessous (BtbN
+#   FFmpeg-Builds, FFmpeg 8.1 = avcodec 62 / avutil 60) est téléchargée, vérifiée par SHA-256 et
+#   seules avcodec-62.dll, avutil-60.dll et swresample-6.dll (dépendance réelle d'avcodec) en sont
+#   extraites dans third_party\ffmpeg, avec LICENSE.txt (LGPL) et SOURCE.txt (provenance). Une
+#   build GPL est REFUSÉE (« --enable-gpl » / « --enable-nonfree » dans la configuration
+#   embarquée). -NoFfmpeg : setup sans FFmpeg. Voir docs/ARCHITECTURE.md.
 # - OpenH264 (Cisco, BSD) : PAS intégré (la licence de brevets de Cisco exige un téléchargement
 #   séparé sur le poste de l'utilisateur) ; le setup installe seulement le texte de licence
 #   (third_party\openh264\BINARY_LICENSE.txt) et propose une tâche qui lance « grx-host
@@ -29,6 +31,15 @@ $VigemName = "ViGEmBus_${VigemVersion}_x64_x86_arm64.exe"
 $VigemUrl = "https://github.com/nefarius/ViGEmBus/releases/download/v$VigemVersion/$VigemName"
 $VigemSha256 = "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a"
 $VigemSigner = "Nefarius Software Solutions e.U."
+
+# FFmpeg LGPL partagé (BtbN). Les « autobuild » sont purgées au bout de quelques semaines : une
+# fois extraite, third_party\ffmpeg sert de cache ; pour une nouvelle machine, mettre à jour
+# l'URL et le SHA-256 (même version majeure 8.x, sinon adapter grx-render/src/ffmpeg.rs).
+$FfmpegBuild = "ffmpeg-n8.1.3-35-gf1acb0a266-win64-lgpl-shared-8.1"
+$FfmpegUrl = "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-14-12-37/$FfmpegBuild.zip"
+$FfmpegSha256 = "97927ac5391d5e3a11dc3bce679d54f7fde04cf54380a09970c32eea49ba20a2"
+$FfmpegSourceUrl = "https://github.com/FFmpeg/FFmpeg/tree/f1acb0a266 (FFmpeg n8.1.3-35-gf1acb0a266) ; scripts de build : https://github.com/FFmpeg-Builds/FFmpeg-Builds (ex-BtbN)"
+$FfmpegDlls = @("avcodec-62.dll", "avutil-60.dll", "swresample-6.dll")
 
 function Get-WorkspaceVersion {
     $toml = Get-Content (Join-Path $root "Cargo.toml") -Raw
@@ -104,6 +115,46 @@ function Get-VerifiedFfmpeg([string]$dir) {
     return (Resolve-Path $dir).Path
 }
 
+# Télécharge (SHA-256 épinglé) la build LGPL et n'en extrait que les DLL nécessaires.
+function Get-PinnedFfmpeg([string]$dest) {
+    $cache = Join-Path $env:LOCALAPPDATA "grx-build-cache"
+    New-Item -ItemType Directory -Force -Path $cache | Out-Null
+    $zip = Join-Path $cache "$FfmpegBuild.zip"
+    if (-not (Test-Path $zip)) {
+        Write-Host "Téléchargement de $FfmpegUrl"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $FfmpegUrl -OutFile $zip -UseBasicParsing -UserAgent "grx-build"
+    }
+    $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+    if ($hash -ne $FfmpegSha256) {
+        Remove-Item $zip -Force
+        throw "SHA-256 de la build FFmpeg inattendu ($hash) : fichier supprimé, construction arrêtée"
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    $z = [IO.Compression.ZipFile]::OpenRead($zip)
+    try {
+        $want = @($FfmpegDlls | ForEach-Object { "$FfmpegBuild/bin/$_" }) + "$FfmpegBuild/LICENSE.txt"
+        foreach ($e in $z.Entries) {
+            if ($want -contains $e.FullName) {
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $dest $e.Name), $true)
+            }
+        }
+    } finally { $z.Dispose() }
+    foreach ($f in $FfmpegDlls + "LICENSE.txt") {
+        if (-not (Test-Path (Join-Path $dest $f))) { throw "FFmpeg : $f absent de l'archive $FfmpegBuild" }
+    }
+    $src = @(
+        "FFmpeg (LGPL v3 : build « lgpl-shared », --enable-version3 sans --enable-gpl ni --enable-nonfree) intégré à GamingRemoteExperience.",
+        "Build binaire : $FfmpegUrl",
+        "SHA-256 de l'archive : $FfmpegSha256",
+        "Sources : $FfmpegSourceUrl",
+        "DLL inchangées, chargées dynamiquement ; remplaçables par toute build compatible (avcodec 62 / avutil 60)."
+    )
+    Set-Content -Path (Join-Path $dest "SOURCE.txt") -Value $src -Encoding UTF8
+    Write-Host "FFmpeg LGPL $FfmpegBuild extrait dans $dest (SHA-256 de l'archive vérifié)"
+}
+
 $ohLicense = Join-Path $root "third_party\openh264\BINARY_LICENSE.txt"
 if (-not (Test-Path $ohLicense) -or -not ((Get-Content -Raw $ohLicense) -match "OpenH264 Video Codec provided by Cisco Systems")) {
     throw "third_party\openh264\BINARY_LICENSE.txt manquant ou inattendu (texte de licence Cisco requis par le setup)"
@@ -114,7 +165,10 @@ Write-Host "OpenH264 : téléchargé par le setup depuis Cisco (tâche facultati
 $iscc = Find-Iscc
 $defs = @("/DAppVersion=$version", "/DBinDir=$BinDir", "/DOutDir=$OutDir")
 if (-not $NoVigem) { $defs += "/DVigemExe=$(Get-VerifiedVigem)" }
-if (-not $FfmpegDir) { $FfmpegDir = Join-Path $root "third_party\ffmpeg" }
+if (-not $FfmpegDir) {
+    $FfmpegDir = Join-Path $root "third_party\ffmpeg"
+    if (-not $NoFfmpeg -and -not (Test-Path (Join-Path $FfmpegDir "SOURCE.txt"))) { Get-PinnedFfmpeg $FfmpegDir }
+}
 if (-not $NoFfmpeg -and (Test-Path (Join-Path $FfmpegDir "avcodec-62.dll"))) {
     $defs += "/DFfmpegDir=$(Get-VerifiedFfmpeg $FfmpegDir)"
     if (-not (Test-Path (Join-Path $FfmpegDir "swresample-6.dll"))) { $defs += "/DFfmpegNoSwr=1" }

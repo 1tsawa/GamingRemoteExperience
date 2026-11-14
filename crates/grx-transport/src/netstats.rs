@@ -14,6 +14,8 @@ pub struct RttEstimator {
 }
 
 const MIN_WINDOW_US: Micros = 10_000_000;
+/// Mesures pendant lesquelles une valeur initiale aberrante peut être remplacée.
+const WARMUP_SAMPLES: u64 = 8;
 
 impl Default for RttEstimator {
     fn default() -> Self {
@@ -30,6 +32,14 @@ impl RttEstimator {
         let r = rtt_us.max(1) as f64;
         match self.srtt {
             None => {
+                self.srtt = Some(r);
+                self.rttvar = r / 2.0;
+            }
+            // Démarrage : une 1re mesure gonflée (pair occupé à ouvrir la fenêtre/sonder ses
+            // décodeurs) mettait ~10 s à s'effacer (pings toutes les 0,5 s, gain 1/8) et affichait
+            // un RTT de 10-250 ms en local. Pendant les 8 premières mesures, une mesure 4x plus
+            // faible ré-amorce l'estimateur.
+            Some(s) if self.samples < WARMUP_SAMPLES && r * 4.0 < s => {
                 self.srtt = Some(r);
                 self.rttvar = r / 2.0;
             }
@@ -215,3 +225,7 @@ mod tests {
         assert_eq!(loss, 0.0);
     }
 }
+
+#[cfg(test)]
+#[path = "netstats_warmup_tests.rs"]
+mod warmup_tests;

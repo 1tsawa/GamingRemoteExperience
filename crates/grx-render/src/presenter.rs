@@ -89,6 +89,13 @@ pub struct PresenterStats {
     pub presented: u64,
     /// Images remplacées dans la boîte aux lettres avant d'avoir été dessinées.
     pub dropped: u64,
+    /// Tous les `Present` (nouvelles images + re-présentations curseur/calque/redimensionnement).
+    pub presents: u64,
+    /// Re-présentations de la dernière image (sans nouvelle image décodée).
+    pub redraws: u64,
+    /// Conversions YUV -> RGB par `VideoProcessorBlt` (moteur Video Processing) : au plus une par
+    /// image décodée, les re-présentations recopient la dernière image RGB (moteur 3D/copie).
+    pub blts: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -125,6 +132,9 @@ struct Shared {
     proxy: EventLoopProxy<UserEvent>,
     presented: AtomicU64,
     dropped: AtomicU64,
+    presents: AtomicU64,
+    redraws: AtomicU64,
+    blts: AtomicU64,
     latencies: Mutex<Vec<u32>>,
     layout: Mutex<Layout>,
     closed: AtomicBool,
@@ -243,6 +253,9 @@ impl PresenterHandle {
         PresenterStats {
             presented: self.shared.presented.load(Ordering::Relaxed),
             dropped: self.shared.dropped.load(Ordering::Relaxed),
+            presents: self.shared.presents.load(Ordering::Relaxed),
+            redraws: self.shared.redraws.load(Ordering::Relaxed),
+            blts: self.shared.blts.load(Ordering::Relaxed),
         }
     }
 
@@ -319,6 +332,9 @@ impl Presenter {
             proxy: event_loop.create_proxy(),
             presented: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            presents: AtomicU64::new(0),
+            redraws: AtomicU64::new(0),
+            blts: AtomicU64::new(0),
             latencies: Mutex::new(Vec::new()),
             layout: Mutex::new(Layout::default()),
             closed: AtomicBool::new(false),
@@ -359,6 +375,8 @@ impl Presenter {
             error: None,
             retry: false,
             cursor_retry: false,
+            last_present: None,
+            min_redraw: MIN_REDRAW_INTERVAL,
         };
         let r = self.event_loop.run_app(&mut app);
         self.shared.closed.store(true, Ordering::Release);
@@ -399,6 +417,13 @@ struct Gfx {
     hdr_out: bool,
     /// Dernière vérification « l'écran de la fenêtre est-il en HDR ? ».
     hdr_check: Option<(Instant, bool)>,
+    /// Dernière image convertie en RGB (BGRA, taille de la fenêtre) : les re-présentations
+    /// (curseur, calque, redimensionnement) la recopient au lieu de relancer le VideoProcessor.
+    rgb: Option<(ID3D11Texture2D, u32, u32)>,
+    /// `rgb` (ou l'intermédiaire HDR) contient la dernière image à la taille courante.
+    rgb_valid: bool,
+    /// Intermédiaire HDR qui contient la dernière image (0 : aucun).
+    hdr_key: usize,
 }
 
 impl Gfx {
@@ -457,6 +482,9 @@ impl Gfx {
             hdr: None,
             hdr_out: false,
             hdr_check: None,
+            rgb: None,
+            rgb_valid: false,
+            hdr_key: 0,
         };
         g.fetch_backbuffer()?;
         if std::env::var("GRX_RENDER_DEBUG").is_ok() {
@@ -486,6 +514,7 @@ impl Gfx {
             h.release_target();
         }
         self.backbuffer = None;
+        self.rgb_valid = false;
         unsafe { self.context.ClearState() };
         unsafe { self.context.Flush() };
         unsafe { self.swapchain.ResizeBuffers(0, w, h, format, DXGI_SWAP_CHAIN_FLAG(self.flags as i32)) }
@@ -536,7 +565,34 @@ impl Gfx {
         unsafe { WaitForSingleObjectEx(self.waitable, timeout_ms, true) == WAIT_OBJECT_0 }
     }
 
-    fn render(&mut self, f: &DecodedFrame) -> Result<()> {
+    /// Texture BGRA intermédiaire à la taille de la fenêtre (recréée si la taille change).
+    fn rgb_target(&mut self) -> Result<ID3D11Texture2D> {
+        if !matches!(&self.rgb, Some((_, w, h)) if (*w, *h) == (self.w, self.h)) {
+            self.rgb = None;
+            self.rgb_valid = false;
+            let td = D3D11_TEXTURE2D_DESC {
+                Width: self.w,
+                Height: self.h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut t = None;
+            unsafe { self.device.CreateTexture2D(&td, None, Some(&mut t)) }.ctx("CreateTexture2D(RGB intermédiaire)")?;
+            self.rgb = Some((t.unwrap(), self.w, self.h));
+        }
+        Ok(self.rgb.as_ref().unwrap().0.clone())
+    }
+
+    /// Dessine `f` et présente. `fresh` : nouvelle image décodée (conversion YUV -> RGB) ; sinon
+    /// re-présentation : la dernière image RGB est recopiée sans VideoProcessor si elle est encore
+    /// valide. Retourne `true` si un `VideoProcessorBlt` a été fait.
+    fn render(&mut self, f: &DecodedFrame, fresh: bool) -> Result<bool> {
         let dev = unsafe { f.texture.GetDevice() }.ctx("ID3D11Texture2D::GetDevice")?;
         if dev.as_raw() != self.device.as_raw() {
             return Err(RenderError::Other(
@@ -544,6 +600,7 @@ impl Gfx {
                     .into(),
             ));
         }
+        let mut blitted = false;
         if f.hdr {
             // HDR10 : YCbCr PQ -> RGB PQ (VideoProcessor) -> tone-mapping SDR ou scRGB (écran HDR).
             let want = self.display_is_hdr();
@@ -553,13 +610,31 @@ impl Gfx {
             }
             let (w, h) = (self.w, self.h);
             let inter = self.hdr.as_mut().unwrap().intermediate(w, h)?;
-            self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &inter, w, h, BlitColor::Pq)?;
+            // L'intermédiaire HDR sert de cache : à refaire s'il a été recréé (taille) ou après du SDR.
+            let key = inter.as_raw() as usize;
+            if fresh || !self.rgb_valid || self.hdr_key != key {
+                self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &inter, w, h, BlitColor::Pq)?;
+                blitted = true;
+                self.hdr_key = key;
+                self.rgb_valid = true;
+            }
             let bb = self.backbuffer.clone().ok_or_else(|| RenderError::Other("no back buffer".into()))?;
             self.hdr.as_mut().unwrap().draw(&bb, w, h, self.hdr_out)?;
         } else {
             self.set_hdr_out(false)?;
+            if self.hdr_key != 0 {
+                // On sort du HDR : le cache RGB SDR est périmé.
+                self.hdr_key = 0;
+                self.rgb_valid = false;
+            }
             let bb = self.backbuffer.clone().ok_or_else(|| RenderError::Other("no back buffer".into()))?;
-            self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &bb, self.w, self.h, BlitColor::Sdr)?;
+            let rgb = self.rgb_target()?;
+            if fresh || !self.rgb_valid {
+                self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &rgb, self.w, self.h, BlitColor::Sdr)?;
+                blitted = true;
+                self.rgb_valid = true;
+            }
+            unsafe { self.context.CopyResource(&bb, &rgb) };
         }
         let bb = self.backbuffer.clone().ok_or_else(|| RenderError::Other("no back buffer".into()))?;
         self.cursor.draw(&self.device, &self.context, &bb, self.w, self.h, f.width, f.height);
@@ -573,7 +648,8 @@ impl Gfx {
         };
         let hr = unsafe { self.swapchain.Present(interval, flags) };
         // DXGI_STATUS_OCCLUDED (succès) quand la fenêtre est masquée : rien à faire.
-        hr.ok().ctx("Present")
+        hr.ok().ctx("Present")?;
+        Ok(blitted)
     }
 }
 
@@ -587,8 +663,13 @@ struct App<F> {
     last: Option<DecodedFrame>,
     error: Option<RenderError>,
     retry: bool,
-    /// Redessin du curseur reporté (swapchain pas prête).
+    /// Redessin du curseur reporté (swapchain pas prête ou cadence plafonnée).
     cursor_retry: bool,
+    /// Dernier `Present` (cadence des re-présentations curseur).
+    last_present: Option<Instant>,
+    /// Intervalle minimal entre deux re-présentations sans nouvelle image (fréquence de l'écran,
+    /// au plus 120 Hz) : un curseur à 1000 Hz ne déclenche pas 1000 `Present`/s.
+    min_redraw: Duration,
 }
 
 impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> App<F> {
@@ -623,8 +704,9 @@ impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> App<F> {
             return;
         }
         let Some((frame, t0)) = self.shared.mailbox.lock().unwrap().take() else { return };
-        match gfx.render(&frame) {
-            Ok(()) => {
+        match gfx.render(&frame, true) {
+            Ok(b) => {
+                self.count_present(b);
                 self.shared.presented.fetch_add(1, Ordering::Relaxed);
                 let us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
                 let mut l = self.shared.latencies.lock().unwrap();
@@ -646,7 +728,7 @@ impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> App<F> {
         }
         match self.gfx.as_ref() {
             Some(g) if self.last.is_some() => {
-                if !g.wait_ready(0) {
+                if self.last_present.is_some_and(|t| t.elapsed() < self.min_redraw) || !g.wait_ready(0) {
                     self.cursor_retry = true;
                     return;
                 }
@@ -658,10 +740,33 @@ impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> App<F> {
 
     fn redraw_last(&mut self) {
         if let (Some(g), Some(f)) = (self.gfx.as_mut(), self.last.as_ref()) {
-            if let Err(e) = g.render(f) {
-                eprintln!("grx-render: redraw error: {e}");
+            match g.render(f, false) {
+                Ok(b) => {
+                    self.shared.redraws.fetch_add(1, Ordering::Relaxed);
+                    self.count_present(b);
+                }
+                Err(e) => eprintln!("grx-render: redraw error: {e}"),
             }
         }
+    }
+
+    fn count_present(&mut self, blitted: bool) {
+        self.last_present = Some(Instant::now());
+        self.shared.presents.fetch_add(1, Ordering::Relaxed);
+        if blitted {
+            self.shared.blts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Fréquence de l'écran de la fenêtre -> intervalle minimal des re-présentations.
+    fn update_min_redraw(&mut self) {
+        let hz = self
+            .window
+            .as_ref()
+            .and_then(|w| w.current_monitor())
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| mhz as f64 / 1000.0);
+        self.min_redraw = redraw_interval(hz);
     }
 
     fn toggle_fullscreen(&self) {
@@ -706,6 +811,7 @@ impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> ApplicationHandler<Us
         self.update_layout();
         (self.hook)(&PresenterEvent::Ready, &window);
         self.window = Some(window);
+        self.update_min_redraw();
         // Des images ont pu arriver avant la fenêtre.
         self.pump();
     }
@@ -726,6 +832,7 @@ impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> ApplicationHandler<Us
                     self.redraw_last();
                 }
             }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => self.update_min_redraw(),
             WindowEvent::RedrawRequested => self.redraw_last(),
             WindowEvent::KeyboardInput { event: ke, .. } => {
                 if !consumed
@@ -804,17 +911,42 @@ impl<F: FnMut(&PresenterEvent, &Window) -> bool + 'static> ApplicationHandler<Us
         if self.cursor_retry {
             self.cursor_redraw();
         }
-        el.set_control_flow(if self.retry || self.cursor_retry {
+        el.set_control_flow(if self.retry {
             ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1))
+        } else if self.cursor_retry {
+            // Prochaine re-présentation autorisée (cadence plafonnée), au moins 1 ms plus tard.
+            let now = Instant::now();
+            let due = self.last_present.map_or(now, |t| t + self.min_redraw);
+            ControlFlow::WaitUntil(due.max(now + Duration::from_millis(1)))
         } else {
             ControlFlow::Wait
         });
     }
 }
 
+/// Intervalle minimal des re-présentations sans nouvelle image (curseur) : une période d'écran,
+/// plafonnée à 120 Hz (8,3 ms) ; 60 Hz si la fréquence est inconnue.
+const MIN_REDRAW_INTERVAL: Duration = Duration::from_micros(8_333);
+
+fn redraw_interval(hz: Option<f64>) -> Duration {
+    match hz {
+        Some(hz) if hz >= 1.0 => Duration::from_secs_f64(1.0 / hz.min(120.0)).max(MIN_REDRAW_INTERVAL),
+        _ => Duration::from_micros(16_667),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redraw_interval_follows_display_capped_at_120hz() {
+        assert_eq!(redraw_interval(Some(60.0)).as_micros(), 16_666);
+        assert_eq!(redraw_interval(Some(240.0)).as_micros(), 8_333);
+        assert_eq!(redraw_interval(Some(120.0)).as_micros(), 8_333);
+        assert_eq!(redraw_interval(None).as_micros(), 16_667);
+        assert_eq!(redraw_interval(Some(0.0)).as_micros(), 16_667);
+    }
 
     #[test]
     fn maps_window_points_to_video() {

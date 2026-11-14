@@ -51,7 +51,7 @@ pub use annexb::{
 };
 pub use blit::fit_rect;
 pub use cursor::{cursor_quad, CursorShape, RemoteCursor};
-pub use chain::{codec_key, create_with, create_with_pref, Attempt, ChainError, DecoderKind, DecoderPref, DisabledDecoders};
+pub use chain::{codec_key, create_with, create_with_pref, create_with_pref_vendor, order_for_vendor, VENDOR_INTEL, Attempt, ChainError, DecoderKind, DecoderPref, DisabledDecoders};
 pub use decoder::{DecodedFrame, DecoderStats};
 pub use video_decoder::{gpu_supports, gpu_supports_format, kind_formats, probe_decoders, ProbeEntry, VideoDecoder};
 /// Voie FFmpeg D3D11VA : `Ok(version et dossier)` si les DLL LGPL sont chargeables, sinon la raison.
@@ -59,7 +59,7 @@ pub fn ffmpeg_availability() -> std::result::Result<String, String> {
     ffmpeg::availability()
 }
 pub use error::{RenderError, Result};
-pub use gpu::create_device;
+pub use gpu::{create_device, vendor_id};
 /// Device D3D11 partagé décodeur/présentateur (réexporté pour les crates sans dépendance `windows`).
 pub use windows::Win32::Graphics::Direct3D11::ID3D11Device as D3D11Device;
 pub use overlay::{Align, Color, Font, OverlayItem, OverlayScene, Rect};

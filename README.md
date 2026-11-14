@@ -30,7 +30,7 @@ cargo build --release -p grx-host -p grx-client     # binaires dans target\relea
 ```powershell
 # 1. Lancer le host : il ouvre tout seul le port UDP 7777 sur la box (UPnP), voir plus bas
 target\release\grx-host.exe run --bind [::]:7777
-#    options : --codec auto|hevc|h264|av1 (défaut auto : négocié)  --fps 60  --max-bitrate 50  --fill  --no-input  --no-audio
+#    options : --codec auto|hevc|h264|av1 (défaut auto : négocié)  --fps 60  --max-bitrate 30  --fill  --no-input  --no-audio
 #              --display N (écran capturé au départ, 1 = le plus à gauche ; défaut : principal)
 #              --encoder auto|nvidia|amd|intel|software  --chroma auto|420|444
 #              --no-upnp  --external-port 7777  --upnp-lease 3600

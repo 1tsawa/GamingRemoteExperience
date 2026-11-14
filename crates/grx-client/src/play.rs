@@ -417,7 +417,11 @@ fn create_decoder(
     format: grx_video::PixelFormat,
 ) -> Result<(VideoDecoder, Vec<grx_render::Attempt>), grx_render::ChainError> {
     let mut attempts = Vec::new();
-    for kind in vc.decoders.kinds_for(codec, format) {
+    // GPU Intel : FFmpeg D3D11VA avant Media Foundation (repli MF), voir `order_for_vendor`.
+    let vendor = grx_render::vendor_id(&vc.device);
+    let mut kinds = vc.decoders.kinds_for(codec, format);
+    grx_render::order_for_vendor(&mut kinds, vendor);
+    for kind in kinds {
         if vc.disabled.is_disabled(kind, codec) {
             continue;
         }
@@ -537,6 +541,9 @@ fn video_loop(
     let (mut decode_errors, mut presented_total, mut dropped_total, mut decoded_total) = (0u64, 0u64, 0u64, 0u64);
     let mut err_logged = 0;
     let mut consecutive_errors = 0u32;
+    // Diagnostic (`--stats`) : décodeurs créés, renégociations, compteurs du décodeur courant.
+    let (mut decoders_created, mut renegotiations) = (0u64, 0u64);
+    let mut last_dec = grx_render::DecoderStats::default();
     // Pour l'overlay : résolution et codec du flux, encodeur du host, décodeur local.
     let (mut res, mut codec_name) = ((0u32, 0u32), String::new());
     let (mut enc_name, mut dec_name) = (String::new(), String::new());
@@ -653,6 +660,12 @@ fn video_loop(
                             let hc = conn.host_codec().1;
                             let pq = hc.as_ref().is_some_and(|h| h.transfer == grx_core::codec_neg::Transfer::Pq);
                             d.set_hdr(pq);
+                            // Sortie du MFT = format du flux (évite une conversion par image dans le MFT).
+                            d.set_format_hint(hc.as_ref().map_or(grx_video::PixelFormat::Yuv420, |h| {
+                                grx_video::PixelFormat::new(h.format.is_444(), h.format.is_10bit())
+                            }));
+                            decoders_created += 1;
+                            last_dec = grx_render::DecoderStats::default();
                             dec_stream = hc.as_ref().map(|h| (h.format, h.transfer));
                             enc_name = hc.as_ref().and_then(|h| h.encoder).map_or(String::new(), |b| b.label().to_string());
                             dec_name = format!("{} · {}", d.kind().label(), d.backend_name());
@@ -661,8 +674,9 @@ fn video_loop(
                                 ov.decoder_hint = d.kind().label().to_string();
                             }
                             println!(
-                                "Décodeur : {} ({}, {}){}{}",
+                                "Décodeur : {}{} ({}, {}){}{}",
                                 d.backend_name(),
+                                d.output_label().map_or(String::new(), |l| format!(" -> {l}")),
                                 crate::codec::label(codec),
                                 d.kind().label(),
                                 hc.as_ref().map_or(" [host sans négociation]".to_string(), |h| format!(" [codec choisi par le host : {}, {}]", h.reason.label(), stream_label(codec, Some(h)))),
@@ -677,6 +691,7 @@ fn video_loop(
                             dec = Some(d);
                         }
                         Err(e) => {
+                            renegotiations += 1;
                             if let Err(m) = renegotiate(&conn, &mut vc, codec, &e.causes()) {
                                 finish(Outcome::Decoder(m));
                                 break;
@@ -725,6 +740,7 @@ fn video_loop(
                     if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
                         let codec = d.codec();
                         dec = None;
+                        renegotiations += 1;
                         if let Err(m) = renegotiate(&conn, &mut vc, codec, &format!("{consecutive_errors} erreurs de suite : {e}")) {
                             finish(Outcome::Decoder(m));
                             break;
@@ -798,6 +814,24 @@ fn video_loop(
                      capture->écran ~{e2e:>5.1} ms  présentées {presented} écartées {dropped}  perdues {}",
                     s.transport.video_rx.frames_lost
                 );
+                // Diagnostic GPU/décodeur (à renvoyer en cas de GPU client saturé) : une conversion
+                // VideoProcessorBlt par image décodée au plus, re-présentations plafonnées.
+                let ds = dec.as_ref().map(|d| d.stats()).unwrap_or_default();
+                let idr_rx = s.video_keyframes - last.video_keyframes;
+                let idr_req = (s.keyframe_requests_app - last.keyframe_requests_app)
+                    + (s.transport.video_rx.keyframe_requests - last.transport.video_rx.keyframe_requests);
+                println!(
+                    "  diag : voie {dec_name}  Blt/s {}  Present/s {} (re-présentations {})  ProcessOutput/s {}  changements de flux {}  resets {}  \
+                     IDR reçues/s {idr_rx} demandées/s {idr_req}  décodeurs créés {decoders_created}  renégociations {renegotiations}  \
+                     reçu {wire_mbps:.1} Mb/s",
+                    pres.blts - last_pres.blts,
+                    pres.presents - last_pres.presents,
+                    pres.redraws - last_pres.redraws,
+                    ds.process_output_calls.saturating_sub(last_dec.process_output_calls),
+                    ds.stream_changes.saturating_sub(last_dec.stream_changes),
+                    ds.resets.saturating_sub(last_dec.resets),
+                );
+                last_dec = ds;
             }
             if secs_n == 1 {
                 // Démarrage : l'encodeur du host tourne déjà pendant que la fenêtre/le décodeur s'initialisent
@@ -837,6 +871,14 @@ fn video_loop(
         dropped_total,
         decode_errors
     );
+    {
+        let ps = handle.stats();
+        let k = s.keyframe_requests_app + s.transport.video_rx.keyframe_requests;
+        println!(
+            "GPU    : {} conversions VideoProcessorBlt, {} Present ({} re-présentations sans nouvelle image) | décodeurs créés {decoders_created}, renégociations {renegotiations}, IDR demandées {k}",
+            ps.blts, ps.presents, ps.redraws
+        );
+    }
     let fmin = all_fps.iter().cloned().fold(f64::MAX, f64::min);
     println!(
         "FPS    : moyen {:.1} (min {:.0} / max {:.0} par seconde, 1re exclue)",

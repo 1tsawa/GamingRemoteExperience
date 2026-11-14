@@ -76,7 +76,7 @@ mod tests {
             "client":{"no_input":false,"no_audio":true,"fullscreen":true},"update":{"auto_check":false}}"#;
         let s: GuiSettings = serde_json::from_slice(old).unwrap();
         assert_eq!(s.host.codec, crate::logic::CodecChoice::Hevc);
-        assert_eq!((s.host.fps, s.host.max_bitrate, s.host.idle_timeout, s.host.display), (30, 50, 5, 0));
+        assert_eq!((s.host.fps, s.host.max_bitrate, s.host.idle_timeout, s.host.display), (30, 30, 5, 0));
         assert!(s.client.fullscreen && s.client.no_audio && s.client.volume == 80);
         assert_eq!(s.client.codec, crate::logic::CodecChoice::Auto);
         assert!(!s.update.auto_check);

@@ -56,6 +56,20 @@ fn preferred_adapter() -> Result<IDXGIAdapter1> {
 /// NVIDIA s'il existe. C'est le device partagé entre décodeur et présentateur.
 ///
 /// N'initialise pas COM : winit exige un thread STA (OleInitialize) pour la boucle de fenêtre.
+/// `VendorId` PCI de l'adaptateur du device (0x8086 Intel, 0x10DE NVIDIA, 0x1002 AMD ; 0 inconnu).
+pub fn vendor_id(device: &ID3D11Device) -> u32 {
+    // Test : `GRX_FORCE_GPU_VENDOR=0x8086` simule un GPU Intel (ordre des décodeurs).
+    if let Some(v) = std::env::var("GRX_FORCE_GPU_VENDOR").ok().and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
+        return v;
+    }
+    (|| -> windows::core::Result<u32> {
+        let dxgi: IDXGIDevice = device.cast()?;
+        let adapter = unsafe { dxgi.GetAdapter() }?;
+        Ok(unsafe { adapter.GetDesc() }?.VendorId)
+    })()
+    .unwrap_or(0)
+}
+
 pub fn create_device() -> Result<ID3D11Device> {
     let adapter = preferred_adapter()?;
     let mut device: Option<ID3D11Device> = None;

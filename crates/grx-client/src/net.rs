@@ -87,6 +87,8 @@ pub struct ConnStats {
     pub transport: Stats,
     pub video_frames: u64,
     pub video_keyframes: u64,
+    /// Demandes d'image clé faites par l'application (démarrage, erreur de décodage, attente d'IDR).
+    pub keyframe_requests_app: u64,
     pub video_bytes: u64,
     /// Images purgées car le consommateur ne suivait pas (voir `ConnectOptions::video_queue`).
     pub video_overflow_dropped: u64,
@@ -476,6 +478,7 @@ fn net_loop(sh: Arc<Shared>, sock: UdpSocket, sess: Session, cmd_rx: Receiver<Cm
                     let _ = net.ep.send_control(&m);
                 }
                 Cmd::Keyframe => {
+                    st.keyframe_requests_app += 1;
                     let _ = net.ep.request_keyframe();
                 }
             }

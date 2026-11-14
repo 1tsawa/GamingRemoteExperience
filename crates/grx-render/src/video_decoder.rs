@@ -84,8 +84,11 @@ impl VideoDecoder {
         disabled: &DisabledDecoders,
         pref: DecoderPref,
     ) -> std::result::Result<(Self, Vec<Attempt>), ChainError> {
-        chain::create_with_pref(codec, disabled, pref, |k| Self::with_kind(device, codec, k).map_err(|e| short_error(&e)))
-            .map(|(d, _, a)| (d, a))
+        let vendor = crate::gpu::vendor_id(device);
+        chain::create_with_pref_vendor(codec, disabled, pref, vendor, |k| {
+            Self::with_kind(device, codec, k).map_err(|e| short_error(&e))
+        })
+        .map(|(d, _, a)| (d, a))
     }
 
     /// Flux HDR10 annoncé par le host (`GRX-CDC`) : les images sont marquées PQ/BT.2020.
@@ -144,6 +147,22 @@ impl VideoDecoder {
             Inner::Mf(d) => d.stats(),
             Inner::Ff { stats, .. } => *stats,
             Inner::Soft { dec, .. } => dec.stats,
+        }
+    }
+
+    /// Format du flux annoncé par le host : la voie Media Foundation choisit la sortie du MFT
+    /// correspondante (aucune conversion par image dans le MFT). Sans effet pour les autres voies.
+    pub fn set_format_hint(&mut self, f: PixelFormat) {
+        if let Inner::Mf(d) = &mut self.inner {
+            d.set_format_hint(f);
+        }
+    }
+
+    /// Format de sortie du décodeur (« NV12 »…) pour le diagnostic ; `None` hors Media Foundation.
+    pub fn output_label(&self) -> Option<&'static str> {
+        match &self.inner {
+            Inner::Mf(d) => Some(d.output_label()),
+            _ => None,
         }
     }
 
