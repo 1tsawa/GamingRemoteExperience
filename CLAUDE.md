@@ -2,6 +2,11 @@
 
 Clone de Parsec en Rust, sans serveur d'authentification. Voir `README.md`, `TUTO.md` et `docs/ARCHITECTURE.md`.
 
+## Clients multiples et portabilité
+
+- Le client tournera sur **d'autres machines que le PC de développement** (GPU Intel/AMD/NVIDIA, portables, sans extensions du Store…). Ne jamais supposer le matériel du PC de dev (RTX 4070 Ti) : tout choix matériel passe par la détection/négociation, avec repli et message clair. Ce qui n'est testé que sur le PC de dev doit être signalé comme tel.
+- Un **client Android** est prévu. Garder `grx-core`, `grx-transport` et le format des événements de `grx-input` **sans dépendance Windows** (code Windows derrière `cfg(windows)` ou dans des crates séparés), et le protocole documenté et indépendant de la plateforme.
+
 ## Délégation au LLM local
 
 Un LLM local (llama.cpp, Qwen3.6-35B-A3B, contexte 64k) sert à économiser des tokens.
