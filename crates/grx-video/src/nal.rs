@@ -5,6 +5,9 @@ use crate::Codec;
 /// Itère sur les NAL units d'un flux Annex-B et renvoie le `nal_unit_type`
 /// de chacune (H.264 : 5 bits, H.265 : 6 bits).
 pub fn nal_types(codec: Codec, data: &[u8]) -> Vec<u8> {
+    if codec == Codec::Av1 {
+        return crate::obu::obu_types(data);
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i + 3 < data.len() {
@@ -12,7 +15,7 @@ pub fn nal_types(codec: Codec, data: &[u8]) -> Vec<u8> {
             let hdr = data[i + 3];
             out.push(match codec {
                 Codec::H264 => hdr & 0x1F,
-                Codec::Hevc => (hdr >> 1) & 0x3F,
+                Codec::Hevc | Codec::Av1 => (hdr >> 1) & 0x3F,
             });
             i += 3;
         } else {
@@ -24,9 +27,13 @@ pub fn nal_types(codec: Codec, data: &[u8]) -> Vec<u8> {
 
 /// `true` si le flux contient une image IDR (H.264 : type 5 ; HEVC : 19/20 = IDR_W_RADL/IDR_N_LP).
 pub fn contains_idr(codec: Codec, data: &[u8]) -> bool {
+    if codec == Codec::Av1 {
+        return crate::obu::is_key_frame(data);
+    }
     nal_types(codec, data).iter().any(|&t| match codec {
         Codec::H264 => t == 5,
         Codec::Hevc => t == 19 || t == 20,
+        Codec::Av1 => false,
     })
 }
 
@@ -36,6 +43,7 @@ pub fn contains_parameter_sets(codec: Codec, data: &[u8]) -> bool {
     match codec {
         Codec::H264 => t.contains(&7) && t.contains(&8),
         Codec::Hevc => t.contains(&32) && t.contains(&33) && t.contains(&34),
+        Codec::Av1 => t.contains(&crate::obu::OBU_SEQUENCE_HEADER),
     }
 }
 

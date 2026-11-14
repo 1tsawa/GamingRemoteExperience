@@ -250,6 +250,9 @@ pub struct Overlay {
     pub monitor_hz: u32,
     /// Ligne d'état des manettes (vide : non affichée), mise à jour par `play.rs`.
     pub gamepads: String,
+    /// Bandeau de sécurité (écran sécurisé Windows / fenêtre administrateur côté host) ; `None` =
+    /// situation normale, rien n'est affiché. Rempli par `play.rs` d'après le message `GRX-SEC`.
+    pub security_banner: Option<String>,
     /// Écrans du host (`GRX-DSP`), vide avec un host ancien.
     pub displays: Vec<DisplayInfo>,
     /// Écran capturé (index dans `displays`).
@@ -294,6 +297,7 @@ impl Overlay {
             audio_enabled: true,
             monitor_hz: 60,
             gamepads: String::new(),
+            security_banner: None,
             displays: Vec::new(),
             active_display: None,
             preferred_display: None,
@@ -368,7 +372,7 @@ impl Overlay {
 
     /// Quelque chose est-il à l'écran ? (sinon aucun coût de rendu)
     pub fn is_visible(&self) -> bool {
-        self.menu_open || self.show_stats || self.float_visible()
+        self.menu_open || self.show_stats || self.float_visible() || self.security_banner.is_some()
     }
 
     fn float_visible(&self) -> bool {
@@ -1021,6 +1025,9 @@ impl Overlay {
             return None;
         }
         let mut s = OverlayScene::new(self.scale);
+        if let Some(text) = &self.security_banner {
+            self.draw_security_banner(&mut s, text);
+        }
         if self.show_stats {
             self.draw_stats(&mut s);
         }
@@ -1078,6 +1085,22 @@ impl Overlay {
             Some((i, d)) => format!("{}/{} {}", i + 1, self.displays.len(), if d.name.is_empty() { "Écran" } else { &d.name }),
             None => "-".into(),
         }
+    }
+
+    /// Bandeau discret en haut au centre : état de sécurité du host (écran sécurisé / fenêtre
+    /// administrateur). Toujours visible tant que la situation n'est pas revenue à la normale.
+    fn draw_security_banner(&self, s: &mut OverlayScene, text: &str) {
+        // Largeur proportionnelle au texte (≈ 7 px/caractère à 13 px), bornée à la fenêtre.
+        let w = ((text.chars().count() as f32 * 7.4) + 44.0).min(self.view_w - 2.0 * MARGIN).max(220.0);
+        let h = 30.0;
+        let x = ((self.view_w - w) / 2.0).max(MARGIN);
+        let y = MARGIN;
+        let r = Rect::new(x, y, w, h);
+        // Fond ambre sombre, liseré ambre : visible sans masquer le jeu.
+        s.fill(r, 7.0, Color::rgba(60, 42, 10, 0.92));
+        s.stroke(r, 7.0, Color::rgba(240, 180, 60, 0.85), 1.0);
+        s.fill(Rect::new(r.x, r.y, 4.0, r.h), 2.0, Color::rgba(240, 180, 60, 0.95));
+        s.text(Rect::new(r.x + 14.0, r.y, r.w - 22.0, r.h), text, 13.0, Color::rgb(248, 226, 170), Align::Left, Font::UiBold);
     }
 
     fn draw_toggle(s: &mut OverlayScene, w: Rect, on: bool, enabled: bool) {
@@ -1491,6 +1514,25 @@ mod tests {
         assert_eq!(classify_hotkey(KeyCode::KeyM, false, true, false), None);
         assert_eq!(classify_hotkey(KeyCode::KeyM, true, true, true), None);
         assert_eq!(classify_hotkey(KeyCode::KeyG, true, true, false), None);
+    }
+
+    #[test]
+    fn security_banner_shows_even_when_menu_closed_and_hides_when_cleared() {
+        let mut o = ov();
+        // Rien de visible au départ (menu fermé, souris loin).
+        assert!(o.scene().is_none());
+        // Bandeau de sécurité présent : la scène le dessine même menu fermé.
+        o.security_banner = Some("Fenêtre administrateur au premier plan sur le host".into());
+        assert!(o.is_visible());
+        let s = o.scene().expect("scène visible avec le bandeau");
+        let has_banner_text = s.items.iter().any(|it| matches!(
+            it,
+            grx_render::OverlayItem::Text { text, .. } if text.contains("Fenêtre administrateur")
+        ));
+        assert!(has_banner_text, "le bandeau doit contenir le texte de sécurité");
+        // Situation revenue à la normale : le bandeau disparaît.
+        o.security_banner = None;
+        assert!(o.scene().is_none());
     }
 
     #[test]

@@ -34,11 +34,12 @@ mod encoder;
 mod error;
 mod gpu;
 pub mod nal;
+pub mod obu;
 
 pub use capture::{capturable, list_displays, list_outputs, CapturedFrame, OutputInfo, ScreenCapturer};
 pub use displayconfig::{monitor_names, MonitorName};
 pub use cursor::{cursor_screen_pos, CursorImage, CursorState, CursorTracker};
-pub use encoder::{Encoder, EncoderBackend};
+pub use encoder::{available_encoders, Encoder, EncoderBackend};
 pub use error::{Result, VideoError};
 pub use gpu::{create_device_for_adapter, list_adapters, AdapterInfo};
 
@@ -49,6 +50,8 @@ pub enum Codec {
     H264,
     /// H.265 / HEVC (profil Main 8 bits 4:2:0).
     Hevc,
+    /// AV1 (profil Main 8 bits 4:2:0), flux d'OBU « low overhead » (voir [`obu`]).
+    Av1,
 }
 
 impl Codec {
@@ -57,6 +60,7 @@ impl Codec {
         match self {
             Codec::H264 => "h264",
             Codec::Hevc => "h265",
+            Codec::Av1 => "obu",
         }
     }
 }

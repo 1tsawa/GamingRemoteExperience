@@ -73,7 +73,7 @@ DATA  [0x10][sid u32 LE][nonce u64 LE][AES-256-GCM ciphertext + tag 16]
 - **Une seule session** à la fois, pas de HDR. ~~un seul écran (le principal)~~ **levée** : choix de l'écran capturé à chaud depuis l'overlay (voir « Écrans multiples ») ; un seul écran à la fois (pas de bureau étendu complet).
 - **Détection de coupure** d'un client tué : 5 s.
 - **Latence mesurée** capture→réception : valable en local ou avec horloges synchronisées ; la latence jusqu'au pixel affiché n'est pas mesurée.
-- **Décodage HEVC** : nécessite l'extension Windows « HEVC Video Extensions » (présente ici) ; sinon utiliser `--codec h264`.
+- **Décodage HEVC** : Media Foundation demande l'extension « HEVC Video Extensions » ; sans elle, FFmpeg D3D11VA (DLL LGPL facultatives) ou, à défaut, H.264 négocié automatiquement (voir « Codecs et négociation »).
 - **Contrôleur de débit** AIMD simple (oscille, réagit à une perte aléatoire >10 % comme à de la congestion).
 
 ## Feuille de route restante
@@ -85,6 +85,16 @@ DATA  [0x10][sid u32 LE][nonce u64 LE][AES-256-GCM ciphertext + tag 16]
 5. ~~Incrustation du **curseur** (forme + position envoyées à part)~~ (fait, voir « Curseur distant »), ~~multi-écrans~~ (fait, voir « Écrans multiples »), presse-papiers
 6. Écran virtuel (pilote IDD tiers) pour les hosts sans écran ; chiffrement DPAPI des identités
 7. Tests réseau réels (2 machines, Wi-Fi, 4G) et réglage du contrôle de débit
+
+## Codecs et négociation
+
+- **Protocole** (`grx_core::codec_neg`, canal Control fiable) : `[magie 7][version 1][count ≤ 16][(clé u8, longueur u8, valeur)…]`, ≤ 512 o, longueur exacte ; clé connue mal formée → message refusé, clé inconnue ignorée, capacités inconnues (codec/backend) ignorées : extensible sans casser les anciens pairs. `GRX-COD` client → host : 1 = capacités de décodage `[codec][backend][formats][réservé]` × ≤ 32, 2 = codec demandé (`play --codec`), 3 = renégociation, 4 = mode de décodeur (Auto/matériel/logiciel). `GRX-CDC` host → client : 1 = encodeurs, 2 = codec choisi (obligatoire), 3 = raison, 4 = format du flux. Fuzz 200 000 tampons. **Points d'extension (phase 2)** : `BackendId` ouvert (MF, FFmpeg D3D11VA, logiciel, NVENC/AMF/QSV réservés), `FormatSet` (4:2:0/4:4:4 × 8/10 bits, par capacité et pour le flux), `DecoderMode`, octet réservé « profil », clés 5..255 libres ; côté rendu, `DecoderKind` + `DecoderKind::CHAIN` (`grx-render/src/chain.rs`).
+- **Choix** (`codec_neg::choose`, testé exhaustivement) : sans annonce (ancien client), `auto` → H.264 ; un codec forcé par le host est gardé (comportement historique). Avec annonce : candidats = encodeurs du host ∩ décodeurs du client ; préférence du client, puis du host, puis HEVC > H.264 ; AV1 jamais choisi automatiquement ; aucun commun → H.264.
+- **Host** (`grx-host/src/codec.rs`) : `CodecState` partagé boucle réseau / thread vidéo. Le thread vidéo attend l'annonce au plus 700 ms avant d'ouvrir l'encodeur (`open_encoder` : échec de création → codec marqué en panne, repli jusqu'à H.264) ; en cours de session, un nouveau choix recrée l'encodeur (~30 ms) avec image clé. Encodeurs disponibles : énumération MFT matériels (`grx_video::available_encoders`, en cache ; ici NVIDIA H.264/HEVC/AV1). AV1 : profil Main 8 bits, flux d'OBU « low overhead » (`grx_video::obu` : découpe, sequence header, `KEY_FRAME`).
+- **Client** (`grx-client/src/codec.rs`, `play.rs`) : device D3D11 créé avant la connexion et partagé avec le présentateur ; `grx_render::probe_decoders` (thread dédié MTA, vérifie le profil D3D11 du GPU puis crée vraiment le décodeur, chaîne MF → FFmpeg, cache par adaptateur et voies désactivées ; ~80 ms ici) → `GRX-COD`. Le codec du flux est reconnu sur chaque image clé (Annex-B ou OBU) : changement → nouveau décodeur. Création impossible ou 8 erreurs de décodage consécutives → codec retiré, `GRX-COD` de renégociation, attente des images du nouveau codec ; impossible (H.264, ancien host) → message clair (codec, cause, solutions ; pas de conseil réseau) et code de sortie 4, que `grx-gui` affiche comme « décodage vidéo impossible ». Options cachées de test : `--disable-decoder mf-hevc,ffmpeg,av1,…`, `--fail-decoder-after hevc:120`.
+- **FFmpeg D3D11VA** (`grx-render/src/ffmpeg.rs`) : `avcodec-62` / `avutil-60` (+ `swresample-6` si présent) chargées par `LoadLibraryExW` en chemin absolu depuis `%GRX_FFMPEG_DIR%`, le dossier de l'exe puis `exe\ffmpeg` (jamais le `PATH`) ; version majeure vérifiée (offsets `AVCodecContext.hw_device_ctx` = 560, `AVHWDeviceContext.hwctx` = 16, `AVFrame.width/height/format` = 104/108/116, mesurés sur les en-têtes FFmpeg 8.1). Contexte D3D11VA créé sur **notre** device (zéro copie), décodeurs natifs `h264`/`hevc`/`av1`, `threads=1`, `low_delay`, `extra_hw_frames=4` ; sortie `AV_PIX_FMT_D3D11` = texture NV12 + index de tranche, gardée par une référence `AVFrame` jusqu'à l'affichage ; une image non matérielle (profil refusé) = erreur → repli. Absent ou autre version : voie désactivée. **Non testé sur cette machine** (le chargement de DLL téléchargées n'a pas été autorisé) : à valider avec des DLL fournies.
+- **DLL FFmpeg et licence** : jamais de build GPL (`build-setup.ps1` refuse `--enable-gpl`/`--enable-nonfree` trouvés dans la configuration embarquée ; le `F:\ffmpeg` local est une build statique GPL, inutilisable). Intégration à l'installateur seulement si `third_party\ffmpeg\` (ou `-FfmpegDir`) contient les DLL, `LICENSE.txt` (LGPL, installé dans `licenses\FFmpeg-LGPL.txt`) et `SOURCE.txt` (provenance : URL de la build et des sources correspondantes, obligation LGPL). Build prête à l'emploi : BtbN `ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip` (github.com/BtbN/FFmpeg-Builds, 91 Mo de DLL : setup 6,7 → 34 Mo). Build minimale recommandée (~5 Mo) : `./configure --enable-shared --disable-static --disable-programs --disable-doc --disable-everything --disable-avdevice --disable-avformat --disable-avfilter --disable-swscale --disable-swresample --enable-d3d11va --enable-decoder=h264,hevc,av1 --enable-hwaccel=h264_d3d11va,hevc_d3d11va,av1_d3d11va` (MSYS2/mingw-w64, FFmpeg 8.x, sans `--enable-gpl`).
+- **Mesures** (RTX 4070 Ti, boucle locale 2560x1440 60 img/s, appel du décodeur) : HEVC MF 0,18 ms ; H.264 MF 0,27 ms ; AV1 MF 0,16-0,19 ms ; `codec_check` 1080p (appel + fin GPU) : HEVC 0,48 ms, H.264 0,88 ms, AV1 1,11 ms. Renégociation HEVC → H.264 en session : encodeur recréé en 32 ms, aucune coupure.
 
 ## Curseur distant
 
@@ -182,6 +192,98 @@ Vérification en boucle locale (127.0.0.1, `--no-input`, GPU réel) : datagramme
 - **Révocation / changement de rôle** : la session est coupée sans préavis ; pas d'IPC avec le service (la CLI écrit le fichier, le host le relit chaque seconde).
 - **Liste de confiance et identité** non chiffrées (ACL du profil ; DPAPI à faire).
 - Une clé autorisée peut toujours reprendre la main de SA propre session (voulu : reconnexion) ; pas de borne sur le nombre de clients autorisés ; `view_only` n'empêche pas de recevoir l'audio/vidéo (voulu).
+
+## Contrôle total (host élevé, fenêtres administrateur et UAC)
+
+Problème : sous Windows, un processus d'intégrité « moyenne » (le host lancé normalement) ne peut
+pas injecter d'entrées (`SendInput`) vers une fenêtre d'intégrité supérieure (UIPI). Quand une
+fenêtre administrateur passe au premier plan côté host (ex. Gestionnaire des tâches), la souris du
+client semble « figée ». Pendant une invite UAC ou l'écran de verrouillage, Windows bascule sur un
+**bureau sécurisé** (`Winlogon`) : un processus non-SYSTEM n'y capture rien (DXGI renvoie
+`E_ACCESSDENIED`) et n'y injecte rien.
+
+Décision de l'utilisateur : « Host administrateur, sans UAC » — pas de service SYSTEM, pas de jeton
+dupliqué, pas de pilotage du bureau Winlogon/UAC. On ne cherche donc **pas** à automatiser l'UAC :
+on la laisse se valider sur place, et on rend le host élevé pour le reste.
+
+### Ce qui est possible / impossible
+
+| Situation host | Ce que voit/fait le client |
+|---|---|
+| Bureau normal | Historique : `ViewOnly` voit, `Full`/`Total` injectent clavier/souris/manette. |
+| Fenêtre administrateur au premier plan, **host non élevé** | Image OK, manette OK (ViGEm = pilote, hors UIPI) ; **clavier/souris bloqués pour tous** (même `Total`), bandeau « activez Contrôle total sur le host ». |
+| Fenêtre administrateur au premier plan, **host élevé** | `Total` pilote clavier/souris ; `Full` non (bloqué + bandeau « rôle Contrôle total requis ») ; manette OK. |
+| Fenêtre d'intégrité **strictement supérieure au host** (ex. SYSTEM devant un host « seulement » élevé) | Clavier/souris bloqués pour tous (UIPI), bandeau « clavier/souris inopérants ». |
+| **Bureau sécurisé** (invite UAC, Ctrl+Alt+Suppr, verrouillage) | **Jamais d'image ni d'entrée, pour personne, quel que soit le rôle.** L'UAC se valide physiquement sur le PC host. |
+
+La politique pure est dans `grx_core::secure` (`access`/`notice`, 100 % testée sans Windows) ;
+l'observation (lecture seule) du bureau et des intégrités dans `grx-host/src/secure.rs`
+(`OpenInputDesktop`+`GetUserObjectInformation UOI_NAME`, `GetForegroundWindow`→`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`→`TokenIntegrityLevel`).
+Un thread `grx-secure` publie la situation toutes les 200 ms ; la boucle réseau ne fait que lire un
+atomique. À chaque changement, le host envoie au client un message Control `GRX-SEC`
+(`grx_core::secure_notice`, 11 octets, décodage strict + fuzz) ; l'overlay affiche un bandeau
+discret qui disparaît au retour à la normale. Au passage dans un état où le clavier/souris est
+bloqué, le host demande au thread d'entrée un `release_all()` (pas de touche « coincée »). La
+capture DXGI reprend seule après l'UAC (gestion `DXGI_ERROR_ACCESS_LOST`/`E_ACCESSDENIED` existante).
+
+### Rôle par client
+
+`trust.rs` : `enum Role { ViewOnly, Full, Total }` (rétrocompat `view_only` : le champ booléen reste
+écrit pour qu'une version ancienne lise un rôle sûr — un `total` y apparaît comme `full` ; le plus
+restrictif gagne). `grx-host set-role <fp> total`, et dans grx-gui une liste déroulante
+Lecture seule / Complet / Contrôle total avec **confirmation explicite** pour Contrôle total (ce
+client pourra piloter les fenêtres administrateur). Changer le rôle coupe la session (reconnexion).
+
+### Host élevé via tâche planifiée (pas de service, une seule UAC)
+
+`grx-host elevation enable|disable|status`, et un interrupteur dans l'onglet Host de grx-gui.
+`enable` vérifie d'abord le dossier (voir modèle de menace) puis, via **ShellExecute `runas`**
+(une seule UAC), relance une sous-commande interne élevée qui crée une **tâche planifiée**
+« GamingRemoteExperience Host (élevé) » pour l'utilisateur courant : principal `InteractiveToken`
+(sa session, sans mot de passe stocké), `RunLevel=HighestAvailable`, exécution à la demande
+(+ déclencheur à l'ouverture de session, optionnel), instance unique, priorité normale. L'action
+est figée : `grx-host run --from-task`. Les **options de lancement ne sont pas dans la ligne de
+commande de la tâche** (elle est créée sous UAC) : grx-gui les écrit dans `host-options.json`
+(`grx_core::elevation::TaskOptions`), filtrées par une **liste blanche stricte**
+(`validate_run_args` : pas de `--data-dir`, pas de chemin, pas d'option de test cachée, pas de
+`--opt=valeur`, valeurs bornées) ; le host élevé relit ce fichier et revalide avant de l'appliquer.
+
+Le bouton « Démarrer » de grx-gui lance alors le host élevé par `schtasks /Run` (aucune UAC à
+chaque fois). « Arrêter » : grx-gui (non élevé) ne peut pas envoyer Ctrl+C à un processus élevé —
+le host élevé crée donc un **événement nommé** `Local\GamingRemoteExperience-Host-Stop-<pid>` dont
+l'ACL n'autorise que l'utilisateur courant (+ SYSTEM) ; grx-gui le déclenche par
+`grx-host elevation stop --pid <pid>`, le host s'arrête proprement (referme la redirection box,
+`release_all`). `disable` supprime la tâche (une UAC). L'installateur/`grx-update` arrêtent et
+relancent le host élevé lors d'une mise à jour (la mise à jour machine passe déjà par UAC).
+
+### Modèle de menace
+
+- **Élévation silencieuse par remplacement d'exe** : la tâche lance un exe élevé sans ré-auth. Si
+  cet exe (ou son dossier) était modifiable par un utilisateur standard, n'importe qui pourrait le
+  remplacer et obtenir une élévation silencieuse. `enable` **refuse** donc d'activer si
+  `grx-host.exe` n'est pas dans un dossier protégé : vérification à la fois du chemin (sous
+  `Program Files`, installation « pour tous les utilisateurs ») **et** d'un test d'écriture réel
+  (`can_write`) quand on n'est pas élevé. Chemin absolu obligatoire.
+- **Fichier d'options détourné** : au pire, l'utilisateur ne change que **ses propres** paramètres
+  de capture (liste blanche ; jamais de chemin ni de `--data-dir`). Le fichier est dans le dossier
+  de données de l'utilisateur ; il ne peut pas faire exécuter autre chose à l'exe élevé.
+- **Événement d'arrêt détourné** : ACL restreinte à l'utilisateur courant — un autre utilisateur de
+  la machine ne peut ni le déclencher ni le créer d'avance.
+- **UAC / bureau sécurisé** : jamais capturés ni pilotés à distance (impossible pour un non-SYSTEM,
+  et voulu). Une invite UAC se valide physiquement. Un client `Total` peut piloter des fenêtres
+  **administrateur** (après élévation déjà accordée), ce qui est un vrai pouvoir : d'où la
+  confirmation explicite et un rôle distinct de `Full`.
+- **Limites** : le host élevé tourne en permanence avec les droits admin de l'utilisateur ; un
+  client `Total` compromis a autant de pouvoir qu'un administrateur local interactif (hors UAC).
+  Observation uniquement en lecture seule, aucun pilotage du Planificateur/Winlogon.
+
+Tests : `grx_core::secure` (décision rôle×situation, messages + fuzz `GRX-SEC`),
+`grx_core::elevation` (XML de la tâche, liste blanche, dossier protégé, SID, décodage schtasks),
+`grx-host::secure` (intégrité lue sur des processus présents, en lecture seule ; simulation),
+`grx-host::elevation` (preflight refuse un dossier inscriptible, aller-retour `host-options.json`),
+overlay client (bandeau visible/masqué). Boucle locale réelle avec le mode de test caché
+`run --simulate-secure cycle` (aucune UAC, aucune tâche créée) : pendant l'état « bureau sécurisé »
+simulé, le host n'envoie plus d'image (0 img/s côté client) et envoie `GRX-SEC`.
 
 ## Jalon GUI (`crates/grx-gui`)
 

@@ -3,7 +3,7 @@
 Streaming de jeu / bureau à distance à la Parsec, **sans serveur d'authentification** :
 chaque machine a sa clé, le host décide seul qui peut se connecter.
 
-Windows uniquement pour l'instant (host et client). Rust, encodage/décodage matériel H.265 (NVIDIA), UDP chiffré AES-256-GCM.
+Windows uniquement pour l'instant (host et client). Rust, encodage/décodage matériel HEVC / H.264 / AV1 (NVIDIA ; codec négocié selon les décodeurs du client), UDP chiffré AES-256-GCM.
 
 ## Installation (setup.exe)
 
@@ -30,7 +30,7 @@ cargo build --release -p grx-host -p grx-client     # binaires dans target\relea
 ```powershell
 # 1. Lancer le host : il ouvre tout seul le port UDP 7777 sur la box (UPnP), voir plus bas
 target\release\grx-host.exe run --bind [::]:7777
-#    options : --codec hevc|h264  --fps 60  --max-bitrate 50  --fill  --no-input  --no-audio
+#    options : --codec auto|hevc|h264|av1 (défaut auto : négocié)  --fps 60  --max-bitrate 50  --fill  --no-input  --no-audio
 #              --display N (écran capturé au départ, 1 = le plus à gauche ; défaut : principal)
 #              --no-upnp  --external-port 7777  --upnp-lease 3600
 
@@ -49,7 +49,19 @@ target\release\grx-client.exe play "grx://…" --save-as monpc
 target\release\grx-client.exe play monpc
 ```
 
-Gestion des clients autorisés côté host : `grx-host list` (affiche aussi le rôle), `grx-host revoke <début d'empreinte>` (coupe la session en cours en ~1 s), `grx-host set-role <début d'empreinte> view-only|full` (spectateur : voit et entend, n'injecte rien).
+Gestion des clients autorisés côté host : `grx-host list` (affiche aussi le rôle), `grx-host revoke <début d'empreinte>` (coupe la session en cours en ~1 s), `grx-host set-role <début d'empreinte> view-only|full|total` (spectateur : voit et entend, n'injecte rien ; `total` : peut aussi piloter les fenêtres administrateur quand le host tourne élevé, voir ci-dessous).
+
+### Contrôle total (fenêtres administrateur, UAC)
+
+Quand une fenêtre administrateur (ex. Gestionnaire des tâches) est au premier plan côté host, Windows (UIPI) bloque les entrées venant d'un host non élevé : la souris du client « fige ». Le mode **Contrôle total** rend le host élevé, sans invite UAC à chaque démarrage, via une tâche planifiée créée une seule fois :
+
+```powershell
+grx-host elevation enable        # une seule UAC ; + --at-logon pour lancer à l'ouverture de session
+grx-host elevation status        # état (tâche, dossier protégé, processus élevé)
+grx-host elevation disable       # supprime la tâche (une UAC)
+```
+
+Exige une installation « pour tous les utilisateurs » (grx-host.exe dans `Program Files`, non modifiable par un utilisateur standard) : sinon l'activation est refusée (modèle de menace dans `docs/ARCHITECTURE.md`). Seul un client de rôle `total` pilote alors les fenêtres administrateur ; l'invite UAC et l'écran de verrouillage de Windows ne sont **jamais** visibles ni pilotables à distance (à valider sur place). Le client affiche un bandeau quand une de ces situations survient.
 Durcissement de l'injection côté host : `grx-host run --no-keyboard --no-mouse --no-gamepad --block-win-key` (touches Windows filtrées). Manettes virtuelles : `--gamepad-type auto|xbox|ds4`.
 Vérifiez que l'empreinte affichée par `invite` est celle que le client voit à la connexion.
 
@@ -68,7 +80,7 @@ Seul le **host** doit être joignable ; le client n'a rien à ouvrir. Il n'y a p
 ### Raccourcis du client `play`
 `Ctrl+Maj+M` **menu en overlay** (aussi via le bouton qui apparaît en haut au centre) · `Ctrl+Maj+S` stats à l'écran · `Ctrl+Maj+Q` déconnexion · `Ctrl+Maj+←/→` écran distant précédent/suivant · `F11` plein écran · `F10` stats dans le titre · `Ctrl+Alt+Maj+G` (modifiable : `--capture-key`) capture souris relative · `Alt+F4` quitter.
 Menu (comme Parsec) : plein écran, statistiques détaillées, volume + muet, **bande passante max** et **FPS max** (envoyés au host, appliqués à chaud), **écran du host** capturé (s'il en a plusieurs : bascule à chaud, choix mémorisé), capture souris, **verrouillage du clavier** (Win/Alt+Tab envoyés au host), VSync, bouton flottant, rappel des raccourcis, déconnexion. Menu ouvert : souris et clavier restent au client. Détails dans [TUTO.md](TUTO.md).
-Options : `--no-input`, `--no-audio`, `--no-gamepad`, `--gamepad-as xbox|auto|ds4`, `--volume`, `--stats`, `--fullscreen`, `--vsync`, `--width/--height`, `--local-cursor`.
+Options : `--codec auto|hevc|h264|av1` (défaut auto), `--no-input`, `--no-audio`, `--no-gamepad`, `--gamepad-as xbox|auto|ds4`, `--volume`, `--stats`, `--fullscreen`, `--vsync`, `--width/--height`, `--local-cursor`.
 
 ### Manettes
 Branchez la manette **côté client** : elle apparaît côté host comme une manette virtuelle (ViGEmBus doit être installé sur le host).
@@ -77,6 +89,9 @@ Branchez la manette **côté client** : elle apparaît côté host comme une man
 - **Vibrations** : renvoyées du jeu vers la manette physique (Xbox via XInput, DualShock 4 / DualSense via HID) quand la manette virtuelle est une Xbox 360. Pas de vibration en DualShock 4 virtuelle ni sur les manettes génériques ; gyroscope, pavé tactile (position), LED et gâchettes adaptatives non transmis.
 - Fenêtre sans focus ou menu ouvert : les manettes envoient l'état neutre. Le menu affiche une ligne « Manettes : … » avec leur type.
 Curseur : comme Parsec, le **curseur du host** (forme du jeu, position, visibilité) est dessiné par-dessus la vidéo, y compris en mode capture souris, et le curseur Windows local est masqué au-dessus de l'image. Quand le jeu cache son curseur (caméra au clic droit dans WoW…), il disparaît aussi chez le client. `--local-cursor` revient à l'ancien comportement (curseur Windows local seul).
+
+### Codecs (négociation automatique)
+Au démarrage, `play` **sonde ses décodeurs** (création réelle d'un décodeur D3D11 sur le GPU pour HEVC, H.264 et AV1, ~80 ms, en cache) et les annonce au host (`GRX-COD`). Le host choisit (`run --codec auto` par défaut : **HEVC, sinon H.264** ; AV1 seulement sur demande `--codec av1` d'un côté ou de l'autre, s'il est encodable et décodable) et annonce son choix (`GRX-CDC`). Un client sans décodeur HEVC (PC sans l'extension « HEVC Video Extensions ») reçoit donc du H.264 sans rien régler. Chaîne de décodage du client : **Media Foundation** (matériel, extensions du Store pour HEVC/AV1) → **FFmpeg D3D11VA** (matériel aussi, DLL LGPL facultatives `avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll` à côté de `grx-client.exe`) → codec annoncé indisponible. Si un décodeur tombe en panne en cours de session, le client renégocie (H.264) **sans couper la session**. Un ancien client (sans négociation) reçoit du H.264 d'un host en `auto` ; un ancien host est décodé tel quel. Le codec et la voie de décodage s'affichent dans les statistiques (`Ctrl+Maj+S` : « Flux 2560x1440 HEVC · MF matériel »). `cargo run --release -p grx-render --example codec_check` mesure chaque couple codec/voie.
 
 ### Tests sans risque
 `grx-host run --no-input --no-audio --fill` + `grx-client bench <cible> --secs 10` mesure FPS, débit, latence, perte sans rien injecter.
@@ -91,7 +106,7 @@ target\release\grx-gui.exe          # grx-host.exe et grx-client.exe doivent êt
 target\release\grx-gui.exe --data-dir-host C:\tmp\h --data-dir-client C:\tmp\c   # ou GRX_DATA_DIR_HOST / GRX_DATA_DIR_CLIENT
 ```
 
-- **Onglet Host** : empreinte du host (copiable) ; création d'invitation (adresse publique mémorisée, bouton « Détecter mon IP locale » sans aucune requête Internet, validité 5 min / 1 h / 24 h) avec lien, bouton Copier, **QR code** et compte à rebours ; liste des clients autorisés (rôle Complet / Lecture seule, révocation avec confirmation), rafraîchie toute seule quand `trust.json` change ; démarrage/arrêt de `grx-host run` (bind, codec, fps, `--no-input`, `--no-keyboard/--no-mouse/--no-gamepad`, `--block-win-key`, `--no-audio`) avec ses dernières lignes de sortie. L'arrêt envoie Ctrl+C (arrêt propre), un host lancé depuis un terminal est détecté mais pas arrêté.
+- **Onglet Host** : empreinte du host (copiable) ; création d'invitation (adresse publique mémorisée, bouton « Détecter mon IP locale » sans aucune requête Internet, validité 5 min / 1 h / 24 h) avec lien, bouton Copier, **QR code** et compte à rebours ; liste des clients autorisés (rôle Complet / Lecture seule / Contrôle total avec confirmation explicite, révocation avec confirmation), rafraîchie toute seule quand `trust.json` change ; démarrage/arrêt de `grx-host run` (bind, codec, fps, `--no-input`, `--no-keyboard/--no-mouse/--no-gamepad`, `--block-win-key`, `--no-audio`) avec ses dernières lignes de sortie. L'arrêt envoie Ctrl+C (arrêt propre), un host lancé depuis un terminal est détecté mais pas arrêté. Section **Contrôle total (host élevé)** : activer/désactiver le mode (une UAC), puis démarrage du host élevé par la tâche planifiée (sans UAC) et arrêt propre par événement nommé.
 - **Accès Internet dans la GUI** : quand le host tourne, la carte Statut lit `status.json` (~1 s) : redirection ouverte (méthode, adresse externe, bail restant), en cours, ou échec avec la cause et un conseil (CGNAT, double NAT, UPnP désactivé → redirection manuelle) ; état du pare-feu Windows et bouton « Voir la commande » qui affiche/copie la sortie de `grx-host firewall-help` (la GUI ne l'exécute **jamais**). Options de lancement : « Ouvrir le port automatiquement (UPnP) » (cochée par défaut, sinon `--no-upnp`) et port externe (`--external-port`). Carte Invitation : l'adresse est pré-remplie avec l'adresse externe de la redirection (sans écraser une saisie manuelle), bouton « Adresse publique automatique » (même logique que `invite --addr auto` : `status.json`, sinon IP externe demandée à la box, réseau local uniquement) et lien IPv6 alternatif (même jeton) quand le host écoute en `[::]`. Fermer la GUI arrête le host par Ctrl+C, ce qui supprime la redirection de la box.
 - **Onglet Client** : hosts mémorisés (Renommer / Supprimer / Connecter avec `--no-input`, `--no-audio`, `--fullscreen`), ajout d'un host par lien `grx://` (bouton Coller, validation immédiate, adresse et **empreinte à comparer à l'œil**, nom), « Appairer et connecter » ; empreinte de ce client.
 - Le jeton n'existe qu'en mémoire (jamais écrit par la GUI) ; il est passé à `grx-client` par l'entrée standard (`grx-client play - --save-as nom`), pas en ligne de commande. Préférences non secrètes dans `<dossier host>\gui.json`.

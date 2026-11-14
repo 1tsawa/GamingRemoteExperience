@@ -1,4 +1,5 @@
 mod bench;
+mod codec;
 mod cursor;
 mod gamepads;
 mod input;
@@ -12,7 +13,7 @@ mod play;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use grx_core::util::default_data_dir;
 use grx_core::{fingerprint, Identity, Invite, ProfileStore};
@@ -28,10 +29,21 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// `play --codec` : codec demandé au host.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PlayCodecArg {
+    /// Le host choisit parmi les décodeurs de ce PC (HEVC, sinon H.264)
+    Auto,
+    Hevc,
+    H264,
+    Av1,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub enum CodecArg {
     Hevc,
     H264,
+    Av1,
 }
 
 #[derive(Subcommand)]
@@ -118,6 +130,16 @@ enum Cmd {
         /// (tests) journalise chaque événement manette envoyé
         #[arg(long, hide = true)]
         gamepad_verbose: bool,
+        /// Codec demandé au host (auto : le host choisit selon les décodeurs de ce PC ; un codec
+        /// que ce PC ne sait pas décoder n'est jamais imposé)
+        #[arg(long, value_enum, default_value = "auto")]
+        codec: PlayCodecArg,
+        /// (tests) voies de décodage à ignorer, ex. mf-hevc, ffmpeg, av1, ffmpeg-h264
+        #[arg(long, hide = true, default_value = "")]
+        disable_decoder: String,
+        /// (tests) panne simulée du décodeur : codec:images, ex. hevc:120
+        #[arg(long, hide = true)]
+        fail_decoder_after: Option<String>,
     },
     /// Liste les manettes détectées (XInput, DualShock 4 / DualSense, génériques) et affiche leur
     /// état pendant quelques secondes, sans connexion à un host
@@ -265,6 +287,9 @@ fn main() -> Result<()> {
             gamepad_as,
             sim_gamepad,
             gamepad_verbose,
+            codec,
+            disable_decoder,
+            fail_decoder_after,
         } => {
             let (invite, known) = store.resolve(&read_target(target)?)?;
             println!("Connexion à {} — empreinte attendue : {}", invite.addr, fingerprint(&invite.host_key));
@@ -295,6 +320,30 @@ fn main() -> Result<()> {
                         verbose: gamepad_verbose,
                         ..Default::default()
                     }),
+                    codec: {
+                        use grx_core::codec_neg::VideoCodec;
+                        match codec {
+                            PlayCodecArg::Auto => None,
+                            PlayCodecArg::Hevc => Some(VideoCodec::Hevc),
+                            PlayCodecArg::H264 => Some(VideoCodec::H264),
+                            PlayCodecArg::Av1 => Some(VideoCodec::Av1),
+                        }
+                    },
+                    disabled_decoders: grx_render::DisabledDecoders::parse(&disable_decoder)
+                        .map_err(|e| anyhow!("--disable-decoder : {e}"))?,
+                    fail_decoder_after: match fail_decoder_after.as_deref().map(|v| v.split_once(':')) {
+                        None => None,
+                        Some(Some((c, n))) => Some((
+                            match c {
+                                "h264" => grx_video::Codec::H264,
+                                "hevc" => grx_video::Codec::Hevc,
+                                "av1" => grx_video::Codec::Av1,
+                                _ => bail!("--fail-decoder-after : codec h264|hevc|av1"),
+                            },
+                            n.parse().map_err(|_| anyhow!("--fail-decoder-after : nombre d'images"))?,
+                        )),
+                        Some(None) => bail!("--fail-decoder-after : codec:images"),
+                    },
                 },
                 |_| if !known { store.remember(&invite, save_as.clone()) } else { Ok(()) },
             )?;

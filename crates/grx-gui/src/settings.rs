@@ -20,6 +20,10 @@ pub struct GuiSettings {
     pub client: ClientPlayOptions,
     /// Recherche de mises à jour (activée par défaut, au plus une fois par jour).
     pub update: UpdatePrefs,
+    /// Démarrer le host en mode « Contrôle total » (host élevé via la tâche planifiée).
+    pub host_elevated: bool,
+    /// Lancer aussi le host élevé à l'ouverture de session (option de la tâche).
+    pub host_at_logon: bool,
 }
 
 pub fn settings_path(host_dir: &Path) -> PathBuf {
@@ -53,6 +57,8 @@ mod tests {
             host: HostRunOptions { fps: 30, no_input: true, ..Default::default() },
             client: ClientPlayOptions { fullscreen: true, ..Default::default() },
             update: UpdatePrefs { auto_check: false, last_check_ms: 42 },
+            host_elevated: true,
+            host_at_logon: false,
         };
         save(&p, &s).unwrap();
         assert_eq!(load(&p), s);

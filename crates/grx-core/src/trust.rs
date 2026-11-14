@@ -13,14 +13,91 @@ pub const MAX_INVITE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// Nombre maximal d'invitations en attente (évite de gonfler `trust.json`).
 const MAX_PENDING_INVITES: usize = 64;
 
+/// Rôle d'un client autorisé.
+///
+/// * `ViewOnly` : voit l'écran et entend le son, n'injecte rien ;
+/// * `Full` : clavier, souris, manette sur le bureau normal (comportement historique) ;
+/// * `Total` : comme `Full`, et en plus, quand le host tourne en mode « Contrôle total » (host
+///   lancé élevé par sa tâche planifiée), pilote clavier/souris des fenêtres administrateur au
+///   premier plan. Le bureau sécurisé (invite UAC, écran de verrouillage) n'est JAMAIS visible
+///   ni pilotable à distance, quel que soit le rôle : il se valide sur place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub enum Role {
+    ViewOnly,
+    #[default]
+    Full,
+    Total,
+}
+
+impl Role {
+    /// Nom stocké dans `trust.json` et accepté par la CLI (`view_only`, `full`, `total`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::ViewOnly => "view_only",
+            Role::Full => "full",
+            Role::Total => "total",
+        }
+    }
+
+    /// Analyse tolérante (casse, `-`/`_`) ; `None` si inconnu.
+    pub fn parse(s: &str) -> Option<Role> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "view_only" | "viewonly" | "spectateur" => Some(Role::ViewOnly),
+            "full" | "complet" => Some(Role::Full),
+            "total" | "controle_total" => Some(Role::Total),
+            _ => None,
+        }
+    }
+
+    pub fn can_inject(self) -> bool {
+        self != Role::ViewOnly
+    }
+}
+
+impl Serialize for Role {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Role {
+    /// Un rôle inconnu (fichier écrit par une version future) devient `ViewOnly` : moindre
+    /// privilège, sans rendre tout le fichier illisible.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Role, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Role::parse(&s).unwrap_or(Role::ViewOnly))
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AuthorizedClient {
     pub key: String,
     pub name: String,
     pub added_ms: u64,
-    /// Rôle « spectateur » : le client voit l'écran et entend le son mais n'injecte rien.
+    /// Ancien champ (≤ 0.2.0) : rôle « spectateur ». Toujours écrit (`role == ViewOnly`) pour
+    /// qu'une version ancienne lise un rôle sûr : un client `total` y est vu comme `full`.
     #[serde(default)]
     pub view_only: bool,
+    /// Rôle (≥ 0.3.0). Absent = déduit de `view_only`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+}
+
+impl AuthorizedClient {
+    /// Rôle effectif. `view_only = true` l'emporte toujours (le plus restrictif gagne si les deux
+    /// champs se contredisent, par exemple après une modification par une version ancienne).
+    pub fn role(&self) -> Role {
+        if self.view_only {
+            Role::ViewOnly
+        } else {
+            self.role.unwrap_or(Role::Full)
+        }
+    }
+
+    fn set_role(&mut self, r: Role) {
+        self.view_only = r == Role::ViewOnly;
+        self.role = Some(r);
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -130,8 +207,13 @@ impl TrustStore {
 
     /// Rôle « spectateur » du client (faux s'il est inconnu).
     pub fn is_view_only(&self, key: &PublicKey) -> bool {
+        self.role_of(key) == Some(Role::ViewOnly)
+    }
+
+    /// Rôle du client, `None` s'il n'est pas autorisé.
+    pub fn role_of(&self, key: &PublicKey) -> Option<Role> {
         let k = b32_encode(key);
-        self.data.clients.iter().any(|c| c.key == k && c.view_only)
+        self.data.clients.iter().find(|c| c.key == k).map(AuthorizedClient::role)
     }
 
     pub fn authorize(&mut self, key: &PublicKey, name: &str, now_ms: u64) -> Result<()> {
@@ -140,7 +222,7 @@ impl TrustStore {
             if d.clients.iter().any(|c| c.key == k) {
                 return Ok(((), false));
             }
-            d.clients.push(AuthorizedClient { key: k, name: name.to_string(), added_ms: now_ms, view_only: false });
+            d.clients.push(AuthorizedClient { key: k, name: name.to_string(), added_ms: now_ms, view_only: false, role: None });
             Ok(((), true))
         })
     }
@@ -168,16 +250,21 @@ impl TrustStore {
         })
     }
 
-    /// Change le rôle des clients dont l'empreinte commence par le préfixe. Retourne leur nombre.
+    /// Bascule spectateur / complet (ancienne API, voir [`Self::set_role`]).
     pub fn set_view_only(&mut self, fingerprint_or_prefix: &str, view_only: bool) -> Result<usize> {
+        self.set_role(fingerprint_or_prefix, if view_only { Role::ViewOnly } else { Role::Full })
+    }
+
+    /// Change le rôle des clients dont l'empreinte commence par le préfixe. Retourne leur nombre.
+    pub fn set_role(&mut self, fingerprint_or_prefix: &str, role: Role) -> Result<usize> {
         let want = Self::matching(fingerprint_or_prefix)?;
         self.mutate(|d| {
             let mut n = 0;
             let mut changed = false;
             for c in d.clients.iter_mut().filter(|c| Self::fp_of(c).starts_with(&want)) {
                 n += 1;
-                if c.view_only != view_only {
-                    c.view_only = view_only;
+                if c.role() != role || c.role != Some(role) {
+                    c.set_role(role);
                     changed = true;
                 }
             }
@@ -352,3 +439,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "trust_role_tests.rs"]
+mod role_tests;

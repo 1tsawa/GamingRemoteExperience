@@ -1,10 +1,13 @@
 mod access;
+mod codec;
 mod control;
 mod cursor;
 mod display;
+mod elevation;
 mod firewall;
 mod pipeline;
 mod portmap_task;
+mod secure;
 mod server;
 mod status;
 
@@ -18,15 +21,18 @@ use grx_core::util::{default_data_dir, now_ms};
 use grx_core::trust::MAX_INVITE_TTL_MS;
 use grx_core::{fingerprint, HostAuth, Identity, Invite, TrustStore};
 use grx_input::{GamepadPolicy, InjectorConfig};
-use grx_video::Codec;
 
 use crate::pipeline::PipelineOpts;
 use crate::server::RunOpts;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum CodecArg {
+    /// Négocié avec le client : HEVC si son PC le décode, sinon H.264 (AV1 seulement sur demande)
+    Auto,
     Hevc,
     H264,
+    /// AV1 (encodeur NVIDIA RTX 40+ requis ; repli automatique sinon)
+    Av1,
 }
 
 /// Rôle d'un client autorisé.
@@ -41,8 +47,29 @@ enum GamepadTypeArg {
 enum RoleArg {
     /// Voit l'écran et entend le son, n'injecte aucune entrée
     ViewOnly,
-    /// Contrôle complet (clavier, souris, manette)
+    /// Contrôle complet (clavier, souris, manette) sur le bureau normal
     Full,
+    /// Comme « full », et pilote aussi les fenêtres administrateur si le host est élevé
+    Total,
+}
+
+impl RoleArg {
+    fn role(self) -> grx_core::Role {
+        match self {
+            RoleArg::ViewOnly => grx_core::Role::ViewOnly,
+            RoleArg::Full => grx_core::Role::Full,
+            RoleArg::Total => grx_core::Role::Total,
+        }
+    }
+}
+
+/// Situation simulée pour `run --simulate-secure` (mode de test caché).
+#[derive(Clone, Copy, ValueEnum)]
+enum SimulateArg {
+    Normal,
+    Elevated,
+    Secure,
+    Cycle,
 }
 
 #[derive(Parser)]
@@ -76,8 +103,11 @@ enum Cmd {
     List,
     /// Révoque un client par préfixe d'empreinte (4 caractères minimum)
     Revoke { fingerprint: String },
-    /// Change le rôle d'un client : `view-only` (spectateur) ou `full`. Une session en cours est coupée.
+    /// Change le rôle d'un client : `view-only`, `full` ou `total`. Une session en cours est coupée.
     SetRole { fingerprint: String, #[arg(value_enum)] role: RoleArg },
+    /// Mode « Contrôle total » : host lancé élevé par une tâche planifiée (voir la sous-commande)
+    #[command(subcommand)]
+    Elevation(ElevationCmd),
     /// Affiche les commandes (administrateur) pour autoriser grx-host dans le pare-feu Windows
     FirewallHelp {
         #[arg(long, default_value_t = 7777)]
@@ -97,8 +127,9 @@ enum Cmd {
         /// Durée du bail de redirection demandé à la box (s), renouvelé à mi-vie ; 0 = permanent
         #[arg(long, default_value_t = 3600)]
         upnp_lease: u64,
-        /// Codec vidéo
-        #[arg(long, value_enum, default_value = "hevc")]
+        /// Codec vidéo préféré ; le client annonce ses décodeurs et un codec qu'il ne sait pas
+        /// décoder est remplacé automatiquement (H.264 en dernier recours)
+        #[arg(long, value_enum, default_value = "auto")]
         codec: CodecArg,
         /// Cadence maximale de capture/encodage
         #[arg(long, default_value_t = 60)]
@@ -141,11 +172,50 @@ enum Cmd {
         /// de démarrage) ; défaut : l'écran principal. Le client peut en changer depuis son menu.
         #[arg(long)]
         display: Option<usize>,
+        /// Interne : lancé par la tâche planifiée « Contrôle total » ; lit les options dans
+        /// host-options.json et installe l'arrêt propre par événement nommé.
+        #[arg(long, hide = true)]
+        from_task: bool,
+        /// Caché (tests) : simule l'état de sécurité observé sans lire Windows (aucune UAC réelle).
+        #[arg(long, value_enum, hide = true)]
+        simulate_secure: Option<SimulateArg>,
+    },
+}
+
+/// Sous-commandes du mode « Contrôle total ».
+#[derive(Subcommand)]
+enum ElevationCmd {
+    /// Active le mode : crée la tâche planifiée (une seule invite UAC) et lance le host élevé
+    Enable {
+        /// Lancer aussi le host élevé à chaque ouverture de session
+        #[arg(long)]
+        at_logon: bool,
+    },
+    /// Désactive le mode : supprime la tâche planifiée (une invite UAC)
+    Disable,
+    /// Affiche l'état de la tâche et si le processus courant est élevé
+    Status,
+    /// Interne : crée la tâche (déjà élevé via UAC) — appelé par `enable`
+    #[command(hide = true)]
+    InstallTask {
+        #[arg(long)]
+        at_logon: bool,
+    },
+    /// Interne : supprime la tâche (déjà élevé) — appelé par `disable`
+    #[command(hide = true)]
+    RemoveTask,
+    /// Démarre le host via la tâche planifiée (pas d'UAC) : utilisé par grx-gui
+    RunTask,
+    /// Demande l'arrêt propre d'un host élevé (événement nommé) : utilisé par grx-gui
+    #[command(hide = true)]
+    Stop {
+        #[arg(long)]
+        pid: u32,
     },
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = load_cli();
     let dir = cli.data_dir.unwrap_or_else(|| default_data_dir("host"));
     let identity = Identity::load_or_create(&dir.join("identity.json"))?;
     let trust = TrustStore::load(&dir.join("trust.json"))?;
@@ -190,7 +260,12 @@ fn main() -> Result<()> {
                     .and_then(|v| <[u8; 32]>::try_from(v).ok())
                     .map(|k| fingerprint(&k))
                     .unwrap_or_else(|| "?".into());
-                println!("{fp}  {:<10}  {}", if c.view_only { "spectateur" } else { "complet" }, c.name);
+                let label = match c.role() {
+                    grx_core::Role::ViewOnly => "spectateur",
+                    grx_core::Role::Full => "complet",
+                    grx_core::Role::Total => "contrôle total",
+                };
+                println!("{fp}  {label:<14}  {}", c.name);
             }
         }
         Cmd::Revoke { fingerprint } => {
@@ -198,9 +273,13 @@ fn main() -> Result<()> {
             println!("{n} client(s) révoqué(s)");
         }
         Cmd::SetRole { fingerprint, role } => {
-            let n = auth.trust.set_view_only(&fingerprint, matches!(role, RoleArg::ViewOnly))?;
+            let n = auth.trust.set_role(&fingerprint, role.role())?;
+            if matches!(role, RoleArg::Total) {
+                println!("ATTENTION : ce client (« Contrôle total ») pourra piloter les fenêtres administrateur du PC quand le host tourne élevé.");
+            }
             println!("{n} client(s) modifié(s) ; un host en cours d'exécution coupe la session du client concerné (il doit se reconnecter)");
         }
+        Cmd::Elevation(cmd) => return run_elevation(cmd),
         Cmd::Run {
             bind,
             no_upnp,
@@ -220,6 +299,8 @@ fn main() -> Result<()> {
             no_audio,
             idle_timeout,
             display,
+            from_task,
+            simulate_secure,
         } => {
             // Coordonnées physiques partout (DXGI, curseur, SendInput) même avec une mise à
             // l'échelle Windows différente par écran.
@@ -242,9 +323,14 @@ fn main() -> Result<()> {
                 bind,
                 idle_timeout: Duration::from_secs_f64(idle_timeout),
                 pipeline: PipelineOpts {
-                    codec: match codec {
-                        CodecArg::Hevc => Codec::Hevc,
-                        CodecArg::H264 => Codec::H264,
+                    codec: {
+                        use grx_core::codec_neg::{CodecPref, VideoCodec};
+                        match codec {
+                            CodecArg::Auto => CodecPref::Auto,
+                            CodecArg::Hevc => CodecPref::Force(VideoCodec::Hevc),
+                            CodecArg::H264 => CodecPref::Force(VideoCodec::H264),
+                            CodecArg::Av1 => CodecPref::Force(VideoCodec::Av1),
+                        }
                     },
                     fps,
                     fill,
@@ -281,10 +367,132 @@ fn main() -> Result<()> {
                     println!("Touches Windows du client filtrées (--block-win-key).");
                 }
             }
-            run_host(&dir, auth, opts, no_upnp, external_port, Duration::from_secs(upnp_lease))?
+            let sim = simulate_secure.map(|s| match s {
+                SimulateArg::Normal => secure::Simulate::Normal,
+                SimulateArg::Elevated => secure::Simulate::Elevated,
+                SimulateArg::Secure => secure::Simulate::Secure,
+                SimulateArg::Cycle => secure::Simulate::Cycle,
+            });
+            // Observation lecture seule du bureau/intégrité (ou simulation) : le serveur en lit
+            // l'état pour autoriser/bloquer et prévenir le client (GRX-SEC).
+            secure::start(sim);
+            if from_task {
+                println!("Host élevé lancé par la tâche planifiée « Contrôle total ».");
+            }
+            run_host(&dir, auth, opts, no_upnp, external_port, Duration::from_secs(upnp_lease), from_task)?
         }
     }
     Ok(())
+}
+
+/// Analyse la ligne de commande. Pour `run --from-task` (tâche planifiée), les options de l'hôte
+/// élevé ne sont PAS sur la ligne de commande (figée, créée sous UAC) : on les relit dans
+/// `host-options.json` (dossier de données par défaut) et on ré-analyse en les ajoutant. Les
+/// arguments y ont déjà été validés par la liste blanche avant écriture, et sont revérifiés ici.
+fn load_cli() -> Cli {
+    let cli = Cli::parse();
+    if let Cmd::Run { from_task: true, .. } = &cli.cmd {
+        let dir = cli.data_dir.clone().unwrap_or_else(|| default_data_dir("host"));
+        match elevation::read_task_options(&dir) {
+            Ok(extra) if !extra.is_empty() => {
+                let mut argv: Vec<String> = vec!["grx-host".into()];
+                if let Some(d) = &cli.data_dir {
+                    argv.push("--data-dir".into());
+                    argv.push(d.to_string_lossy().into_owned());
+                }
+                argv.push("run".into());
+                argv.push("--from-task".into());
+                argv.extend(extra);
+                match Cli::try_parse_from(&argv) {
+                    Ok(c) => return c,
+                    Err(e) => eprintln!("options de la tâche ignorées (ré-analyse impossible) : {e}"),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("host-options.json ignoré : {e}"),
+        }
+    }
+    cli
+}
+
+/// Sous-commandes `grx-host elevation …`.
+fn run_elevation(cmd: ElevationCmd) -> Result<()> {
+    match cmd {
+        ElevationCmd::Enable { at_logon } => {
+            let exe = std::env::current_exe()?;
+            // Vérifie AVANT l'UAC (message clair, pas d'invite inutile).
+            elevation::preflight(&exe)?;
+            println!("Activation du Contrôle total : une autorisation Windows (UAC) va être demandée…");
+            let mut args = vec!["elevation", "install-task"];
+            if at_logon {
+                args.push("--at-logon");
+            }
+            let code = elevation::run_elevated_self(&args)?;
+            if code != 0 {
+                bail!("l'opération élevée a échoué (code {code})");
+            }
+            let st = elevation::status();
+            if st.task_present && st.task_valid {
+                println!("Contrôle total activé : la tâche « {} » est installée.", grx_core::elevation::TASK_NAME);
+                println!("grx-gui (ou `grx-host elevation run-task`) peut maintenant lancer le host élevé sans UAC.");
+            } else {
+                bail!("la tâche n'a pas été créée : relancez en acceptant l'invite UAC.");
+            }
+        }
+        ElevationCmd::Disable => {
+            println!("Désactivation du Contrôle total : une autorisation Windows (UAC) va être demandée…");
+            let code = elevation::run_elevated_self(&["elevation", "remove-task"])?;
+            if code != 0 {
+                bail!("l'opération élevée a échoué (code {code})");
+            }
+            println!("Contrôle total désactivé : la tâche planifiée a été supprimée.");
+        }
+        ElevationCmd::Status => {
+            let st = elevation::status();
+            println!("Processus courant élevé        : {}", oui_non(st.current_elevated));
+            println!("Dossier protégé (Program Files): {}", oui_non(st.protected_location));
+            println!("Tâche planifiée présente       : {}", oui_non(st.task_present));
+            if st.task_present {
+                println!("Tâche valide (élevée, bon exe) : {}", oui_non(st.task_valid));
+                println!("Lancement à l'ouverture session: {}", oui_non(st.at_logon));
+                if let Some(c) = &st.task_command {
+                    println!("Exécutable de la tâche         : {c}");
+                }
+            }
+        }
+        ElevationCmd::InstallTask { at_logon } => {
+            if !elevation::is_elevated() {
+                bail!("install-task doit être exécuté élevé (passez par `elevation enable`).");
+            }
+            elevation::create_task(at_logon)?;
+        }
+        ElevationCmd::RemoveTask => {
+            if !elevation::is_elevated() {
+                bail!("remove-task doit être exécuté élevé (passez par `elevation disable`).");
+            }
+            elevation::delete_task()?;
+        }
+        ElevationCmd::RunTask => {
+            elevation::run_task()?;
+            println!("Host élevé démarré via la tâche planifiée (aucune UAC).");
+        }
+        ElevationCmd::Stop { pid } => {
+            if elevation::signal_stop(pid) {
+                println!("Arrêt demandé au host élevé (pid {pid}).");
+            } else {
+                bail!("aucun host élevé joignable (pid {pid}) : déjà arrêté ?");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn oui_non(b: bool) -> &'static str {
+    if b {
+        "oui"
+    } else {
+        "non"
+    }
 }
 
 /// `run` : socket, status.json, redirection automatique et pare-feu en arrière-plan, puis la
@@ -296,6 +504,7 @@ fn run_host(
     no_upnp: bool,
     external_port: Option<u16>,
     lease: Duration,
+    from_task: bool,
 ) -> Result<()> {
     use status::{FirewallStatus, HostStatus, StatusFile, UpnpStatus};
     let sock = server::bind_socket(opts.bind)?;
@@ -365,7 +574,32 @@ fn run_host(
         });
     }
 
-    let res = server::run(sock, auth, opts);
+    // Host lancé élevé par la tâche « Contrôle total » : grx-gui (non élevé) ne peut pas lui
+    // envoyer Ctrl+C, on ajoute donc un arrêt par événement nommé (ACL : utilisateur courant).
+    // Ctrl+C reste géré (console) via `server::serve`, qui installe aussi le gestionnaire.
+    let res = if from_task {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let quit = Arc::new(AtomicBool::new(false));
+        {
+            let q = quit.clone();
+            let _ = ctrlc::set_handler(move || q.store(true, Ordering::SeqCst));
+        }
+        if let Some(ev) = elevation::create_stop_event() {
+            let q = quit.clone();
+            // Un seul fil bloqué sur l'événement ; au déclenchement, demande l'arrêt propre.
+            let _ = std::thread::Builder::new().name("grx-stop".into()).spawn(move || {
+                ev.wait();
+                println!("Arrêt demandé par événement nommé (grx-gui).");
+                q.store(true, Ordering::SeqCst);
+            });
+        } else {
+            eprintln!("[sécurité] événement d'arrêt non créé : seul Ctrl+C arrêtera ce host.");
+        }
+        server::serve(sock, auth, opts, quit)
+    } else {
+        server::run(sock, auth, opts)
+    };
     if let Some(t) = task {
         t.stop(Duration::from_secs(8));
     }

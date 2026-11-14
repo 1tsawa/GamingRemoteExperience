@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use grx_audio::{AudioCapturer, CaptureConfig, OpusConfig, OpusEncoder};
 use grx_input::{InjectorConfig, InputInjector, Rumble};
-use grx_video::{Codec, Encoder, EncoderConfig, OutputInfo, ScreenCapturer};
+use grx_video::{Encoder, EncoderConfig, OutputInfo, ScreenCapturer};
 
 /// Microsecondes depuis l'epoch Unix : horloge commune host/client (même machine ou NTP) qui
 /// sert de `pts` pour mesurer la latence de bout en bout.
@@ -25,7 +25,8 @@ fn pts_of(at: Instant) -> u64 {
 
 #[derive(Clone, Debug)]
 pub struct PipelineOpts {
-    pub codec: Codec,
+    /// `run --codec` : préférence du host, le codec effectif est négocié (`codec.rs`).
+    pub codec: grx_core::codec_neg::CodecPref,
     pub fps: u32,
     pub fill: bool,
     pub audio: bool,
@@ -69,12 +70,18 @@ pub struct Shared {
     pub inputs_injected: AtomicU64,
     pub inputs_other: AtomicU64,
     pub video_ready: AtomicBool,
+    /// Demande de relâchement immédiat de toutes les touches/boutons/manettes par le thread
+    /// d'entrée (sécurité : passage à un état où l'injection est bloquée, pour ne pas laisser une
+    /// touche « coincée » enfoncée). Remise à faux par le thread une fois le relâchement fait.
+    pub release_input: AtomicBool,
     /// Plafond d'images/s demandé par le client (0 = aucun), voir `control.rs`.
     pub max_fps: AtomicU32,
     /// Curseur lu dans DXGI par le thread vidéo, envoyé à part par la boucle réseau (`cursor.rs`).
     pub cursor: Arc<grx_video::CursorTracker>,
     /// Écrans du host, écran capturé, demande de bascule du client (`display.rs`).
     pub displays: Arc<crate::display::Displays>,
+    /// Négociation du codec avec le client (`codec.rs`).
+    pub codec: Arc<crate::codec::CodecState>,
 }
 
 pub struct Pipeline {
@@ -102,9 +109,11 @@ impl Pipeline {
             inputs_injected: AtomicU64::new(0),
             inputs_other: AtomicU64::new(0),
             video_ready: AtomicBool::new(false),
+            release_input: AtomicBool::new(false),
             max_fps: AtomicU32::new(0),
             cursor: Arc::new(grx_video::CursorTracker::new()),
             displays: Arc::new(crate::display::Displays::new()),
+            codec: Arc::new(crate::codec::CodecState::new(opts.codec)),
         });
         let mut threads = Vec::new();
 
@@ -207,8 +216,9 @@ fn open_display(
 ) -> Result<(ScreenCapturer, Encoder), String> {
     let make_enc = |cap: &ScreenCapturer| {
         let (w, h) = cap.size();
-        Encoder::with_device(cap.device(), EncoderConfig { codec: o.codec, width: w, height: h, fps: o.fps, bitrate_kbps: kbps })
-            .map_err(|e| format!("encodeur : {e}"))
+        crate::codec::open_encoder(&sh.codec, |codec| {
+            Encoder::with_device(cap.device(), EncoderConfig { codec, width: w, height: h, fps: o.fps, bitrate_kbps: kbps })
+        })
     };
     if let Some((mut cap, mut enc)) = reuse {
         if cap.adapter_output().0 == target.adapter_index {
@@ -252,17 +262,20 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
     let list = grx_video::list_displays().unwrap_or_default();
     // `--display N` : cet écran ; sinon le choix historique (adaptateur NVIDIA, écran principal).
     let start = o.display.as_deref().and_then(|_| crate::display::pick_initial(&list, o.display.as_deref()).cloned());
+    // Codec : on attend (brièvement) les décodeurs annoncés par le client (`codec.rs`).
+    sh.codec.wait_decided(crate::codec::DECIDE_TIMEOUT, &sh.stop);
     let (mut cap, mut enc) = match &start {
         Some(t) => open_display(t, None, sh, o, cur_kbps)?,
         None => {
             let mut cap = ScreenCapturer::new().map_err(|e| format!("capture : {e}"))?;
             cap.set_cursor_tracker(sh.cursor.clone());
             let (w, h) = cap.size();
-            let enc = Encoder::with_device(
-                cap.device(),
-                EncoderConfig { codec: o.codec, width: w, height: h, fps: o.fps, bitrate_kbps: cur_kbps },
-            )
-            .map_err(|e| format!("encodeur : {e}"))?;
+            let enc = crate::codec::open_encoder(&sh.codec, |codec| {
+                Encoder::with_device(
+                    cap.device(),
+                    EncoderConfig { codec, width: w, height: h, fps: o.fps, bitrate_kbps: cur_kbps },
+                )
+            })?;
             (cap, enc)
         }
     };
@@ -275,7 +288,7 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
         displays.set_active(&a.device_name);
     }
     let (w, h) = cap.size();
-    println!("  vidéo : {w}x{h} {:?} {} fps, {:?}, {} kb/s initial", o.codec, o.fps, enc.backend(), cur_kbps);
+    println!("  vidéo : {w}x{h} {:?} {} fps, {:?}, {} kb/s initial", enc.config().codec, o.fps, enc.backend(), cur_kbps);
     for (i, d) in list.iter().enumerate() {
         let mark = if active.as_ref().is_some_and(|a| a.device_name == d.device_name) { "  <- capturé" } else { "" };
         println!("  écran {}{mark}", crate::display::describe(i, d));
@@ -295,6 +308,17 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
     let fill_ms = (1000 / o.fps.max(1)).max(1);
 
     while !sh.stop.load(Ordering::Relaxed) {
+        // Changement de codec négocié (renégociation du client) : encodeur recréé, image clé.
+        if let Some(c) = sh.codec.take_switch(enc.config().codec) {
+            let (t0, old) = (Instant::now(), enc.config().codec);
+            let (w, h) = cap.size();
+            drop(enc);
+            enc = crate::codec::open_encoder(&sh.codec, |codec| {
+                Encoder::with_device(cap.device(), EncoderConfig { codec, width: w, height: h, fps: o.fps, bitrate_kbps: cur_kbps })
+            })?;
+            println!("  vidéo : codec {old:?} -> {:?} (demandé {c:?}, {:?}) en {:.1} ms", enc.config().codec, enc.backend(), t0.elapsed().as_secs_f64() * 1000.0);
+            sh.want_key.store(true, Ordering::SeqCst);
+        }
         // Bascule d'écran demandée par le client (GRX-MON) ou repli après disparition de l'écran.
         if let Some(target) = displays.take_request() {
             if active.as_ref().is_none_or(|a| a.device_name != target.device_name) {
@@ -503,6 +527,12 @@ fn input_thread(
     inj.gamepads_mut().set_rumble_sink(rumble);
     let mut pads_seen = String::new();
     loop {
+        // Sécurité : relâchement demandé par la boucle réseau (fenêtre élevée / bureau sécurisé
+        // au premier plan), pour ne pas laisser une touche enfoncée pendant que l'injection est
+        // bloquée. Les événements déjà en file sont ignorés tant que le drapeau est levé.
+        if sh.release_input.swap(false, Ordering::SeqCst) {
+            inj.release_all();
+        }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(ev) => {
                 match inj.inject_bytes(&ev) {

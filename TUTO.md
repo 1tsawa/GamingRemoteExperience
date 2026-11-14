@@ -34,7 +34,7 @@ target\release\grx-gui.exe
 
 Le PC client n'a pas besoin de Rust. Il faut seulement :
 - Windows 10 ou 11 ;
-- l'extension **« HEVC Video Extensions »** du Microsoft Store (sinon voir le dépannage) ;
+- rien de spécial pour la vidéo : sans l'extension **« HEVC Video Extensions »** du Microsoft Store, le host passe tout seul en H.264 (avec l'extension : HEVC, meilleure qualité à débit égal) ;
 - plus besoin du « Visual C++ Redistributable » : le runtime C est intégré aux exe depuis la 0.2.0.
 
 ---
@@ -73,7 +73,7 @@ Autres commandes utiles :
 .\grx-host.exe info              # empreinte du host
 .\grx-host.exe list              # clients autorisés
 .\grx-host.exe revoke ABCD       # révoquer un client (début de son empreinte)
-.\grx-host.exe set-role ABCD view-only   # spectateur (ou: full)
+.\grx-host.exe set-role ABCD view-only   # spectateur (ou: full, ou: total)
 .\grx-host.exe firewall-help     # commande à lancer si le pare-feu bloque
 ```
 
@@ -81,7 +81,8 @@ Options utiles de `run` :
 
 | Option | Effet |
 |---|---|
-| `--codec h264` | Si le client n'a pas l'extension HEVC |
+| `--codec h264` | Impose H.264 (inutile en général : le défaut `auto` choisit HEVC si le client le décode, sinon H.264) |
+| `--codec av1` | AV1 (RTX 40 ou plus récent ; repli automatique si le client ne le décode pas) |
 | `--max-bitrate 20` | Limite le débit (Mb/s), si la connexion de l'ami est faible |
 | `--fps 30` | Divise la charge par deux |
 | `--no-input` | L'ami voit l'écran mais ne peut rien contrôler |
@@ -219,7 +220,9 @@ Limites : gyroscope, position sur le pavé tactile, LED, gâchettes adaptatives 
 | Le client affiche « aucune réponse » | Le host n'est pas lancé, l'adresse est fausse, le lien a déjà servi, ou le client a été révoqué (le host ne répond jamais aux inconnus). Créez une nouvelle invitation. |
 | Le statut UPnP du host est en échec | Vérifiez que l'UPnP est activé dans l'interface de la box. Sinon, créez une redirection manuelle UDP 7777 vers l'IP locale du PC host. |
 | Ça marche en local mais pas depuis Internet | Pare-feu : `grx-host.exe firewall-help`. Vérifiez que le réseau Windows est en **Privé**. |
-| Erreur de décodeur HEVC côté client | Installez « HEVC Video Extensions » (Microsoft Store), ou lancez le host avec `--codec h264`. |
+| Décodeur HEVC : « aucun décodeur matériel HEVC utilisable » au démarrage du client | Pas grave : le host passe en **H.264 automatiquement** (host récent en `--codec auto`). Pour retrouver HEVC : installez l'extension gratuite **« HEVC Video Extensions from Device Manufacturer »** (Microsoft Store), ou placez les DLL FFmpeg LGPL (`avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll`) à côté de `grx-client.exe`. La console du client liste ses décodeurs (`Décodeurs vidéo de ce PC`). |
+| « Décodeur vidéo … indisponible sur ce PC » (code 4) | La connexion fonctionne, c'est le décodage qui échoue : host ancien sans négociation (mettez-le à jour ou lancez-le avec `--codec h264`), ou pilote graphique à mettre à jour si c'est H.264. |
+| Le décodeur casse en pleine session | Le client renégocie tout seul vers H.264 (« renégociation » dans sa console) sans couper la session. |
 | Image saccadée, pertes élevées | Lancez le host avec `--max-bitrate 15 --fps 30` et réessayez. Préférez un câble Ethernet côté host. |
 | L'adresse publique a changé | Recréez une invitation, ou utilisez un nom DuckDNS (`--addr monpc.duckdns.org:7777`). |
 | Une touche reste « enfoncée » côté host | Fermez le client : le host relâche tout à la déconnexion. |
@@ -231,3 +234,74 @@ Limites : gyroscope, position sur le pavé tactile, LED, gâchettes adaptatives 
 - **Comparez toujours l'empreinte** du host lors de la première connexion.
 - Révoquez les clients dont vous ne vous servez plus (`grx-host.exe list` puis `revoke`).
 - Arrêtez le host quand vous ne l'utilisez pas : l'arrêt referme le port sur la box.
+
+## 6. Contrôle total : piloter les fenêtres administrateur (et comprendre l'UAC)
+
+Quand une fenêtre **administrateur** passe au premier plan côté host (Gestionnaire des tâches,
+éditeur de registre lancé en admin…), Windows interdit à un host « ordinaire » d'y envoyer le
+clavier et la souris : **la souris du client semble figée**. Pendant une **invite UAC** ou l'écran
+de verrouillage, Windows affiche un **bureau sécurisé** : même en Contrôle total, personne ne voit
+ni ne pilote cet écran à distance — **l'UAC se valide physiquement sur le PC host**. C'est voulu.
+
+Le mode **Contrôle total** rend le host élevé (admin) pour lever le blocage des fenêtres
+administrateur, sans redemander l'UAC à chaque démarrage.
+
+### Pré-requis : installation « pour tous les utilisateurs »
+
+Le Contrôle total n'est proposé que si `grx-host.exe` est dans un dossier **non modifiable par un
+utilisateur standard** (sinon quelqu'un pourrait remplacer l'exe et obtenir une élévation
+silencieuse). Installez donc en **machine** :
+
+1. Lancez `setup.exe`, et à la question des privilèges, choisissez **Installer pour tous les
+   utilisateurs** (une UAC) : l'application va dans `C:\Program Files\GamingRemoteExperience`.
+
+### Activer le Contrôle total
+
+Avec l'interface :
+
+1. Onglet **Host**, dépliez **Contrôle total (host élevé)**.
+2. Cliquez **Activer (UAC)** et acceptez l'invite Windows (une seule fois). Cochez éventuellement
+   « Lancer le host élevé à l'ouverture de session ».
+3. Cochez **Démarrer le host en mode Contrôle total**, puis **Démarrer le host** : il démarre élevé
+   **sans** nouvelle UAC. **Arrêter** fonctionne normalement (arrêt propre, même élevé).
+
+En ligne de commande (équivalent) :
+
+```powershell
+grx-host elevation enable          # une seule UAC ; + --at-logon si souhaité
+grx-host elevation status          # doit indiquer : dossier protégé = oui, tâche valide = oui
+# le bouton Démarrer de grx-gui lance ensuite le host élevé sans UAC
+grx-host elevation disable         # pour désactiver (une UAC ; supprime la tâche)
+```
+
+### Donner le rôle « Contrôle total » à un client
+
+Dans la liste des clients (onglet Host), choisissez **Contrôle total** dans le menu du client et
+**confirmez** (ce client pourra piloter les fenêtres administrateur de votre PC). En ligne de
+commande : `grx-host set-role <début d'empreinte> total`. Un client **Complet** (sans « total »)
+ne pilote pas les fenêtres administrateur, même si le host est élevé.
+
+### Test avec le Gestionnaire des tâches
+
+1. Host élevé démarré, un client **Contrôle total** connecté.
+2. Côté host, ouvrez le **Gestionnaire des tâches** (il s'ouvre en administrateur) et laissez-le au
+   premier plan.
+3. Côté client : vous continuez à voir l'écran et **la souris/le clavier fonctionnent** dans le
+   Gestionnaire des tâches.
+   - Avec un client seulement **Complet** : l'image reste visible mais un **bandeau** indique que le
+     rôle « Contrôle total » est requis, et le clavier/souris sont sans effet sur cette fenêtre.
+   - Avec un host **non élevé** : bandeau « activez Contrôle total sur le host », clavier/souris
+     bloqués pour tous sur cette fenêtre (la manette, elle, continue de fonctionner).
+
+### Comportement pendant une UAC
+
+Déclenchez une invite UAC côté host (ex. lancer un programme « en tant qu'administrateur ») :
+
+- Côté client, l'image se fige sur la dernière vue puis un **bandeau** apparaît :
+  « Écran sécurisé Windows (UAC / verrouillage) sur le host — à valider sur place ». Aucune image du
+  bureau sécurisé n'est transmise, aucune entrée n'est injectée, **pour personne**.
+- **Validez l'UAC physiquement sur le PC host** (ou annulez-la). Dès le retour au bureau normal,
+  l'image reprend automatiquement et le bandeau disparaît.
+
+C'est le comportement attendu et non contournable : l'UAC protège le PC host, y compris de vous à
+distance.

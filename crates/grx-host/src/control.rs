@@ -67,11 +67,10 @@ mod tests {
     use grx_input::InjectorConfig;
     use grx_transport::bitrate::BitrateConfig;
     use grx_transport::Config;
-    use grx_video::Codec;
 
     fn opts() -> PipelineOpts {
         PipelineOpts {
-            codec: Codec::Hevc,
+            codec: grx_core::codec_neg::CodecPref::Force(grx_core::codec_neg::VideoCodec::Hevc),
             fps: 60,
             fill: false,
             audio: false,

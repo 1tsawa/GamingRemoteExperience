@@ -25,6 +25,12 @@ pub struct BenchOpts {
 
 /// Diagnostic d'une image : `None` = plausible, sinon la raison.
 fn validate(codec: Codec, key: bool, d: &[u8]) -> Option<&'static str> {
+    if codec == Codec::Av1 {
+        if !grx_video::obu::looks_like_av1(d) {
+            return Some("flux d'OBU AV1 invalide");
+        }
+        return (key != grx_video::obu::is_key_frame(d)).then_some("drapeau clé incohérent avec le flux AV1");
+    }
     if !(d.starts_with(&[0, 0, 0, 1]) || d.starts_with(&[0, 0, 1])) {
         return Some("pas de start code Annex-B");
     }
@@ -34,14 +40,14 @@ fn validate(codec: Codec, key: bool, d: &[u8]) -> Option<&'static str> {
     }
     let (vcl_max, valid): (u8, fn(u8) -> bool) = match codec {
         Codec::Hevc => (21, |t| t <= 9 || (16..=21).contains(&t) || (32..=40).contains(&t)),
-        Codec::H264 => (5, |t| (1..=12).contains(&t)),
+        Codec::H264 | Codec::Av1 => (5, |t| (1..=12).contains(&t)),
     };
     if types.iter().any(|&t| !valid(t)) {
         return Some("type de NAL invalide");
     }
     let has_vcl = types.iter().any(|&t| match codec {
         Codec::Hevc => t <= vcl_max,
-        Codec::H264 => (1..=vcl_max).contains(&t),
+        Codec::H264 | Codec::Av1 => (1..=vcl_max).contains(&t),
     });
     if !has_vcl {
         return Some("aucune slice (VCL)");
@@ -74,6 +80,7 @@ pub fn run(
     let codec = match b.codec {
         CodecArg::Hevc => Codec::Hevc,
         CodecArg::H264 => Codec::H264,
+        CodecArg::Av1 => Codec::Av1,
     };
     let t_conn = Instant::now();
     let conn = ClientConnection::connect(id, invite, opts)?;
@@ -85,6 +92,12 @@ pub fn run(
         t_conn.elapsed().as_secs_f64() * 1e3
     );
     on_connected(&conn)?;
+    // Négociation : on demande au host le codec attendu (sinon un host en `auto` enverrait du H.264).
+    {
+        use grx_core::codec_neg::{BackendId, ClientCodecs, CodecSet};
+        let c = crate::codec::to_neg(codec);
+        conn.send_control(&ClientCodecs::simple(CodecSet::EMPTY.with(c), BackendId::MEDIA_FOUNDATION, Some(c)).encode());
+    }
     let mut out = match &b.save {
         Some(p) => Some(BufWriter::new(File::create(p).with_context(|| format!("création de {}", p.display()))?)),
         None => None,

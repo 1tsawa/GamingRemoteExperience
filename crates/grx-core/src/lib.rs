@@ -8,8 +8,12 @@
 pub mod error;
 pub mod identity;
 pub mod invite;
+pub mod codec_neg;
 pub mod displays;
+pub mod elevation;
 pub mod profiles;
+pub mod secure;
+pub mod secure_notice;
 pub mod session;
 pub mod stream_settings;
 pub mod trust;
@@ -20,4 +24,4 @@ pub use identity::{fingerprint, Identity, PublicKey};
 pub use invite::{Invite, Token};
 pub use profiles::{Profile, ProfileStore};
 pub use session::{ClientHandshake, HostAuth, Session, PKT_DATA, PKT_INIT, PKT_RESP};
-pub use trust::TrustStore;
+pub use trust::{Role, TrustStore};

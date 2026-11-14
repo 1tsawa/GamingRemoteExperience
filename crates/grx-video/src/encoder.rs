@@ -35,6 +35,72 @@ fn mf_startup() -> Result<()> {
     res
 }
 
+/// Codecs pour lesquels un encodeur MFT matériel est enregistré (H.264, HEVC, AV1), avec le nom
+/// du premier (NVIDIA d'abord). Simple énumération (pas de création) ; résultat mis en cache.
+/// La création peut encore échouer : l'appelant se replie alors sur H.264.
+pub fn available_encoders() -> Vec<(Codec, String)> {
+    static CACHE: std::sync::OnceLock<Vec<(Codec, String)>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            gpu::init_com();
+            if mf_startup().is_err() {
+                return Vec::new();
+            }
+            [Codec::H264, Codec::Hevc, Codec::Av1]
+                .into_iter()
+                .filter_map(|c| {
+                    let mut names = enum_hw_encoders(c).ok()?.into_iter().map(|(_, n)| n).collect::<Vec<_>>();
+                    names.sort_by_key(|n| !n.to_ascii_lowercase().contains("nvidia"));
+                    names.into_iter().next().map(|n| (c, n))
+                })
+                .collect()
+        })
+        .clone()
+}
+
+fn enum_hw_encoders(codec: Codec) -> Result<Vec<(IMFActivate, String)>> {
+    let out_info = MFT_REGISTER_TYPE_INFO {
+        guidMajorType: MFMediaType_Video,
+        guidSubtype: match codec {
+            Codec::H264 => MFVideoFormat_H264,
+            Codec::Hevc => MFVideoFormat_HEVC,
+            Codec::Av1 => MFVideoFormat_AV1,
+        },
+    };
+    let mut pp: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count = 0u32;
+    unsafe {
+        MFTEnumEx(
+            MFT_CATEGORY_VIDEO_ENCODER,
+            MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
+            None,
+            Some(&out_info),
+            &mut pp,
+            &mut count,
+        )
+    }
+    .ctx("MFTEnumEx")?;
+    let mut cands: Vec<(IMFActivate, String)> = Vec::new();
+    if pp.is_null() {
+        return Ok(cands);
+    }
+    for i in 0..count as usize {
+        // Prend possession de chaque IMFActivate (libéré au drop).
+        if let Some(a) = unsafe { std::ptr::read(pp.add(i)) } {
+            let mut name = String::new();
+            let mut p = PWSTR::null();
+            let mut len = 0u32;
+            if unsafe { a.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut p, &mut len) }.is_ok() {
+                name = unsafe { p.to_string() }.unwrap_or_default();
+                unsafe { CoTaskMemFree(Some(p.0 as *const _)) };
+            }
+            cands.push((a, name));
+        }
+    }
+    unsafe { CoTaskMemFree(Some(pp as *const _)) };
+    Ok(cands)
+}
+
 struct RawOutput {
     data: Vec<u8>,
     clean_point: bool,
@@ -134,44 +200,10 @@ impl Encoder {
     }
 
     fn create_mft(codec: Codec) -> Result<(IMFTransform, String)> {
-        let out_info = MFT_REGISTER_TYPE_INFO {
-            guidMajorType: MFMediaType_Video,
-            guidSubtype: match codec {
-                Codec::H264 => MFVideoFormat_H264,
-                Codec::Hevc => MFVideoFormat_HEVC,
-            },
-        };
-        let mut pp: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut count = 0u32;
-        unsafe {
-            MFTEnumEx(
-                MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
-                None,
-                Some(&out_info),
-                &mut pp,
-                &mut count,
-            )
-        }
-        .ctx("MFTEnumEx")?;
-        if pp.is_null() || count == 0 {
+        let mut cands = enum_hw_encoders(codec)?;
+        if cands.is_empty() {
             return Err(VideoError::NoEncoder(codec));
         }
-        let mut cands: Vec<(IMFActivate, String)> = Vec::new();
-        for i in 0..count as usize {
-            // Prend possession de chaque IMFActivate (libéré au drop).
-            if let Some(a) = unsafe { std::ptr::read(pp.add(i)) } {
-                let mut name = String::new();
-                let mut p = PWSTR::null();
-                let mut len = 0u32;
-                if unsafe { a.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut p, &mut len) }.is_ok() {
-                    name = unsafe { p.to_string() }.unwrap_or_default();
-                    unsafe { CoTaskMemFree(Some(p.0 as *const _)) };
-                }
-                cands.push((a, name));
-            }
-        }
-        unsafe { CoTaskMemFree(Some(pp as *const _)) };
         // Préfère NVIDIA.
         cands.sort_by_key(|(_, n)| !n.to_ascii_lowercase().contains("nvidia"));
         let mut last_err = None;
@@ -220,6 +252,7 @@ impl Encoder {
                     &match cfg.codec {
                         Codec::H264 => MFVideoFormat_H264,
                         Codec::Hevc => MFVideoFormat_HEVC,
+                        Codec::Av1 => MFVideoFormat_AV1,
                     },
                 )
                 .ctx("SUBTYPE")?;
@@ -231,6 +264,7 @@ impl Encoder {
             let profile = match cfg.codec {
                 Codec::H264 => eAVEncH264VProfile_High.0,
                 Codec::Hevc => eAVEncH265VProfile_Main_420_8.0,
+                Codec::Av1 => eAVEncAV1VProfile_Main_420_8.0,
             };
             let _ = out_t.SetUINT32(&MF_MT_MPEG2_PROFILE, profile as u32);
             // Métadonnées colorimétriques (VUI) : BT.709, plage limitée — cohérent avec le VideoProcessor.

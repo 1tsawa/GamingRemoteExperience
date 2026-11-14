@@ -29,6 +29,8 @@ fn nal_type(codec: Codec, hdr: u8) -> u8 {
     match codec {
         Codec::H264 => hdr & 0x1F,
         Codec::Hevc => (hdr >> 1) & 0x3F,
+        // AV1 n'est pas en Annex-B (OBU, voir grx_video::obu) : sans objet.
+        Codec::Av1 => hdr,
     }
 }
 
@@ -74,6 +76,7 @@ fn is_vcl(codec: Codec, t: u8) -> bool {
     match codec {
         Codec::H264 => (1..=5).contains(&t),
         Codec::Hevc => t <= 31,
+        Codec::Av1 => false,
     }
 }
 
@@ -84,6 +87,7 @@ fn starts_new_au(codec: Codec, t: u8) -> bool {
         Codec::H264 => matches!(t, 6..=9 | 14..=18),
         // VPS, SPS, PPS, AUD, prefix SEI, 41..=44, 48..=55
         Codec::Hevc => matches!(t, 32..=35 | 39 | 41..=44 | 48..=55),
+        Codec::Av1 => false,
     }
 }
 
@@ -124,32 +128,51 @@ pub fn split_access_units(codec: Codec, data: &[u8]) -> Vec<Range<usize>> {
 
 /// `true` si le paquet contient une image IDR (H.264 : 5 ; HEVC : 19/20).
 pub fn contains_idr(codec: Codec, data: &[u8]) -> bool {
+    if codec == Codec::Av1 {
+        return grx_video::obu::is_key_frame(data);
+    }
     nal_types(codec, data).iter().any(|&t| match codec {
         Codec::H264 => t == 5,
         Codec::Hevc => t == 19 || t == 20,
+        Codec::Av1 => false,
     })
 }
 
 /// `true` si le paquet contient un point d'accès aléatoire (IDR, ou en HEVC BLA/CRA : types 16..=21).
 pub fn contains_random_access(codec: Codec, data: &[u8]) -> bool {
+    if codec == Codec::Av1 {
+        // Image clé AV1 : sequence header + frame_type KEY_FRAME (l'encodeur répète le SH).
+        return grx_video::obu::is_key_frame(data);
+    }
     nal_types(codec, data).iter().any(|&t| match codec {
         Codec::H264 => t == 5,
         Codec::Hevc => (16..=21).contains(&t),
+        Codec::Av1 => false,
     })
 }
 
 /// `true` si le paquet contient les jeux de paramètres (H.264 : SPS+PPS ; HEVC : VPS+SPS+PPS).
 pub fn contains_parameter_sets(codec: Codec, data: &[u8]) -> bool {
+    if codec == Codec::Av1 {
+        return grx_video::obu::contains_sequence_header(data);
+    }
     let t = nal_types(codec, data);
     match codec {
         Codec::H264 => t.contains(&7) && t.contains(&8),
         Codec::Hevc => t.contains(&32) && t.contains(&33) && t.contains(&34),
+        Codec::Av1 => false,
     }
 }
 
 /// Devine le codec d'un fichier brut d'après sa première NAL : HEVC si c'est un VPS/SPS/PPS/AUD
 /// (types 32..=35, `nuh_layer_id` 0, `temporal_id_plus1` valide), sinon H.264 (SPS/PPS/AUD/SEI/IDR).
+///
+/// AV1 (flux d'OBU, pas de start code) : reconnu à son premier OBU (temporal delimiter ou
+/// sequence header) — un flux Annex-B commence par `00`, ce qui n'est pas un OBU valide.
 pub fn sniff_codec(data: &[u8]) -> Option<Codec> {
+    if data.first().is_some_and(|&b| b != 0) && grx_video::obu::looks_like_av1(data) {
+        return Some(Codec::Av1);
+    }
     let first = data.windows(3).position(|w| w == [0, 0, 1])?;
     let hdr = *data.get(first + 3)?;
     let b1 = *data.get(first + 4)?;

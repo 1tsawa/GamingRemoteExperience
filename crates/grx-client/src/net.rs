@@ -128,6 +128,12 @@ struct Shared {
     rumble: Mutex<VecDeque<grx_input::Rumble>>,
     /// Dernière liste d'écrans du host (`GRX-DSP`) et compteur de réceptions (0 = jamais reçue).
     displays: Mutex<(u64, Option<grx_core::displays::DisplayList>)>,
+    /// Dernier état de sécurité du host (`GRX-SEC`) et compteur de réceptions (0 = jamais reçu),
+    /// pour le bandeau de l'overlay.
+    security: Mutex<(u64, Option<grx_core::secure_notice::SecureNotice>)>,
+    /// Dernière annonce de codec du host (`GRX-CDC`) et compteur de réceptions (0 = jamais reçue :
+    /// ancien host sans négociation).
+    host_codec: Mutex<(u64, Option<grx_core::codec_neg::HostCodec>)>,
 }
 
 pub struct ClientConnection {
@@ -217,6 +223,8 @@ impl ClientConnection {
             host_info: Mutex::new(None),
             rumble: Mutex::new(VecDeque::new()),
             displays: Mutex::new((0, None)),
+            security: Mutex::new((0, None)),
+            host_codec: Mutex::new((0, None)),
         });
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let sh = shared.clone();
@@ -293,6 +301,11 @@ impl ClientConnection {
         self.shared.rumble.lock().unwrap().drain(..).collect()
     }
 
+    /// Dernière annonce de codec du host (`GRX-CDC`) et nombre de réceptions (0 : host sans négociation).
+    pub fn host_codec(&self) -> (u64, Option<grx_core::codec_neg::HostCodec>) {
+        self.shared.host_codec.lock().unwrap().clone()
+    }
+
     pub fn host_info(&self) -> Option<grx_core::stream_settings::HostInfo> {
         *self.shared.host_info.lock().unwrap()
     }
@@ -306,6 +319,16 @@ impl ClientConnection {
     /// Numéro de réception de la liste d'écrans (lecture bon marché, voir [`Self::displays`]).
     pub fn displays_serial(&self) -> u64 {
         self.shared.displays.lock().unwrap().0
+    }
+
+    /// Dernier état de sécurité du host (`GRX-SEC`) et son numéro de réception (0 = jamais reçu).
+    pub fn security(&self) -> (u64, Option<grx_core::secure_notice::SecureNotice>) {
+        *self.shared.security.lock().unwrap()
+    }
+
+    /// Numéro de réception de l'état de sécurité (lecture bon marché).
+    pub fn security_serial(&self) -> u64 {
+        self.shared.security.lock().unwrap().0
     }
 
     pub fn state(&self) -> ConnState {
@@ -494,6 +517,12 @@ fn net_loop(sh: Arc<Shared>, sock: UdpSocket, sess: Session, cmd_rx: Receiver<Cm
                     break 'outer;
                 }
                 Event::Control(m) if sh.cursor.on_control(&m) => {}
+                Event::Control(m) if grx_core::codec_neg::is_host_codec(&m) => {
+                    if let Some(c) = grx_core::codec_neg::HostCodec::decode(&m) {
+                        let mut g = sh.host_codec.lock().unwrap();
+                        *g = (g.0 + 1, Some(c));
+                    }
+                }
                 Event::Control(m) if grx_input::rumble::is_rumble(&m) => {
                     if let Some(r) = grx_input::Rumble::decode(&m) {
                         let mut q = sh.rumble.lock().unwrap();
@@ -513,6 +542,12 @@ fn net_loop(sh: Arc<Shared>, sock: UdpSocket, sess: Session, cmd_rx: Receiver<Cm
                     if let Some(l) = grx_core::displays::DisplayList::decode(&m) {
                         let mut d = sh.displays.lock().unwrap();
                         *d = (d.0 + 1, Some(l));
+                    }
+                }
+                Event::Control(m) if grx_core::secure_notice::is_secure_notice(&m) => {
+                    if let Some(n) = grx_core::secure_notice::SecureNotice::decode(&m) {
+                        let mut s = sh.security.lock().unwrap();
+                        *s = (s.0 + 1, Some(n));
                     }
                 }
                 Event::Datagram(d) => {

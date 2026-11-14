@@ -135,6 +135,8 @@ pub enum Event {
     FirewallHelp(Result<String, String>),
     AutoAddr(AutoAddr),
     Update(crate::update::UpdateEvent),
+    /// État du mode Contrôle total (tâche planifiée).
+    Elevation(ElevationState),
 }
 
 #[derive(Clone)]
@@ -167,7 +169,7 @@ pub enum DataCmd {
     CreateInvite { addr: String, alt_addr: Option<String>, ttl_ms: u64 },
     /// Même logique que `grx-host invite --addr auto` (status.json, sinon IP externe lue sur la box).
     AutoAddr { port: u16 },
-    SetRole { fingerprint: String, name: String, view_only: bool },
+    SetRole { fingerprint: String, name: String, role: grx_core::Role },
     Revoke { fingerprint: String, name: String },
     RenameHost { old: String, new: String },
     DeleteHost(String),
@@ -202,9 +204,49 @@ fn client_rows(t: &TrustStore) -> Vec<ClientRow> {
                 .map(|k| fingerprint(&k))
                 .unwrap_or_else(|| "?".into()),
             added_ms: c.added_ms,
-            view_only: c.view_only,
+            role: c.role(),
         })
         .collect()
+}
+
+/// Écrit `host-options.json` pour le host élevé (options de `grx-host run`, hors `run`), après
+/// filtrage par la liste blanche de `grx_core::elevation`. Refuse en silence toute option interdite.
+fn write_host_options(dir: &Path, run_args: &[String]) -> Result<(), String> {
+    // `run_args` = sortie de HostRunOptions::to_args : [--data-dir, <dir>, run, …]. On ne garde
+    // que ce qui suit `run`, et jamais `--data-dir` (le host élevé utilise son dossier par défaut).
+    let after_run = run_args.iter().position(|a| a == "run").map(|i| i + 1).unwrap_or(0);
+    let mut args: Vec<String> = Vec::new();
+    let mut it = run_args[after_run..].iter();
+    while let Some(a) = it.next() {
+        if a == "--data-dir" {
+            it.next();
+            continue;
+        }
+        args.push(a.clone());
+    }
+    grx_core::elevation::validate_run_args(&args).map_err(|e| e)?;
+    let o = grx_core::elevation::TaskOptions { args };
+    let json = serde_json::to_vec_pretty(&o).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).ok();
+    std::fs::write(dir.join(grx_core::elevation::OPTIONS_FILE), json).map_err(|e| e.to_string())
+}
+
+/// Analyse la sortie de `grx-host elevation status` (lignes « libellé : oui/non »).
+fn parse_elevation_status(stdout: &str) -> ElevationState {
+    let val = |needle: &str| {
+        stdout
+            .lines()
+            .find(|l| l.contains(needle))
+            .and_then(|l| l.rsplit(':').next())
+            .map(|v| v.trim().eq_ignore_ascii_case("oui"))
+            .unwrap_or(false)
+    };
+    ElevationState {
+        task_present: val("Tâche planifiée présente"),
+        task_valid: val("Tâche valide"),
+        at_logon: val("ouverture"),
+        protected_location: val("Dossier protégé"),
+    }
 }
 
 fn profile_rows(s: &ProfileStore) -> Vec<ProfileRow> {
@@ -332,16 +374,18 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
                         Err(e) => sink.notice(Level::Error, core_err("Création de l'invitation impossible", &e)),
                     }
                 }
-                DataCmd::SetRole { fingerprint, name, view_only } => {
+                DataCmd::SetRole { fingerprint, name, role } => {
                     let t = trust.as_mut().expect("chargé ci-dessus");
-                    match t.set_view_only(&fingerprint, view_only) {
+                    let label = match role {
+                        grx_core::Role::ViewOnly => "lecture seule",
+                        grx_core::Role::Full => "complet",
+                        grx_core::Role::Total => "contrôle total",
+                    };
+                    match t.set_role(&fingerprint, role) {
                         Ok(0) => sink.notice(Level::Error, format!("« {name} » n'est plus dans la liste (déjà révoqué ?).")),
                         Ok(_) => sink.notice(
                             Level::Success,
-                            format!(
-                                "Rôle de « {name} » : {}. Une session en cours est coupée, le client doit se reconnecter.",
-                                if view_only { "lecture seule" } else { "complet" }
-                            ),
+                            format!("Rôle de « {name} » : {label}. Une session en cours est coupée, le client doit se reconnecter."),
                         ),
                         Err(e) => sink.notice(Level::Error, core_err("Changement de rôle impossible", &e)),
                     }
@@ -506,6 +550,22 @@ pub enum HostCmd {
     Shutdown(Sender<()>),
     /// Exécute `grx-host firewall-help` (lecture seule : affiche la commande, ne l'exécute pas).
     FirewallHelp { port: u16 },
+    /// Démarre le host ÉLEVÉ via la tâche planifiée (mode Contrôle total), avec ces options de
+    /// lancement écrites au préalable dans host-options.json.
+    StartElevated(Vec<String>),
+    /// Active le mode Contrôle total (crée la tâche, UAC) ; `at_logon` = lancer aussi à l'ouverture.
+    ElevationEnable { at_logon: bool },
+    /// Désactive le mode Contrôle total (supprime la tâche, UAC).
+    ElevationDisable,
+}
+
+/// État du mode Contrôle total, publié à l'UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ElevationState {
+    pub task_present: bool,
+    pub task_valid: bool,
+    pub at_logon: bool,
+    pub protected_location: bool,
 }
 
 pub fn spawn_host_manager(paths: Paths, sink: Sink, rx: Receiver<HostCmd>) {
@@ -530,6 +590,8 @@ struct HostManager {
     stopping: bool,
     message: Option<String>,
     last_status: Option<HostStatus>,
+    last_elevation: Option<ElevationState>,
+    last_elevation_poll: Option<Instant>,
 }
 
 impl HostManager {
@@ -549,6 +611,8 @@ impl HostManager {
             stopping: false,
             message: None,
             last_status: None,
+            last_elevation: None,
+            last_elevation_poll: None,
         }
     }
 
@@ -558,6 +622,9 @@ impl HostManager {
                 Ok(HostCmd::Start(args)) => self.start(args),
                 Ok(HostCmd::Stop) => self.stop(),
                 Ok(HostCmd::FirewallHelp { port }) => self.firewall_help(port),
+                Ok(HostCmd::StartElevated(args)) => self.start_elevated(args),
+                Ok(HostCmd::ElevationEnable { at_logon }) => self.elevation_change(true, at_logon),
+                Ok(HostCmd::ElevationDisable) => self.elevation_change(false, false),
                 Ok(HostCmd::Shutdown(ack)) => {
                     self.stop();
                     let _ = ack.send(());
@@ -570,6 +637,81 @@ impl HostManager {
                 }
             }
             self.tick();
+        }
+    }
+
+    /// Lance `grx-host elevation <args>` (enfant non élevé ; `enable`/`disable` déclenchent l'UAC
+    /// via ShellExecute depuis grx-host). Sortie capturée dans le journal. Renvoie le code.
+    fn run_elevation_cmd(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        let mut cmd = Command::new(&self.exe);
+        cmd.arg("--data-dir").arg(&self.host_dir).arg("elevation").args(args).stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
+    }
+
+    /// Active / désactive le mode Contrôle total (une invite UAC chacun).
+    fn elevation_change(&mut self, enable: bool, at_logon: bool) {
+        let sub = if enable { "enable" } else { "disable" };
+        let mut args = vec![sub];
+        if enable && at_logon {
+            args.push("--at-logon");
+        }
+        match self.run_elevation_cmd(&args) {
+            Ok(o) if o.status.success() => {
+                self.sink.notice(
+                    Level::Success,
+                    if enable {
+                        "Contrôle total activé (host élevé par tâche planifiée)."
+                    } else {
+                        "Contrôle total désactivé."
+                    },
+                );
+            }
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                self.sink.notice(Level::Error, format!("Contrôle total : échec ({}).", if msg.is_empty() { "annulé ?" } else { &msg }));
+            }
+            Err(e) => self.sink.notice(Level::Error, format!("Impossible de lancer grx-host : {e}")),
+        }
+        self.publish_elevation();
+    }
+
+    /// Démarre le host élevé via la tâche planifiée (aucune UAC) après avoir écrit les options.
+    fn start_elevated(&mut self, args: Vec<String>) {
+        if self.child.is_some() || self.external_pid.is_some() {
+            self.sink.notice(Level::Error, "Un host est déjà en cours d'exécution.");
+            return;
+        }
+        if let Err(e) = write_host_options(&self.host_dir, &args) {
+            self.sink.notice(Level::Error, format!("Options du host élevé non écrites : {e}"));
+            return;
+        }
+        match self.run_elevation_cmd(&["run-task"]) {
+            Ok(o) if o.status.success() => {
+                self.message = Some("Host élevé démarré (mode Contrôle total).".into());
+                self.last_scan = None;
+            }
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                self.sink.notice(Level::Error, format!("Démarrage élevé impossible : {}", if msg.is_empty() { "la tâche existe-t-elle ?" } else { &msg }));
+            }
+            Err(e) => self.sink.notice(Level::Error, format!("Impossible de lancer grx-host : {e}")),
+        }
+    }
+
+    /// Interroge `grx-host elevation status` et publie l'état.
+    fn publish_elevation(&mut self) {
+        let st = match self.run_elevation_cmd(&["status"]) {
+            Ok(o) => parse_elevation_status(&String::from_utf8_lossy(&o.stdout)),
+            Err(_) => ElevationState::default(),
+        };
+        if self.last_elevation.as_ref() != Some(&st) {
+            self.last_elevation = Some(st.clone());
+            self.sink.send(Event::Elevation(st));
         }
     }
 
@@ -623,11 +765,27 @@ impl HostManager {
 
     fn stop(&mut self) {
         let Some(mut child) = self.child.take() else {
-            if self.external_pid.is_some() {
-                self.sink.notice(
-                    Level::Error,
-                    "Ce host n'a pas été lancé par cette fenêtre : fermez-le depuis son terminal (Ctrl+C).",
-                );
+            // Host élevé lancé par la tâche planifiée : pas un enfant de la GUI, et non élevé on
+            // ne peut pas lui envoyer Ctrl+C. On déclenche son arrêt propre par événement nommé
+            // (grx-host elevation stop --pid), valable seulement si le mode Contrôle total est actif.
+            if let Some(pid) = self.external_pid {
+                if self.last_elevation.as_ref().is_some_and(|e| e.task_present) {
+                    self.stopping = true;
+                    self.publish(Some(pid));
+                    self.push_log("— Arrêt demandé au host élevé (événement nommé) —");
+                    let ok = matches!(self.run_elevation_cmd(&["stop", "--pid", &pid.to_string()]), Ok(o) if o.status.success());
+                    if !ok {
+                        self.sink.notice(Level::Error, "Arrêt du host élevé impossible (déjà arrêté ?).");
+                    }
+                    self.stopping = false;
+                    self.last_scan = None;
+                    self.publish(None);
+                } else {
+                    self.sink.notice(
+                        Level::Error,
+                        "Ce host n'a pas été lancé par cette fenêtre : fermez-le depuis son terminal (Ctrl+C).",
+                    );
+                }
             }
             return;
         };
@@ -675,6 +833,11 @@ impl HostManager {
         }
         self.publish(None);
         self.poll_status_file();
+        // État du mode Contrôle total : relu toutes les ~3 s (schtasks est peu coûteux mais pas gratuit).
+        if self.last_elevation_poll.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            self.last_elevation_poll = Some(Instant::now());
+            self.publish_elevation();
+        }
         if self.log_dirty.swap(false, Ordering::Relaxed) {
             let snap = self.log.lock().map(|l| l.snapshot()).unwrap_or_default();
             self.sink.send(Event::HostLog(snap));
@@ -969,15 +1132,18 @@ mod tests {
         });
         assert_eq!(rows[0].name, "pc-test");
         assert_eq!(rows[0].fingerprint, client.fingerprint());
-        assert!(!rows[0].view_only);
+        assert_eq!(rows[0].role, grx_core::Role::Full);
         // Pas de secret sur disque : le lien en clair n'est nulle part dans trust.json.
         let disk = std::fs::read_to_string(paths.host_dir.join("trust.json")).unwrap();
         assert!(!disk.contains(&inv.token.as_ref().unwrap().to_b32()));
 
-        tx.send(DataCmd::SetRole { fingerprint: client.fingerprint(), name: "pc-test".into(), view_only: true })
+        tx.send(DataCmd::SetRole { fingerprint: client.fingerprint(), name: "pc-test".into(), role: grx_core::Role::Total })
             .unwrap();
-        wait_for(&rx, |e| matches!(e, Event::Clients(Ok(ref r)) if r.len() == 1 && r[0].view_only).then_some(()));
-        assert!(TrustStore::load(&paths.host_dir.join("trust.json")).unwrap().is_view_only(&client.public()));
+        wait_for(&rx, |e| matches!(e, Event::Clients(Ok(ref r)) if r.len() == 1 && r[0].role == grx_core::Role::Total).then_some(()));
+        assert_eq!(
+            TrustStore::load(&paths.host_dir.join("trust.json")).unwrap().role_of(&client.public()),
+            Some(grx_core::Role::Total)
+        );
 
         tx.send(DataCmd::Revoke { fingerprint: client.fingerprint(), name: "pc-test".into() }).unwrap();
         wait_for(&rx, |e| matches!(e, Event::Clients(Ok(ref r)) if r.is_empty()).then_some(()));

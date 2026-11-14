@@ -14,6 +14,10 @@
     Version minimale requise pour les mises à jour.
 .PARAMETER SkipTests
     Ignore l'exécution des tests.
+.PARAMETER FfmpegDir
+    Dossier des DLL FFmpeg LGPL à intégrer (défaut : third_party\ffmpeg s'il existe ; voir build-setup.ps1).
+.PARAMETER NoFfmpeg
+    N'intègre pas FFmpeg même si le dossier existe.
 .PARAMETER KeyPath
     Chemin vers la clé privée de signature (défaut : %USERPROFILE%\.grx-release\signing.key).
 #>
@@ -23,6 +27,8 @@ param(
     [string]$NotesFile,
     [string]$MinVersion,
     [switch]$SkipTests,
+    [string]$FfmpegDir,
+    [switch]$NoFfmpeg,
     [string]$KeyPath = (Join-Path $env:USERPROFILE '.grx-release\signing.key')
 )
 
@@ -84,7 +90,10 @@ try {
     New-Item -ItemType Directory -Force -Path $dist | Out-Null
     $dist = (Resolve-Path $dist).Path
 
-    & (Join-Path $PSScriptRoot 'build-setup.ps1') -BinDir $bin -OutDir $dist
+    $setupArgs = @{ BinDir = $bin; OutDir = $dist }
+    if ($FfmpegDir) { $setupArgs.FfmpegDir = $FfmpegDir }
+    if ($NoFfmpeg) { $setupArgs.NoFfmpeg = $true }
+    & (Join-Path $PSScriptRoot 'build-setup.ps1') @setupArgs
     if ($? -eq $false) { Fail "build-setup.ps1 a échoué." }
 
     $setupPath = Join-Path $dist "GRX-Setup-$version.exe"

@@ -7,9 +7,11 @@
 //!   -> swapchain flip-model (waitable, tearing) -> écran
 //! ```
 //!
-//! Prérequis H.265 : l'extension Windows « HEVC Video Extensions » (MFT `HEVCVideoExtension`)
-//! doit être installée ; sinon `VideoDecoder::new(Codec::Hevc)` renvoie `RenderError::NoDecoder`
-//! et l'appelant doit négocier H.264.
+//! Voies de décodage (chaîne de repli, [`VideoDecoder::create_best`]) : Media Foundation (H.264
+//! intégré ; HEVC/AV1 via les extensions « HEVC Video Extensions » / « AV1 Video Extension » du
+//! Store), puis FFmpeg D3D11VA (DLL LGPL facultatives chargées dynamiquement, voir `ffmpeg.rs`).
+//! [`probe_decoders`] sonde ce que le GPU décode réellement ; le client l'annonce au host, qui
+//! choisit le codec (H.264 si rien d'autre n'est disponible).
 //!
 //! ```no_run
 //! use grx_render::*;
@@ -31,12 +33,15 @@
 
 mod annexb;
 mod blit;
+mod chain;
 mod cursor;
 mod decoder;
+mod ffmpeg;
 mod error;
 mod gpu;
 mod overlay;
 mod presenter;
+mod video_decoder;
 
 pub use annexb::{
     contains_idr, contains_parameter_sets, contains_random_access, nal_types, sniff_codec, split_access_units,
@@ -44,9 +49,17 @@ pub use annexb::{
 };
 pub use blit::fit_rect;
 pub use cursor::{cursor_quad, CursorShape, RemoteCursor};
-pub use decoder::{DecodedFrame, DecoderStats, VideoDecoder};
+pub use chain::{codec_key, create_with, Attempt, ChainError, DecoderKind, DisabledDecoders};
+pub use decoder::{DecodedFrame, DecoderStats};
+pub use video_decoder::{gpu_supports, probe_decoders, ProbeEntry, VideoDecoder};
+/// Voie FFmpeg D3D11VA : `Ok(version et dossier)` si les DLL LGPL sont chargeables, sinon la raison.
+pub fn ffmpeg_availability() -> std::result::Result<String, String> {
+    ffmpeg::availability()
+}
 pub use error::{RenderError, Result};
 pub use gpu::create_device;
+/// Device D3D11 partagé décodeur/présentateur (réexporté pour les crates sans dépendance `windows`).
+pub use windows::Win32::Graphics::Direct3D11::ID3D11Device as D3D11Device;
 pub use overlay::{Align, Color, Font, OverlayItem, OverlayScene, Rect};
 pub use presenter::{
     winit, LatencyStats, Presenter, PresenterConfig, PresenterEvent, PresenterHandle, PresenterStats,

@@ -69,6 +69,10 @@ pub fn busy(dir: &Path) -> Vec<String> {
 pub fn stop_in_dir(dir: &Path, grace: Duration) -> usize {
     let procs = grx_processes_in(dir);
     for p in procs.iter().filter(|p| p.name != "grx-gui") {
+        // Host élevé (mode Contrôle total) : grx-gui non élevé ne peut pas lui envoyer Ctrl+C ;
+        // on déclenche d'abord son événement nommé d'arrêt propre (sans effet sur un host normal),
+        // puis on tente Ctrl+C comme avant. L'installateur en mode machine est élevé : les deux marchent.
+        platform::signal_stop_event(p.pid);
         platform::send_ctrl_c(p.pid);
     }
     let t0 = Instant::now();
@@ -96,8 +100,24 @@ mod platform {
     use windows_sys::Win32::System::Console::{
         AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_C_EVENT,
     };
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Threading::{
+        OpenEventW, OpenProcess, SetEvent, TerminateProcess, EVENT_MODIFY_STATE, PROCESS_TERMINATE,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE};
+
+    /// Déclenche l'événement d'arrêt propre d'un host élevé (voir `grx_core::elevation`). Sans
+    /// effet (silencieux) si l'événement n'existe pas (host normal ou déjà arrêté).
+    pub fn signal_stop_event(pid: u32) {
+        let name: Vec<u16> = format!("Local\\GamingRemoteExperience-Host-Stop-{pid}\0").encode_utf16().collect();
+        // SAFETY : handle vérifié puis fermé ; nom terminé par NUL.
+        unsafe {
+            let h = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
+            if !h.is_null() {
+                SetEvent(h);
+                CloseHandle(h);
+            }
+        }
+    }
 
     /// Même méthode que grx-gui : s'attacher à la console du processus, émettre Ctrl+C en
     /// l'ignorant soi-même, se détacher.
@@ -147,6 +167,7 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
+    pub fn signal_stop_event(_pid: u32) {}
     pub fn send_ctrl_c(_pid: u32) -> bool {
         false
     }

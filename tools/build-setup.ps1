@@ -1,14 +1,21 @@
 ﻿# Construit l'installateur GRX-Setup-<version>.exe avec Inno Setup 6 (ISCC).
-#   tools\build-setup.ps1 [-BinDir <dossier des exe>] [-OutDir <sortie>] [-NoVigem]
+#   tools\build-setup.ps1 [-BinDir <dossier des exe>] [-OutDir <sortie>] [-NoVigem] [-FfmpegDir <dossier>] [-NoFfmpeg]
 # - Version lue dans [workspace.package] du Cargo.toml racine (source unique).
 # - ViGEmBus : installateur officiel téléchargé depuis les releases GitHub de nefarius/ViGEmBus
 #   (licence BSD-3), SHA-256 épinglé ci-dessous et signature Authenticode contrôlée. Toute
 #   différence = arrêt (jamais d'installateur de pilote non vérifié dans le setup).
+# - FFmpeg (facultatif) : décodeur de secours HEVC/AV1 (D3D11VA) si l'extension du Store manque.
+#   Intégré seulement si -FfmpegDir (défaut : third_party\ffmpeg) contient avcodec-62.dll,
+#   avutil-60.dll (+ swresample-6.dll si la build en dépend), LICENSE.txt (texte LGPL) et
+#   SOURCE.txt (provenance : URL de la build et des sources). Une build GPL est REFUSÉE
+#   (« --enable-gpl » / « --enable-nonfree » dans la configuration embarquée). Voir docs/ARCHITECTURE.md.
 [CmdletBinding()]
 param(
     [string]$BinDir,
     [string]$OutDir,
-    [switch]$NoVigem
+    [switch]$NoVigem,
+    [string]$FfmpegDir,
+    [switch]$NoFfmpeg
 )
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
@@ -73,9 +80,36 @@ foreach ($exe in "grx-gui.exe", "grx-host.exe", "grx-client.exe") {
     if (-not (Test-Path (Join-Path $BinDir $exe))) { throw "$exe absent de $BinDir (compilez d'abord en release)" }
 }
 
+function Get-VerifiedFfmpeg([string]$dir) {
+    foreach ($f in "avcodec-62.dll", "avutil-60.dll", "LICENSE.txt", "SOURCE.txt") {
+        if (-not (Test-Path (Join-Path $dir $f))) { throw "FFmpeg : $f absent de $dir (voir docs/ARCHITECTURE.md, section FFmpeg)" }
+    }
+    $lic = Get-Content (Join-Path $dir "LICENSE.txt") -Raw
+    if ($lic -notmatch "LESSER GENERAL PUBLIC LICENSE") { throw "FFmpeg : LICENSE.txt n'est pas la LGPL" }
+    foreach ($dll in "avcodec-62.dll", "avutil-60.dll", "swresample-6.dll") {
+        $p = Join-Path $dir $dll
+        if (-not (Test-Path $p)) { continue }
+        # La configuration de compilation est embarquée en clair dans chaque bibliothèque.
+        $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($p))
+        if ($text.Contains("--enable-gpl") -or $text.Contains("--enable-nonfree")) {
+            throw "FFmpeg : $dll est une build GPL/nonfree, refusée (il faut une build LGPL)"
+        }
+        $h = (Get-FileHash -Algorithm SHA256 $p).Hash.ToLowerInvariant()
+        Write-Host "FFmpeg LGPL : $dll ($([math]::Round((Get-Item $p).Length / 1MB, 1)) Mo) SHA-256 $h"
+    }
+    return (Resolve-Path $dir).Path
+}
+
 $iscc = Find-Iscc
 $defs = @("/DAppVersion=$version", "/DBinDir=$BinDir", "/DOutDir=$OutDir")
 if (-not $NoVigem) { $defs += "/DVigemExe=$(Get-VerifiedVigem)" }
+if (-not $FfmpegDir) { $FfmpegDir = Join-Path $root "third_party\ffmpeg" }
+if (-not $NoFfmpeg -and (Test-Path (Join-Path $FfmpegDir "avcodec-62.dll"))) {
+    $defs += "/DFfmpegDir=$(Get-VerifiedFfmpeg $FfmpegDir)"
+    if (-not (Test-Path (Join-Path $FfmpegDir "swresample-6.dll"))) { $defs += "/DFfmpegNoSwr=1" }
+} else {
+    Write-Host "FFmpeg non intégré (décodeur de secours désactivé ; HEVC sans extension -> H.264 négocié)"
+}
 & $iscc /Q @defs (Join-Path $root "installer\grx.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC a échoué (code $LASTEXITCODE)" }
 $setup = Join-Path $OutDir "GRX-Setup-$version.exe"

@@ -93,7 +93,11 @@ pub struct App {
     invite_pending: bool,
     host: HostStatus,
     host_log: Vec<String>,
+    /// État du mode Contrôle total (tâche planifiée).
+    elevation: backend::ElevationState,
     revoke_confirm: Option<ClientRow>,
+    /// Confirmation avant de donner le rôle « Contrôle total » à un client.
+    total_confirm: Option<ClientRow>,
     detect_ip_pending: bool,
     auto_addr_pending: bool,
     run_status: Option<(RunStatus, Duration)>,
@@ -162,8 +166,10 @@ impl App {
             invite_note: None,
             invite_pending: false,
             host: HostStatus::default(),
+            elevation: backend::ElevationState::default(),
             host_log: Vec::new(),
             revoke_confirm: None,
+            total_confirm: None,
             detect_ip_pending: false,
             auto_addr_pending: false,
             run_status: None,
@@ -266,6 +272,16 @@ impl App {
                                 self.notify(Level::Error, e)
                             }
                             (None, Some(0)) => self.notify(Level::Info, format!("Session « {name} » terminée.")),
+                            // Code 4 : aucun décodeur vidéo utilisable (la connexion, elle, fonctionnait).
+                            (None, Some(4)) => {
+                                if pairing {
+                                    self.pair_pending = None;
+                                }
+                                self.notify(
+                                    Level::Error,
+                                    format!("Session « {name} » : décodage vidéo impossible sur ce PC. {detail}"),
+                                )
+                            }
                             (None, code) => {
                                 if pairing {
                                     self.pair_pending = None;
@@ -319,6 +335,7 @@ impl App {
                     self.link_text = t;
                     self.name_touched = false;
                 }
+                Event::Elevation(st) => self.elevation = st,
                 Event::Update(ev) => {
                     self.update.on_event(ev);
                     if matches!(self.update.state, update::UpdateState::Launched) {
@@ -366,7 +383,17 @@ impl App {
         match self.settings.host.validate() {
             Ok(_) => {
                 self.save_settings();
-                let _ = self.host_tx.send(HostCmd::Start(self.settings.host.to_args(&self.paths.host_dir)));
+                let args = self.settings.host.to_args(&self.paths.host_dir);
+                // Mode Contrôle total : lancer le host élevé via la tâche planifiée (aucune UAC à
+                // chaque démarrage), à condition qu'elle soit installée et valide.
+                if self.settings.host_elevated && self.elevation.task_present && self.elevation.task_valid {
+                    let _ = self.host_tx.send(HostCmd::StartElevated(args));
+                } else {
+                    if self.settings.host_elevated {
+                        self.notify(Level::Info, "Mode Contrôle total non activé : démarrage normal (host non élevé).");
+                    }
+                    let _ = self.host_tx.send(HostCmd::Start(args));
+                }
             }
             Err(m) => self.notify(Level::Error, m),
         }
@@ -556,6 +583,7 @@ impl App {
             if st.running && !st.stopping {
                 self.access_status(ui);
             }
+            self.elevation_card(ui, st.running);
             egui::CollapsingHeader::new("Options de lancement").default_open(false).show(ui, |ui| {
                 let o = &mut self.settings.host;
                 let locked = st.running;
@@ -616,6 +644,60 @@ impl App {
                         }
                     });
                 });
+        });
+    }
+
+    /// Mode « Contrôle total » : host lancé élevé par une tâche planifiée (sans UAC à chaque fois).
+    fn elevation_card(&mut self, ui: &mut egui::Ui, running: bool) {
+        egui::CollapsingHeader::new("Contrôle total (host élevé)").default_open(false).show(ui, |ui| {
+            let e = self.elevation.clone();
+            ui.label(small_muted(
+                "Permet à un client « Contrôle total » de piloter au clavier/souris les fenêtres administrateur du PC. \
+                 L'invite UAC et l'écran de verrouillage de Windows restent protégés : jamais visibles ni pilotables à distance (à valider sur place).",
+            ));
+            if !e.protected_location {
+                ui.label(colored(
+                    "Indisponible : grx-host n'est pas installé « pour tous les utilisateurs » (Program Files). \
+                     Réinstallez en installation machine pour activer le Contrôle total en toute sécurité.",
+                    WARN,
+                ));
+                return;
+            }
+            ui.horizontal(|ui| {
+                if e.task_present && e.task_valid {
+                    dot(ui, OK);
+                    ui.label(colored("Activé (tâche planifiée installée)", OK));
+                } else if e.task_present {
+                    dot(ui, WARN);
+                    ui.label(colored("Tâche présente mais invalide (réactivez)", WARN));
+                } else {
+                    dot(ui, MUTED);
+                    ui.label(muted("Désactivé"));
+                }
+            });
+            ui.add_enabled_ui(!running, |ui| {
+                ui.checkbox(&mut self.settings.host_elevated, "Démarrer le host en mode Contrôle total");
+                ui.checkbox(&mut self.settings.host_at_logon, "Lancer le host élevé à l'ouverture de session (optionnel)");
+                ui.horizontal(|ui| {
+                    if !e.task_present {
+                        if ui.add(primary_button("Activer (UAC)")).clicked() {
+                            let _ = self.host_tx.send(HostCmd::ElevationEnable { at_logon: self.settings.host_at_logon });
+                            self.save_settings();
+                        }
+                    } else {
+                        if ui.button("Réappliquer (UAC)").clicked() {
+                            let _ = self.host_tx.send(HostCmd::ElevationEnable { at_logon: self.settings.host_at_logon });
+                            self.save_settings();
+                        }
+                        if ui.add(danger_button("Désactiver (UAC)")).clicked() {
+                            let _ = self.host_tx.send(HostCmd::ElevationDisable);
+                        }
+                    }
+                });
+            });
+            if running {
+                ui.label(small_muted("Arrêtez le host pour changer ces réglages."));
+            }
         });
     }
 
@@ -828,7 +910,7 @@ impl App {
             } else {
                 let now = Instant::now();
                 let rows = self.clients.rows.clone();
-                let mut set_role: Option<(ClientRow, bool)> = None;
+                let mut set_role: Option<(ClientRow, grx_core::Role)> = None;
                 let mut revoke: Option<ClientRow> = None;
                 let mut highlight = false;
                 egui::Grid::new("clients").striped(true).num_columns(5).min_col_width(60.0).show(ui, |ui| {
@@ -852,16 +934,23 @@ impl App {
                             }
                         });
                         ui.label(format_date_local(r.added_ms));
-                        let mut vo = r.view_only;
+                        let mut role = r.role;
                         egui::ComboBox::from_id_salt(("role", &r.fingerprint))
                             .selected_text(r.role_label())
-                            .width(120.0)
+                            .width(140.0)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut vo, false, "Complet");
-                                ui.selectable_value(&mut vo, true, "Lecture seule");
+                                ui.selectable_value(&mut role, grx_core::Role::Full, "Complet");
+                                ui.selectable_value(&mut role, grx_core::Role::ViewOnly, "Lecture seule");
+                                ui.selectable_value(&mut role, grx_core::Role::Total, "Contrôle total");
                             });
-                        if vo != r.view_only {
-                            set_role = Some((r.clone(), vo));
+                        if role != r.role {
+                            // « Contrôle total » demande une confirmation explicite (il pourra
+                            // piloter les fenêtres administrateur du PC quand le host est élevé).
+                            if role == grx_core::Role::Total {
+                                self.total_confirm = Some(r.clone());
+                            } else {
+                                set_role = Some((r.clone(), role));
+                            }
                         }
                         if ui.add(danger_button("Révoquer")).clicked() {
                             revoke = Some(r.clone());
@@ -872,14 +961,16 @@ impl App {
                 if highlight {
                     ui.ctx().request_repaint_after(Duration::from_millis(1000));
                 }
-                if let Some((r, vo)) = set_role {
-                    let _ = self.data_tx.send(DataCmd::SetRole { fingerprint: r.fingerprint, name: r.name, view_only: vo });
+                if let Some((r, role)) = set_role {
+                    let _ = self.data_tx.send(DataCmd::SetRole { fingerprint: r.fingerprint, name: r.name, role });
                 }
                 if let Some(r) = revoke {
                     self.revoke_confirm = Some(r);
                 }
                 ui.label(small_muted(
-                    "Complet : clavier, souris, manette. Lecture seule : le client voit et entend, rien n'est injecté. Changer le rôle ou révoquer coupe la session en cours. La liste se met à jour toute seule.",
+                    "Complet : clavier, souris, manette sur le bureau normal. Lecture seule : le client voit et entend, rien n'est injecté. \
+                     Contrôle total : comme Complet, et pilote aussi les fenêtres administrateur quand le host tourne en mode Contrôle total. \
+                     Changer le rôle ou révoquer coupe la session en cours. La liste se met à jour toute seule.",
                 ));
             }
         });
@@ -1137,6 +1228,41 @@ impl App {
                 self.revoke_confirm = None;
             } else if close {
                 self.revoke_confirm = None;
+            }
+        }
+        if let Some(r) = self.total_confirm.clone() {
+            let mut close = false;
+            let mut confirm = false;
+            let m = egui::Modal::new(egui::Id::unique("total-modal")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Donner le « Contrôle total » ?");
+                ui.label(format!(
+                    "« {} » ({}) pourra piloter au clavier et à la souris les fenêtres administrateur du PC \
+                     (ex. valider certaines boîtes de dialogue) quand le host tourne en mode Contrôle total.",
+                    r.name, r.fingerprint
+                ));
+                ui.label(colored(
+                    "L'invite UAC de Windows et l'écran de verrouillage restent protégés : jamais visibles ni pilotables à distance.",
+                    WARN,
+                ));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary_button("Donner le Contrôle total")).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Annuler").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if m.should_close() {
+                close = true;
+            }
+            if confirm {
+                let _ = self.data_tx.send(DataCmd::SetRole { fingerprint: r.fingerprint, name: r.name, role: grx_core::Role::Total });
+                self.total_confirm = None;
+            } else if close {
+                self.total_confirm = None;
             }
         }
         if let Some(name) = self.delete_confirm.clone() {

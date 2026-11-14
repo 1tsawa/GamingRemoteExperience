@@ -233,12 +233,16 @@ pub struct ClientRow {
     pub name: String,
     pub fingerprint: String,
     pub added_ms: u64,
-    pub view_only: bool,
+    pub role: grx_core::Role,
 }
 
 impl ClientRow {
     pub fn role_label(&self) -> &'static str {
-        if self.view_only { "Lecture seule" } else { "Complet" }
+        match self.role {
+            grx_core::Role::ViewOnly => "Lecture seule",
+            grx_core::Role::Full => "Complet",
+            grx_core::Role::Total => "Contrôle total",
+        }
     }
 }
 
@@ -329,24 +333,31 @@ impl LogBuffer {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 pub enum CodecChoice {
+    /// Négocié avec chaque client (HEVC s'il le décode, sinon H.264).
     #[default]
+    Auto,
     Hevc,
     H264,
+    Av1,
 }
 
 impl CodecChoice {
-    pub const ALL: [CodecChoice; 2] = [CodecChoice::Hevc, CodecChoice::H264];
+    pub const ALL: [CodecChoice; 4] = [CodecChoice::Auto, CodecChoice::Hevc, CodecChoice::H264, CodecChoice::Av1];
 
     pub fn arg(self) -> &'static str {
         match self {
+            CodecChoice::Auto => "auto",
             CodecChoice::Hevc => "hevc",
             CodecChoice::H264 => "h264",
+            CodecChoice::Av1 => "av1",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
+            CodecChoice::Auto => "Automatique (selon le client)",
             CodecChoice::Hevc => "H.265 (HEVC)",
             CodecChoice::H264 => "H.264",
+            CodecChoice::Av1 => "AV1 (RTX 40+)",
         }
     }
 }
@@ -619,7 +630,8 @@ mod tests {
     }
 
     fn row(name: &str, fp: &str, added: u64, vo: bool) -> ClientRow {
-        ClientRow { name: name.into(), fingerprint: fp.into(), added_ms: added, view_only: vo }
+        let role = if vo { grx_core::Role::ViewOnly } else { grx_core::Role::Full };
+        ClientRow { name: name.into(), fingerprint: fp.into(), added_ms: added, role }
     }
 
     #[test]
@@ -686,7 +698,7 @@ mod tests {
         let o = HostRunOptions::default();
         assert_eq!(
             o.to_args(dir),
-            ["--data-dir", "C:/data host", "run", "--bind", "0.0.0.0:7777", "--codec", "hevc", "--fps", "60"]
+            ["--data-dir", "C:/data host", "run", "--bind", "0.0.0.0:7777", "--codec", "auto", "--fps", "60"]
         );
         let o = HostRunOptions {
             bind: " 127.0.0.1:9000 ".into(),

@@ -8,7 +8,7 @@ pub enum RenderError {
         #[source]
         source: windows::core::Error,
     },
-    #[error("no hardware-capable decoder found for {0:?} (see crate docs: install the HEVC Video Extensions for H.265)")]
+    #[error("aucun MFT Media Foundation pour {0:?} (HEVC/AV1 : extension du Microsoft Store absente)")]
     NoDecoder(Codec),
     #[error("decoder produced no frame within the timeout")]
     Timeout,

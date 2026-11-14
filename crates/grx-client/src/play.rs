@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use grx_audio::{AudioPlayer, PlayerConfig};
 use grx_core::{Identity, Invite};
 use grx_input::{InputEvent, MouseButton};
@@ -64,6 +64,12 @@ pub struct PlayOpts {
     pub prefs_path: Option<std::path::PathBuf>,
     /// Manettes physiques (`None` : `--no-gamepad`), voir `gamepads.rs`.
     pub gamepad: Option<crate::gamepads::PadOpts>,
+    /// `play --codec` : codec demandé au host (`None` = auto, voir `codec.rs`).
+    pub codec: Option<grx_core::codec_neg::VideoCodec>,
+    /// (tests) voies de décodage désactivées (`--disable-decoder mf-hevc,...`).
+    pub disabled_decoders: grx_render::DisabledDecoders,
+    /// (tests) panne simulée du décodeur de ce codec après N images décodées.
+    pub fail_decoder_after: Option<(grx_video::Codec, u64)>,
 }
 
 /// Volume par défaut de `--volume` : une autre valeur sur la ligne de commande l'emporte sur la préférence.
@@ -75,7 +81,8 @@ enum Outcome {
     Closed,
     /// La connexion est tombée (timeout, host arrêté, session remplacée).
     Lost(String),
-    Error(String),
+    /// Aucun décodeur vidéo utilisable (message complet : codec, cause, solutions).
+    Decoder(String),
 }
 
 /// Titre de la fenêtre : nom du host + (option) stats + état de la capture.
@@ -131,7 +138,12 @@ fn avg(v: &[f64]) -> f64 {
     }
 }
 
-/// Retourne le code de sortie du processus (0 : fermeture normale, 3 : connexion perdue).
+/// Erreurs de décodage consécutives (sans aucune image entre elles) au-delà desquelles le
+/// décodeur est déclaré en panne et le codec renégocié.
+const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
+
+/// Retourne le code de sortie du processus (0 : fermeture normale, 3 : connexion perdue,
+/// 4 : aucun décodeur vidéo utilisable).
 pub fn run(
     id: &Identity,
     invite: &Invite,
@@ -141,6 +153,17 @@ pub fn run(
 ) -> Result<i32> {
     if p.selftest_input && p.no_input {
         bail!("--selftest-input est incompatible avec --no-input");
+    }
+    // Décodeurs réellement utilisables sur ce GPU (créés pour de vrai, en cache), annoncés au host.
+    let device = grx_render::create_device()?;
+    let t_probe = Instant::now();
+    let decoders = crate::codec::Decoders::new(grx_render::probe_decoders(&device, &p.disabled_decoders), p.codec);
+    println!("Décodeurs vidéo de ce PC (sondage {:.0} ms) :", t_probe.elapsed().as_secs_f64() * 1e3);
+    for l in decoders.summary() {
+        println!("  {l}");
+    }
+    if let Some(c) = p.codec.filter(|c| !decoders.decodable().contains(*c)) {
+        eprintln!("! --codec {} : pas de décodeur {} utilisable ici, le host choisira un autre codec", c.arg(), c.label());
     }
     let t_conn = Instant::now();
     let conn = ClientConnection::connect(id, invite, copts)?;
@@ -152,6 +175,8 @@ pub fn run(
         t_conn.elapsed().as_secs_f64() * 1e3
     );
     on_connected(&conn)?;
+    // Annonce GRX-COD (un ancien host l'ignore et envoie son codec : on le décode s'il est connu).
+    conn.send_control(&decoders.announce(false).encode());
     let conn = Arc::new(conn);
 
     let base_title = format!("GRX - {}", conn.host_name());
@@ -178,6 +203,7 @@ pub fn run(
         height: p.height,
         fullscreen: p.fullscreen,
         vsync: ov.vsync,
+        device: Some(device.clone()),
         ..Default::default()
     })?;
     let handle = presenter.handle();
@@ -249,7 +275,10 @@ pub fn run(
         let (print_stats, secs) = (p.stats, p.secs);
         thread::Builder::new()
             .name("grx-client-video".into())
-            .spawn(move || video_loop(c, h, u, st, o, print_stats, secs))?
+            .spawn(move || {
+                let dev = VideoCtx { device, decoders, disabled: p.disabled_decoders, fail_after: p.fail_decoder_after };
+                video_loop(c, h, u, st, o, print_stats, secs, dev)
+            })?
     };
 
     // Curseur distant (voir `cursor.rs`) : dessiné par le présentateur, curseur local masqué sur la vidéo.
@@ -349,13 +378,47 @@ pub fn run(
             eprintln!("Connexion perdue : {r}");
             3
         }
-        Outcome::Error(e) => return Err(anyhow!(e)),
+        Outcome::Decoder(e) => {
+            eprintln!("{e}");
+            4
+        }
     })
 }
 
 // ---------------------------------------------------------------------------------------------
 // Vidéo
 
+/// Décodage : device partagé avec le présentateur, décodeurs sondés, voies désactivées.
+struct VideoCtx {
+    device: grx_render::D3D11Device,
+    decoders: crate::codec::Decoders,
+    disabled: grx_render::DisabledDecoders,
+    fail_after: Option<(grx_video::Codec, u64)>,
+}
+
+// SAFETY : device D3D11 créé avec la protection multithread (grx_render::create_device).
+unsafe impl Send for VideoCtx {}
+
+/// Le décodeur de `codec` est inutilisable : renégociation vers un autre codec si le host la
+/// gère (sans couper la session), sinon `Err(message final)`.
+fn renegotiate(conn: &ClientConnection, vc: &mut VideoCtx, codec: grx_video::Codec, cause: &str) -> Result<(), String> {
+    let negotiates = conn.host_codec().0 > 0;
+    if codec == grx_video::Codec::H264 || !negotiates {
+        return Err(crate::codec::fatal_message(codec, cause, negotiates));
+    }
+    vc.decoders.mark_unusable(codec);
+    let a = vc.decoders.announce(true);
+    eprintln!(
+        "! décodeur {} indisponible ({cause}) : renégociation (décodeurs restants : {})",
+        crate::codec::label(codec),
+        a.decodable()
+    );
+    conn.send_control(&a.encode());
+    conn.request_keyframe();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn video_loop(
     conn: Arc<ClientConnection>,
     handle: PresenterHandle,
@@ -364,6 +427,7 @@ fn video_loop(
     outcome: Arc<Mutex<Option<Outcome>>>,
     print_stats: bool,
     secs: Option<f64>,
+    mut vc: VideoCtx,
 ) {
     let finish = |o: Outcome| {
         let mut g = outcome.lock().unwrap();
@@ -393,11 +457,14 @@ fn video_loop(
     let mut all_loss = Vec::<f64>::new();
     let (mut decode_errors, mut presented_total, mut dropped_total, mut decoded_total) = (0u64, 0u64, 0u64, 0u64);
     let mut err_logged = 0;
+    let mut consecutive_errors = 0u32;
     // Pour l'overlay : résolution et codec du flux.
     let (mut res, mut codec_name) = ((0u32, 0u32), String::new());
     // Liste d'écrans du host déjà vue ; bascule confirmée par le host, en attente de sa 1re image.
     let mut displays_seen = 0u64;
     let mut switch_confirmed: Option<Instant> = None;
+    // État de sécurité du host (GRX-SEC) déjà traité, pour le bandeau de l'overlay.
+    let mut security_seen = 0u64;
 
     while !stop.load(Ordering::Relaxed) && !handle.is_closed() {
         if let ConnState::Closed(r) = conn.state() {
@@ -431,6 +498,17 @@ fn video_loop(
             }
         }
 
+        // État de sécurité du host : bandeau de l'overlay (écran sécurisé / fenêtre administrateur).
+        let ss = conn.security_serial();
+        if ss != security_seen {
+            security_seen = ss;
+            if let (_, Some(n)) = conn.security() {
+                let mut ov = ui.ov.lock().unwrap();
+                ov.security_banner = grx_core::secure::notice_text(&n);
+                handle.set_overlay(ov.scene());
+            }
+        }
+
         if let Some(f) = conn.recv_video_timeout(Duration::from_millis(20)) {
             if f.keyframe {
                 if let Some(t0) = switch_confirmed.take() {
@@ -440,17 +518,48 @@ fn video_loop(
             }
             let rx_ms = unix_micros().saturating_sub(f.pts_us) as f64 / 1000.0;
             sec_rx += 1;
+            // Changement de codec dans le flux (renégociation) : nouveau décodeur sur l'image clé.
+            if let (true, Some(d)) = (f.keyframe, dec.as_ref()) {
+                if let Some(c) = sniff_codec(&f.data).filter(|c| *c != d.codec()) {
+                    println!("Codec du flux : {} -> {}", crate::codec::label(d.codec()), crate::codec::label(c));
+                    dec = None;
+                }
+            }
             if dec.is_none() {
                 match sniff_codec(&f.data) {
-                    Some(codec) => match handle.create_decoder(codec) {
-                        Ok(d) => {
-                            println!("Décodeur : {} ({codec:?})", d.backend_name());
-                            codec_name = format!("{codec:?}").to_uppercase();
+                    // Codec abandonné (renégociation en cours) : on attend les images du nouveau.
+                    Some(codec) if vc.decoders.is_unusable(codec) => {
+                        if last_kf_req.elapsed() >= Duration::from_millis(500) {
+                            conn.request_keyframe();
+                            last_kf_req = Instant::now();
+                        }
+                        continue;
+                    }
+                    Some(codec) => match VideoDecoder::create_best(&vc.device, codec, &vc.disabled) {
+                        Ok((d, failed)) => {
+                            let hc = conn.host_codec().1;
+                            println!(
+                                "Décodeur : {} ({}, {}){}{}",
+                                d.backend_name(),
+                                crate::codec::label(codec),
+                                d.kind().label(),
+                                hc.map_or(" [host sans négociation]".to_string(), |h| format!(" [codec choisi par le host : {}]", h.reason.label())),
+                                if failed.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" [repli après : {}]", failed.iter().map(|a| format!("{} : {}", a.kind.label(), a.error)).collect::<Vec<_>>().join(" ; "))
+                                }
+                            );
+                            codec_name = format!("{} · {}", crate::codec::label(codec), d.kind().label());
+                            consecutive_errors = 0;
                             dec = Some(d);
                         }
                         Err(e) => {
-                            finish(Outcome::Error(format!("création du décodeur {codec:?} : {e}")));
-                            break;
+                            if let Err(m) = renegotiate(&conn, &mut vc, codec, &e.causes()) {
+                                finish(Outcome::Decoder(m));
+                                break;
+                            }
+                            continue;
                         }
                     },
                     None => {
@@ -462,7 +571,13 @@ fn video_loop(
             }
             let d = dec.as_mut().unwrap();
             let t0 = Instant::now();
-            match d.decode_pts(&f.data, f.pts_us) {
+            let simulated = vc.fail_after.is_some_and(|(c, n)| c == d.codec() && decoded_total >= n);
+            let r = if simulated {
+                Err(grx_render::RenderError::Other("panne simulée (--fail-decoder-after)".into()))
+            } else {
+                d.decode_pts(&f.data, f.pts_us)
+            };
+            match r {
                 Ok(Some(frame)) => {
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
                     sec_dec_n += 1;
@@ -472,16 +587,27 @@ fn video_loop(
                     all_dec_ms.push(ms);
                     all_rx_ms.push(rx_ms);
                     res = (frame.width, frame.height);
+                    consecutive_errors = 0;
                     handle.submit(frame);
                 }
                 Ok(None) => {}
                 Err(e) => {
                     decode_errors += 1;
+                    consecutive_errors += 1;
                     if err_logged < 5 {
                         err_logged += 1;
                         eprintln!("! erreur de décodage : {e} (reset + demande d'image clé)");
                     }
                     let _ = d.reset();
+                    // Décodeur en panne (et non simple perte de paquets) : on change de codec.
+                    if consecutive_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+                        let codec = d.codec();
+                        dec = None;
+                        if let Err(m) = renegotiate(&conn, &mut vc, codec, &format!("{consecutive_errors} erreurs de suite : {e}")) {
+                            finish(Outcome::Decoder(m));
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -577,6 +703,7 @@ fn video_loop(
     let v = s.transport.video_rx;
     let run_s = start.elapsed().as_secs_f64();
     println!("\n-- Résumé play ({run_s:.1} s) --");
+    println!("codec  : {}", if codec_name.is_empty() { "aucun" } else { &codec_name });
     println!(
         "images : {} reçues ({} clés), {} décodées, {} présentées, {} écartées à l'affichage, {} erreurs de décodage",
         s.video_frames,

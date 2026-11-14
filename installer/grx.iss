@@ -102,6 +102,16 @@ Source: "{#BinDir}\grx-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\grx-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\TUTO.md"; DestDir: "{app}"; Flags: ignoreversion
+; Décodeur de secours FFmpeg (LGPL, facultatif : voir tools\build-setup.ps1 -FfmpegDir).
+#ifdef FfmpegDir
+Source: "{#FfmpegDir}\avcodec-62.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#FfmpegDir}\avutil-60.dll"; DestDir: "{app}"; Flags: ignoreversion
+#ifndef FfmpegNoSwr
+Source: "{#FfmpegDir}\swresample-6.dll"; DestDir: "{app}"; Flags: ignoreversion
+#endif
+Source: "{#FfmpegDir}\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "FFmpeg-LGPL.txt"; Flags: ignoreversion
+Source: "{#FfmpegDir}\SOURCE.txt"; DestDir: "{app}\licenses"; DestName: "FFmpeg-SOURCE.txt"; Flags: ignoreversion
+#endif
 #ifdef VigemExe
 Source: "{#VigemExe}"; DestDir: "{tmp}"; DestName: "ViGEmBus_setup.exe"; Components: vigem; Flags: deleteafterinstall
 #endif
@@ -134,6 +144,9 @@ Filename: "{app}\grx-gui.exe"; Flags: nowait runasoriginaluser; Check: RelaunchR
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Tasks: firewall; Flags: runhidden waituntilterminated; RunOnceId: "DelFirewallRule"
+; Contrôle total : supprime la tâche planifiée « host élevé » (sinon elle pointerait vers un exe supprimé).
+; Sans effet si la tâche n'existe pas. Uniquement en installation machine (seule à pouvoir l'activer).
+Filename: "{app}\grx-host.exe"; Parameters: "elevation remove-task"; Check: IsAdminInstallMode; Flags: runhidden waituntilterminated; RunOnceId: "DelElevatedTask"
 
 [Code]
 function TypeFull(Param: String): String;

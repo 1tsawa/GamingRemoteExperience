@@ -8,7 +8,7 @@
 use crate::annexb;
 use crate::error::{RenderError, Result, WinCtx};
 use crate::gpu;
-use grx_video::{Codec, EncodedFrame};
+use grx_video::Codec;
 use std::sync::Once;
 use windows::core::{Interface, PWSTR, VARIANT};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -39,7 +39,13 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Horodatage de présentation (µs), recopié depuis l'entrée.
     pub pts: u64,
-    _sample: IMFSample,
+    pub(crate) _keep: FrameKeep,
+}
+
+/// Ce qui maintient la surface du décodeur en vie tant que l'image est affichée.
+pub(crate) enum FrameKeep {
+    Mf(#[allow(dead_code)] IMFSample),
+    Ff(#[allow(dead_code)] crate::ffmpeg::FrameRef),
 }
 
 impl std::fmt::Debug for DecodedFrame {
@@ -66,7 +72,8 @@ pub struct DecoderStats {
 unsafe impl Send for DecodedFrame {}
 unsafe impl Sync for DecodedFrame {}
 
-pub struct VideoDecoder {
+/// Décodeur Media Foundation (MFT synchrone D3D11-aware).
+pub(crate) struct MfDecoder {
     query: Option<ID3D11Query>,
     codec: Codec,
     device: ID3D11Device,
@@ -77,7 +84,6 @@ pub struct VideoDecoder {
     height: u32,
     wait_idr: bool,
     discontinuity: bool,
-    next_pts: u64,
     stats: DecoderStats,
 }
 
@@ -85,19 +91,11 @@ fn subtype(codec: Codec) -> windows::core::GUID {
     match codec {
         Codec::H264 => MFVideoFormat_H264,
         Codec::Hevc => MFVideoFormat_HEVC,
+        Codec::Av1 => MFVideoFormat_AV1,
     }
 }
 
-impl VideoDecoder {
-    /// Crée un décodeur avec son propre device D3D11 (adaptateur NVIDIA préféré).
-    /// Pour afficher les images avec un [`crate::PresenterHandle`], utiliser [`VideoDecoder::with_device`].
-    pub fn new(codec: Codec) -> Result<Self> {
-        let device = gpu::create_device()?;
-        Self::with_device(&device, codec)
-    }
-
-    /// Crée un décodeur sur le device D3D11 donné (doit avoir `D3D11_CREATE_DEVICE_VIDEO_SUPPORT`
-    /// et la protection multithread ; voir [`crate::create_device`]).
+impl MfDecoder {
     pub fn with_device(device: &ID3D11Device, codec: Codec) -> Result<Self> {
         gpu::init_com();
         mf_startup()?;
@@ -121,7 +119,7 @@ impl VideoDecoder {
         unsafe { mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr.as_raw() as usize) }
             .ctx("MFT_MESSAGE_SET_D3D_MANAGER")?;
 
-        let mut dec = VideoDecoder {
+        let mut dec = MfDecoder {
             query: None,
             codec,
             device: device.clone(),
@@ -132,7 +130,6 @@ impl VideoDecoder {
             height: 0,
             wait_idr: true,
             discontinuity: true,
-            next_pts: 0,
             stats: DecoderStats::default(),
         };
         dec.configure()?;
@@ -219,10 +216,6 @@ impl VideoDecoder {
         &self.name
     }
 
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
-
     /// Device D3D11 sur lequel vivent les textures décodées.
     pub fn device(&self) -> &ID3D11Device {
         &self.device
@@ -241,20 +234,6 @@ impl VideoDecoder {
     /// les paquets non-IDR sont ignorés. Le client doit alors demander un IDR au host.
     pub fn needs_keyframe(&self) -> bool {
         self.wait_idr
-    }
-
-    /// Décode une access unit Annex-B. Renvoie la dernière image sortie (`None` si le MFT n'a
-    /// encore rien produit, ou si on attend un IDR). Les horodatages sont synthétiques ;
-    /// utiliser [`VideoDecoder::decode_pts`] / [`VideoDecoder::decode_frame`] pour les conserver.
-    pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame>> {
-        let pts = self.next_pts;
-        self.next_pts += 16_667;
-        self.decode_pts(data, pts)
-    }
-
-    /// Comme [`VideoDecoder::decode`] avec un `EncodedFrame` (conserve `pts`).
-    pub fn decode_frame(&mut self, f: &EncodedFrame) -> Result<Option<DecodedFrame>> {
-        self.decode_pts(&f.data, f.pts)
     }
 
     pub fn decode_pts(&mut self, data: &[u8], pts_us: u64) -> Result<Option<DecodedFrame>> {
@@ -342,44 +321,11 @@ impl VideoDecoder {
         if self.width == 0 {
             self.read_output_size();
         }
-        Ok(DecodedFrame { texture, subresource, width: self.width, height: self.height, pts, _sample: sample })
+        Ok(DecodedFrame { texture, subresource, width: self.width, height: self.height, pts, _keep: FrameKeep::Mf(sample) })
     }
 
-    /// Bloque jusqu'à ce que le GPU ait fini toutes les commandes soumises sur le device
-    /// (diagnostic : mesurer le temps de décodage réel et non celui de l'appel).
     pub fn sync_gpu(&mut self) -> Result<()> {
-        if self.query.is_none() {
-            let mut q = None;
-            unsafe { self.device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut q)) }
-                .ctx("CreateQuery(EVENT)")?;
-            self.query = q;
-        }
-        let q = self.query.as_ref().unwrap();
-        let ctx = unsafe { self.device.GetImmediateContext() }.ctx("GetImmediateContext")?;
-        unsafe {
-            ctx.End(q);
-            ctx.Flush();
-            let mut done = 0i32;
-            let t0 = std::time::Instant::now();
-            loop {
-                // S_FALSE (1) tant que le GPU n'a pas fini ; windows-rs confond S_OK et S_FALSE dans Result.
-                let hr = (Interface::vtable(&ctx).GetData)(
-                    Interface::as_raw(&ctx),
-                    Interface::as_raw(q),
-                    &mut done as *mut i32 as *mut _,
-                    4,
-                    0,
-                );
-                if hr.0 == 0 || hr.is_err() {
-                    break;
-                }
-                if t0.elapsed() > std::time::Duration::from_secs(1) {
-                    return Err(RenderError::Timeout);
-                }
-                std::hint::spin_loop();
-            }
-        }
-        Ok(())
+        sync_device(&self.device, &mut self.query)
     }
 
     /// Vide le décodeur et renvoie une éventuelle image restante (inutile en mode low latency,
@@ -408,9 +354,9 @@ impl VideoDecoder {
 }
 
 // SAFETY : device D3D11 protégé multithread, COM en MTA ; le décodeur n'est utilisé que via &mut self.
-unsafe impl Send for VideoDecoder {}
+unsafe impl Send for MfDecoder {}
 
-impl Drop for VideoDecoder {
+impl Drop for MfDecoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -477,3 +423,41 @@ fn create_mft(codec: Codec) -> Result<(IMFTransform, String)> {
         None => Err(RenderError::NoDecoder(codec)),
     }
 }
+
+/// Bloque jusqu'à ce que le GPU ait fini toutes les commandes soumises sur le device
+/// (diagnostic : mesurer le temps de décodage réel et non celui de l'appel).
+pub(crate) fn sync_device(device: &ID3D11Device, query: &mut Option<ID3D11Query>) -> Result<()> {
+    if query.is_none() {
+        let mut q = None;
+        unsafe { device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut q)) }
+            .ctx("CreateQuery(EVENT)")?;
+        *query = q;
+    }
+    let q = query.as_ref().unwrap();
+    let ctx = unsafe { device.GetImmediateContext() }.ctx("GetImmediateContext")?;
+    unsafe {
+        ctx.End(q);
+        ctx.Flush();
+        let mut done = 0i32;
+        let t0 = std::time::Instant::now();
+        loop {
+            // S_FALSE (1) tant que le GPU n'a pas fini ; windows-rs confond S_OK et S_FALSE dans Result.
+            let hr = (Interface::vtable(&ctx).GetData)(
+                Interface::as_raw(&ctx),
+                Interface::as_raw(q),
+                &mut done as *mut i32 as *mut _,
+                4,
+                0,
+            );
+            if hr.0 == 0 || hr.is_err() {
+                break;
+            }
+            if t0.elapsed() > std::time::Duration::from_secs(1) {
+                return Err(RenderError::Timeout);
+            }
+            std::hint::spin_loop();
+        }
+    }
+    Ok(())
+}
+

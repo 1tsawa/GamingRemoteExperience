@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use grx_core::session::{peek_sid, MAX_INIT_LEN, MIN_INIT_LEN};
 use grx_core::util::{is_transient_recv_error, now_ms};
-use grx_core::{fingerprint, HostAuth, Session, PKT_DATA, PKT_INIT};
+use grx_core::secure::{access as secure_access, notice as secure_notice, HostSituation, SecureNotice};
+use grx_core::{fingerprint, HostAuth, Role, Session, PKT_DATA, PKT_INIT};
 use grx_transport::bitrate::BitrateConfig;
 use grx_transport::wire::{parse_path_response, path_challenge};
 use grx_transport::{Config, Endpoint, Event, Micros, Stats};
@@ -155,6 +156,7 @@ struct Pending {
     sess: Session,
     peer: SocketAddr,
     view_only: bool,
+    role: Role,
     created: Instant,
 }
 
@@ -171,6 +173,12 @@ struct Active {
     peer: SocketAddr,
     pipeline: Pipeline,
     view_only: bool,
+    /// Rôle du client (sécurité : qui peut piloter une fenêtre administrateur).
+    role: Role,
+    /// Dernière notification de sécurité envoyée (`GRX-SEC`), pour n'émettre qu'aux changements.
+    sec_notice: Option<SecureNotice>,
+    /// La situation précédente autorisait-elle le clavier/souris ? (pour relâcher au passage bloqué)
+    sec_km_allowed: bool,
     probe: Option<Probe>,
     t0: Instant,
     last_rx: Instant,
@@ -369,14 +377,14 @@ impl Server {
             return None;
         }
         self.last_trust_check = Instant::now();
-        let (key, view_only) = (a.sess.peer_key(), a.view_only);
+        let (key, role) = (a.sess.peer_key(), a.role);
         match self.auth.trust.refresh() {
             Ok(_) => {
                 self.trust_failures = 0;
                 if !self.auth.trust.is_authorized(&key) {
                     return Some("clé révoquée");
                 }
-                if self.auth.trust.is_view_only(&key) != view_only {
+                if self.auth.trust.role_of(&key) != Some(role) {
                     return Some("rôle modifié (reconnexion nécessaire)");
                 }
                 None
@@ -435,8 +443,9 @@ impl Server {
                     sess.sid()
                 );
                 // La session précédente (même clé) continue jusqu'à ce que celle-ci soit validée.
-                let view_only = self.auth.trust.is_view_only(&sess.peer_key());
-                self.pending = Some(Pending { sess, peer: from, view_only, created: now });
+                let role = self.auth.trust.role_of(&sess.peer_key()).unwrap_or(Role::ViewOnly);
+                let view_only = role == Role::ViewOnly;
+                self.pending = Some(Pending { sess, peer: from, view_only, role, created: now });
             }
             // Volontairement silencieux envers le pair ; journal local seulement.
             Err(e) => self.warn(|| format!("- INIT refusé depuis {from}: {e}")),
@@ -498,7 +507,7 @@ impl Server {
         if let Some(old) = self.active.take() {
             end_session(&self.sock, old, "remplacée par une nouvelle connexion", true);
         }
-        let mut a = start_session(p.sess, p.peer, p.view_only, &self.opts);
+        let mut a = start_session(p.sess, p.peer, p.view_only, p.role, &self.opts);
         let now = a.now_us();
         a.ep.handle_datagram(now, first_payload);
         // Limites et réglages courants, pour l'overlay du client.
@@ -522,7 +531,7 @@ fn session_pipeline_opts(base: &PipelineOpts, ep: &Endpoint, view_only: bool) ->
     o
 }
 
-fn start_session(sess: Session, peer: SocketAddr, view_only: bool, opts: &RunOpts) -> Active {
+fn start_session(sess: Session, peer: SocketAddr, view_only: bool, role: Role, opts: &RunOpts) -> Active {
     let o = &opts.pipeline;
     let cfg = Config {
         bitrate: BitrateConfig {
@@ -546,6 +555,9 @@ fn start_session(sess: Session, peer: SocketAddr, view_only: bool, opts: &RunOpt
         peer,
         pipeline,
         view_only,
+        role,
+        sec_notice: None,
+        sec_km_allowed: true,
         probe: None,
         t0: now,
         last_rx: now,
@@ -585,16 +597,48 @@ fn end_session(sock: &UdpSocket, mut a: Active, reason: &str, notify: bool) {
     a.pipeline.stop();
 }
 
+/// L'événement d'entrée est-il une manette (non concernée par l'UIPI) ? Tout octet malformé est
+/// traité comme « non-manette » (sera de toute façon ignoré par l'injecteur).
+fn is_gamepad_event(bytes: &[u8]) -> bool {
+    matches!(
+        grx_input::InputEvent::decode(bytes),
+        Ok(grx_input::InputEvent::Gamepad(_))
+            | Ok(grx_input::InputEvent::GamepadConnect { .. })
+            | Ok(grx_input::InputEvent::GamepadDisconnect { .. })
+    )
+}
+
+/// Envoie `GRX-SEC` au client si la notification a changé depuis la dernière (ou la première fois
+/// qu'il y a quelque chose à signaler).
+fn maybe_send_secure_notice(a: &mut Active, sit: &HostSituation) {
+    let n = secure_notice(a.role, sit);
+    if a.sec_notice == Some(n) {
+        return;
+    }
+    if a.ep.send_control(&n.encode()).is_ok() {
+        a.sec_notice = Some(n);
+    }
+}
+
 /// Un tour de boucle pour la session active. Retourne `Some(raison)` si elle doit se terminer.
 fn drive(sock: &UdpSocket, a: &mut Active, opts: &RunOpts) -> Option<&'static str> {
     let now = a.now_us();
 
-    // Images / audio produits par les threads média.
+    // Situation de sécurité observée (bureau sécurisé / fenêtre administrateur) et droits du
+    // client pour ce tour. Aucun appel système ici : lecture d'un atomique rempli par `grx-secure`.
+    let sit = crate::secure::current();
+    let access = secure_access(a.role, &sit);
+
+    // Images / audio produits par les threads média. Sur le bureau sécurisé (UAC, verrouillage),
+    // aucune image n'est envoyée à personne (défense en profondeur : DXGI n'en produit de toute
+    // façon pas) ; les images sont vidées sans être transmises.
     loop {
         match a.pipeline.video_rx.try_recv() {
             Ok(v) => {
-                if let Err(e) = a.ep.send_video_frame(now, &v.data, v.keyframe, v.pts_us) {
-                    eprintln!("! send_video_frame : {e}");
+                if access.video {
+                    if let Err(e) = a.ep.send_video_frame(now, &v.data, v.keyframe, v.pts_us) {
+                        eprintln!("! send_video_frame : {e}");
+                    }
                 }
             }
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
@@ -620,11 +664,15 @@ fn drive(sock: &UdpSocket, a: &mut Active, opts: &RunOpts) -> Option<&'static st
         match ev {
             Event::KeyframeRequested => a.pipeline.shared.want_key.store(true, Ordering::SeqCst),
             Event::Input(m) => {
-                if a.view_only {
-                    // Défense en profondeur : un spectateur n'a de toute façon pas de thread d'injection.
-                    a.pipeline.shared.inputs_other.fetch_add(1, Ordering::Relaxed);
-                } else {
+                // Un spectateur n'a pas de thread d'injection ; sinon, le droit dépend de la
+                // catégorie et de la situation (fenêtre administrateur : clavier/souris bloqués
+                // sauf « Contrôle total » avec host élevé ; manette jamais concernée par l'UIPI).
+                let ok = !a.view_only
+                    && if is_gamepad_event(&m) { access.gamepad } else { access.keyboard_mouse };
+                if ok {
                     a.pipeline.push_input(m);
+                } else {
+                    a.pipeline.shared.inputs_other.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Event::Control(m) if m == BYE => bye = true,
@@ -633,6 +681,10 @@ fn drive(sock: &UdpSocket, a: &mut Active, opts: &RunOpts) -> Option<&'static st
                 if let Some(reply) = crate::control::apply(&m, &mut a.ep, &a.pipeline.shared, &opts.pipeline) {
                     let _ = a.ep.send_control(&reply);
                 }
+            }
+            // Décodeurs du client (négociation du codec, `codec.rs`) : permis aussi en lecture seule.
+            Event::Control(m) if grx_core::codec_neg::is_client_codecs(&m) => {
+                a.pipeline.shared.codec.on_client(&m);
             }
             // Choix de l'écran capturé (overlay du client) : permis aussi en lecture seule.
             Event::Control(m) if grx_core::displays::is_display_select(&m) => {
@@ -647,8 +699,19 @@ fn drive(sock: &UdpSocket, a: &mut Active, opts: &RunOpts) -> Option<&'static st
     if bye {
         return Some("déconnexion du client");
     }
+
+    // Sécurité : si le clavier/souris vient de passer de permis à bloqué, demander au thread
+    // d'entrée de tout relâcher (pas de touche « coincée » enfoncée pendant le blocage).
+    if a.sec_km_allowed && !access.keyboard_mouse && !a.view_only {
+        a.pipeline.shared.release_input.store(true, Ordering::SeqCst);
+    }
+    a.sec_km_allowed = access.keyboard_mouse;
+    // Notifier le client (GRX-SEC) à chaque changement de situation, pour le bandeau de l'overlay.
+    maybe_send_secure_notice(a, &sit);
+
     a.pipeline.shared.target_bps.store(a.ep.target_bitrate_bps(), Ordering::Relaxed);
     a.cursor.drive(&mut a.ep);
+    crate::codec::announce(&mut a.ep, &a.pipeline.shared.codec);
     // Liste des écrans / écran actif : (ré)annoncée à chaque changement.
     let g = a.pipeline.shared.displays.generation();
     if g != a.displays_sent && a.ep.send_control(&a.pipeline.shared.displays.message().encode()).is_ok() {
@@ -721,7 +784,6 @@ mod tests {
     use grx_core::{ClientHandshake, Identity, Token, TrustStore};
     use grx_input::InjectorConfig;
     use grx_transport::wire::{b0, K_PATH_CHALLENGE, K_VIDEO};
-    use grx_video::Codec;
     use std::path::PathBuf;
 
     fn test_opts(input: bool) -> RunOpts {
@@ -729,7 +791,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             idle_timeout: Duration::from_secs(5),
             pipeline: PipelineOpts {
-                codec: Codec::H264,
+                codec: grx_core::codec_neg::CodecPref::Force(grx_core::codec_neg::VideoCodec::H264),
                 fps: 60,
                 fill: false,
                 audio: false,
