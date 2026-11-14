@@ -106,8 +106,24 @@ try {
         if (-not (Test-Path $NotesFile)) { Fail "Le fichier de notes spécifié n'existe pas : $NotesFile" }
         $notesPath = (Resolve-Path $NotesFile).Path
     } else {
-        $notesContent = "GamingRemoteExperience $version"
-        [IO.File]::WriteAllText($notesPath, $notesContent, (New-Object Text.UTF8Encoding $false))
+        # Section « ## <version> » de CHANGELOG.md (jusqu'à la section suivante). Obligatoire avec -Publish.
+        $changelog = Join-Path $root 'CHANGELOG.md'
+        $section = $null
+        if (Test-Path $changelog) {
+            $lines = [IO.File]::ReadAllLines($changelog, [Text.Encoding]::UTF8)
+            $start = [Array]::FindIndex($lines, [Predicate[string]]{ param($l) $l.Trim() -eq "## $version" })
+            if ($start -ge 0) {
+                $body = New-Object System.Collections.Generic.List[string]
+                for ($i = $start + 1; $i -lt $lines.Length -and -not $lines[$i].StartsWith('## '); $i++) { $body.Add($lines[$i]) }
+                $section = ($body -join "`n").Trim()
+            }
+        }
+        if (-not $section) {
+            if ($Publish) { Fail "CHANGELOG.md n'a pas de section « ## $version » : ajoutez le changelog avant de publier." }
+            $section = "GamingRemoteExperience $version"
+        }
+        [IO.File]::WriteAllText($notesPath, $section, (New-Object Text.UTF8Encoding $false))
+        Write-Host "Notes : section $version de CHANGELOG.md"
     }
 
     # Étape 5 : Génération du manifeste
