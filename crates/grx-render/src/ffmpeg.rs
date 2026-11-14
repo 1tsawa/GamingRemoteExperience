@@ -47,6 +47,16 @@ const OFF_FRAME_WIDTH: usize = 104;
 const OFF_FRAME_HEIGHT: usize = 108;
 const OFF_FRAME_FORMAT: usize = 116;
 const AV_PIX_FMT_D3D11: c_int = 171;
+// Formats logiciels (FFmpeg 8.1, mesurés sur pixfmt.h) et champs d'AVFrame.
+const AV_PIX_FMT_YUV420P: c_int = 0;
+const AV_PIX_FMT_YUVJ420P: c_int = 12;
+const AV_PIX_FMT_YUV444P: c_int = 5;
+const AV_PIX_FMT_YUVJ444P: c_int = 14;
+const AV_PIX_FMT_YUV420P10LE: c_int = 62;
+const AV_PIX_FMT_YUV444P10LE: c_int = 68;
+const OFF_FRAME_LINESIZE: usize = 64;
+const OFF_FRAME_TRC: usize = 288;
+const AVCOL_TRC_SMPTE2084: c_int = 16;
 const AV_HWDEVICE_TYPE_D3D11VA: c_int = 7;
 const AVERROR_EAGAIN: c_int = -11;
 const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
@@ -228,6 +238,26 @@ impl Drop for FrameRef {
 /// Image sortie : (texture, tranche, largeur, hauteur, référence à garder).
 pub(crate) type FfFrame = (ID3D11Texture2D, u32, u32, u32, FrameRef);
 
+/// Disposition d'une image logicielle (plans Y, U, V).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Planar {
+    Yuv420,
+    Yuv420P10,
+    Yuv444,
+    Yuv444P10,
+}
+
+/// Image décodée sur le CPU : plans empruntés à l'AVFrame `keep`.
+pub(crate) struct CpuPicture {
+    pub planes: [*const u8; 3],
+    pub strides: [usize; 3],
+    pub width: u32,
+    pub height: u32,
+    pub layout: Planar,
+    pub pq: bool,
+    pub _keep: FrameRef,
+}
+
 pub(crate) struct FfDecoder {
     ctx: *mut c_void,
     pkt: *mut c_void,
@@ -236,6 +266,7 @@ pub(crate) struct FfDecoder {
     name: String,
     width: u32,
     height: u32,
+    hw: bool,
 }
 
 // SAFETY : le contexte n'est utilisé que via &mut self (un seul thread à la fois) ; le device
@@ -253,6 +284,15 @@ fn decoder_name(codec: Codec) -> &'static str {
 
 impl FfDecoder {
     pub fn new(device: &ID3D11Device, codec: Codec) -> Result<FfDecoder> {
+        Self::open(Some(device), codec)
+    }
+
+    /// Décodeur logiciel (CPU, threads de tranches : pas de retard d'image).
+    pub fn new_software(codec: Codec) -> Result<FfDecoder> {
+        Self::open(None, codec)
+    }
+
+    fn open(device: Option<&ID3D11Device>, codec: Codec) -> Result<FfDecoder> {
         let a = api().map_err(RenderError::Other)?;
         unsafe {
             let name = CString::new(decoder_name(codec)).unwrap();
@@ -260,6 +300,38 @@ impl FfDecoder {
             if dec.is_null() {
                 return Err(ff_err("décodeur", format!("« {} » absent de cette build", decoder_name(codec))));
             }
+            let Some(device) = device else {
+                let mut ctx = (a.avcodec_alloc_context3)(dec);
+                if ctx.is_null() {
+                    return Err(ff_err("avcodec_alloc_context3", "échec"));
+                }
+                // Threads de tranches seulement (les threads d'images ajoutent une image de retard chacun).
+                let threads = std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(2).to_string();
+                for (k, v) in [("threads", threads.as_str()), ("thread_type", "slice"), ("flags", "+low_delay")] {
+                    let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
+                    let _ = (a.av_opt_set)(ctx, k.as_ptr(), v.as_ptr(), 0);
+                }
+                let r = (a.avcodec_open2)(ctx, dec, std::ptr::null_mut());
+                if r < 0 {
+                    (a.avcodec_free_context)(&mut ctx);
+                    return Err(ff_err("avcodec_open2", av_err(a, r)));
+                }
+                let pkt = (a.av_packet_alloc)();
+                if pkt.is_null() {
+                    (a.avcodec_free_context)(&mut ctx);
+                    return Err(ff_err("av_packet_alloc", "échec"));
+                }
+                return Ok(FfDecoder {
+                    ctx,
+                    pkt,
+                    codec,
+                    wait_idr: true,
+                    name: format!("FFmpeg {} logiciel ({})", decoder_name(codec), a.version),
+                    width: 0,
+                    height: 0,
+                    hw: false,
+                });
+            };
             // Contexte de device D3D11VA sur NOTRE device (celui du présentateur) : zéro copie.
             let mut hw = (a.av_hwdevice_ctx_alloc)(AV_HWDEVICE_TYPE_D3D11VA);
             if hw.is_null() {
@@ -304,6 +376,7 @@ impl FfDecoder {
                 name: format!("FFmpeg {} D3D11VA ({})", decoder_name(codec), a.version),
                 width: 0,
                 height: 0,
+                hw: true,
             })
         }
     }
@@ -318,9 +391,65 @@ impl FfDecoder {
         self.wait_idr
     }
 
+    /// Décodeur logiciel : décode et renvoie les plans de la dernière image.
+    pub fn decode_cpu(&mut self, data: &[u8], skipped: &mut u64) -> Result<Option<CpuPicture>> {
+        debug_assert!(!self.hw);
+        let Some(keep) = self.receive_latest(data, skipped)? else { return Ok(None) };
+        let a = api().map_err(RenderError::Other)?;
+        let _ = a;
+        unsafe {
+            let f = keep.0 as *const u8;
+            let fmt = *(f.add(OFF_FRAME_FORMAT) as *const c_int);
+            let layout = match fmt {
+                AV_PIX_FMT_YUV420P | AV_PIX_FMT_YUVJ420P => Planar::Yuv420,
+                AV_PIX_FMT_YUV444P | AV_PIX_FMT_YUVJ444P => Planar::Yuv444,
+                AV_PIX_FMT_YUV420P10LE => Planar::Yuv420P10,
+                AV_PIX_FMT_YUV444P10LE => Planar::Yuv444P10,
+                o => return Err(ff_err("image logicielle", format!("format {o} non géré"))),
+            };
+            let data = f as *const *const u8;
+            let ls = f.add(OFF_FRAME_LINESIZE) as *const c_int;
+            let planes = [*data, *data.add(1), *data.add(2)];
+            let strides = [*ls, *ls.add(1), *ls.add(2)];
+            if planes.iter().any(|p| p.is_null()) || strides.iter().any(|&s| s <= 0) {
+                return Err(ff_err("image logicielle", "plans invalides"));
+            }
+            let w = *(f.add(OFF_FRAME_WIDTH) as *const c_int) as u32;
+            let h = *(f.add(OFF_FRAME_HEIGHT) as *const c_int) as u32;
+            let pq = *(f.add(OFF_FRAME_TRC) as *const c_int) == AVCOL_TRC_SMPTE2084;
+            self.width = w;
+            self.height = h;
+            Ok(Some(CpuPicture { planes, strides: strides.map(|s| s as usize), width: w, height: h, layout, pq, _keep: keep }))
+        }
+    }
+
     /// Décode une access unit ; renvoie la dernière image sortie. `Ok(None)` + `skipped` si l'on
     /// attend encore une image clé.
     pub fn decode(&mut self, data: &[u8], skipped: &mut u64) -> Result<Option<FfFrame>> {
+        let Some(keep) = self.receive_latest(data, skipped)? else { return Ok(None) };
+        unsafe {
+            let f = keep.0;
+            let fmt = *((f as *const u8).add(OFF_FRAME_FORMAT) as *const c_int);
+            if fmt != AV_PIX_FMT_D3D11 {
+                // Le hwaccel a refusé le flux (profil non supporté par le GPU) : FFmpeg est
+                // passé en logiciel, ce que le chemin zéro copie ne gère pas.
+                return Err(ff_err("hwaccel D3D11VA", format!("image non matérielle (format {fmt}) : profil non supporté par le GPU ?")));
+            }
+            let data0 = *(f as *const *mut c_void);
+            let index = *((f as *const *mut c_void).add(1)) as usize as u32;
+            let w = *((f as *const u8).add(OFF_FRAME_WIDTH) as *const c_int) as u32;
+            let h = *((f as *const u8).add(OFF_FRAME_HEIGHT) as *const c_int) as u32;
+            let tex = ID3D11Texture2D::from_raw_borrowed(&data0)
+                .cloned()
+                .ok_or_else(|| ff_err("image", "texture D3D11 nulle"))?;
+            self.width = w;
+            self.height = h;
+            Ok(Some((tex, index, w, h, keep)))
+        }
+    }
+
+    /// Envoie le paquet et récupère la dernière image sortie (les précédentes sont relâchées).
+    fn receive_latest(&mut self, data: &[u8], skipped: &mut u64) -> Result<Option<FrameRef>> {
         let a = api().map_err(RenderError::Other)?;
         if self.wait_idr {
             if !annexb::contains_random_access(self.codec, data) {
@@ -370,23 +499,7 @@ impl FfDecoder {
                     }
                     return Err(ff_err("avcodec_receive_frame", av_err(a, r)));
                 }
-                let keep = FrameRef(f);
-                let fmt = *((f as *const u8).add(OFF_FRAME_FORMAT) as *const c_int);
-                if fmt != AV_PIX_FMT_D3D11 {
-                    // Le hwaccel a refusé le flux (profil non supporté par le GPU) : FFmpeg est
-                    // passé en logiciel, ce que le chemin zéro copie ne gère pas.
-                    return Err(ff_err("hwaccel D3D11VA", format!("image non matérielle (format {fmt}) : profil non supporté par le GPU ?")));
-                }
-                let data0 = *(f as *const *mut c_void);
-                let index = *((f as *const *mut c_void).add(1)) as usize as u32;
-                let w = *((f as *const u8).add(OFF_FRAME_WIDTH) as *const c_int) as u32;
-                let h = *((f as *const u8).add(OFF_FRAME_HEIGHT) as *const c_int) as u32;
-                let tex = ID3D11Texture2D::from_raw_borrowed(&data0)
-                    .cloned()
-                    .ok_or_else(|| ff_err("image", "texture D3D11 nulle"))?;
-                self.width = w;
-                self.height = h;
-                latest = Some((tex, index, w, h, keep));
+                latest = Some(FrameRef(f));
             }
             Ok(latest)
         }

@@ -86,7 +86,7 @@ fn main() -> anyhow::Result<()> {
     let t_init = Instant::now();
     let mut enc = Encoder::with_device(
         cap.device(),
-        EncoderConfig { codec, width: w, height: h, fps: target_fps, bitrate_kbps: bitrate },
+        EncoderConfig { codec, width: w, height: h, fps: target_fps, bitrate_kbps: bitrate, ..Default::default() },
     )?;
     println!(
         "capture {sw}x{sh} -> encode {w}x{h} {:?} {} kbps, backend {:?} (init {:.0} ms)",

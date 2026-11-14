@@ -65,6 +65,12 @@ pub enum Row {
     Capture,
     KbdLock,
     Vsync,
+    /// Décodeur : Auto / Matériel / Logiciel.
+    Decoder,
+    /// « Couleur 4:4:4 » (Parsec : Color mode 4:4:4).
+    Color444,
+    /// « Préférer 10 bits ».
+    TenBit,
     Button,
     MenuPos,
     StatsPos,
@@ -72,7 +78,7 @@ pub enum Row {
     Disconnect,
 }
 
-const ROWS: [Row; 14] = [
+const ROWS: [Row; 17] = [
     Row::Fullscreen,
     Row::Stats,
     Row::Volume,
@@ -82,6 +88,9 @@ const ROWS: [Row; 14] = [
     Row::Capture,
     Row::KbdLock,
     Row::Vsync,
+    Row::Decoder,
+    Row::Color444,
+    Row::TenBit,
     Row::Button,
     Row::MenuPos,
     Row::StatsPos,
@@ -101,6 +110,9 @@ pub enum Action {
     SetVsync(bool),
     /// Demander au host de capturer l'écran d'index donné (`GRX-MON`).
     SelectDisplay(u8),
+    /// Choix « Décodeur » / « Couleur 4:4:4 » / « Préférer 10 bits » modifié : nouvelle annonce
+    /// `GRX-COD` au host et nouveau décodeur à la prochaine image clé.
+    SetCodecPrefs { decoder: grx_render::DecoderPref, yuv444: bool, ten_bit: bool },
     Disconnect,
     /// Menu ouvert : relâcher les entrées tenues côté host, suspendre la capture souris.
     MenuOpened,
@@ -144,6 +156,10 @@ pub struct StatsSnapshot {
     pub width: u32,
     pub height: u32,
     pub codec: String,
+    /// Encodeur du host (vendeur, voie), annoncé dans `GRX-CDC`.
+    pub encoder: String,
+    /// Décodeur local (voie et nom).
+    pub decoder: String,
     pub frames_lost: u64,
     pub dropped: u64,
 }
@@ -197,7 +213,8 @@ const STATS_W: f32 = 290.0;
 const STATS_LINE_H: f32 = 19.0;
 
 const PANEL_W: f32 = 460.0;
-const ROW_H: f32 = 34.0;
+// 31 px : 16 lignes (Décodeur, 4:4:4, 10 bits) tiennent dans une fenêtre de 600 px.
+const ROW_H: f32 = 31.0;
 const TITLE_H: f32 = 46.0;
 const PAD: f32 = 16.0;
 const LABEL_W: f32 = 180.0;
@@ -240,6 +257,12 @@ pub struct Overlay {
     pub capture: bool,
     pub kbd_lock: bool,
     pub vsync: bool,
+    /// Choix « Décodeur ».
+    pub decoder: grx_render::DecoderPref,
+    /// Voie de décodage réellement utilisée (affichée sous « Décodeur »), mise à jour par `play.rs`.
+    pub decoder_hint: String,
+    pub yuv444: bool,
+    pub ten_bit: bool,
     pub show_shortcuts: bool,
     pub host: Option<HostInfo>,
     pub stats: Option<StatsSnapshot>,
@@ -288,6 +311,10 @@ impl Overlay {
             capture: false,
             kbd_lock: false,
             vsync: false,
+            decoder: grx_render::DecoderPref::Auto,
+            decoder_hint: String::new(),
+            yuv444: false,
+            ten_bit: false,
             show_shortcuts: false,
             host: None,
             stats: None,
@@ -325,6 +352,9 @@ impl Overlay {
         self.volume = p.volume.clamp(0.0, 1.0);
         self.muted = p.muted;
         self.vsync = p.vsync;
+        self.decoder = grx_render::DecoderPref::parse(&p.decoder).unwrap_or_default();
+        self.yuv444 = p.yuv444;
+        self.ten_bit = p.ten_bit;
         self.capture = p.capture;
         self.bitrate_cap_mbps = p.bitrate_cap_mbps;
         self.fps_cap = p.fps_cap;
@@ -342,6 +372,14 @@ impl Overlay {
             volume: self.volume,
             muted: self.muted,
             vsync: self.vsync,
+            decoder: match self.decoder {
+                grx_render::DecoderPref::Auto => "auto",
+                grx_render::DecoderPref::Hardware => "hardware",
+                grx_render::DecoderPref::Software => "software",
+            }
+            .into(),
+            yuv444: self.yuv444,
+            ten_bit: self.ten_bit,
             capture: self.capture,
             bitrate_cap_mbps: self.bitrate_cap_mbps,
             fps_cap: self.fps_cap,
@@ -803,6 +841,7 @@ impl Overlay {
                 vec![]
             }
             Row::Display => self.cycle_display(dir),
+            Row::Decoder => self.cycle_decoder(dir),
             // Les interrupteurs : droite = activer, gauche = désactiver.
             r => {
                 let on = dir > 0;
@@ -822,6 +861,8 @@ impl Overlay {
             Row::Capture => self.capture,
             Row::KbdLock => self.kbd_lock,
             Row::Vsync => self.vsync,
+            Row::Color444 => self.yuv444,
+            Row::TenBit => self.ten_bit,
             Row::Button => self.button_enabled,
             Row::Shortcuts => self.show_shortcuts,
             Row::Volume => !self.muted,
@@ -874,6 +915,15 @@ impl Overlay {
                 self.vsync = !self.vsync;
                 vec![Action::SetVsync(self.vsync)]
             }
+            Row::Decoder => self.cycle_decoder(1),
+            Row::Color444 => {
+                self.yuv444 = !self.yuv444;
+                vec![self.codec_action()]
+            }
+            Row::TenBit => {
+                self.ten_bit = !self.ten_bit;
+                vec![self.codec_action()]
+            }
             Row::Button => {
                 self.button_enabled = !self.button_enabled;
                 vec![]
@@ -886,15 +936,42 @@ impl Overlay {
         }
     }
 
+    fn codec_action(&self) -> Action {
+        Action::SetCodecPrefs { decoder: self.decoder, yuv444: self.yuv444, ten_bit: self.ten_bit }
+    }
+
+    /// Auto -> Matériel -> Logiciel (et retour) ; `dir` < 0 : sens inverse.
+    fn cycle_decoder(&mut self, dir: i32) -> Vec<Action> {
+        use grx_render::DecoderPref as D;
+        const ORDER: [D; 3] = [D::Auto, D::Hardware, D::Software];
+        let i = ORDER.iter().position(|d| *d == self.decoder).unwrap_or(0) as i32;
+        self.decoder = ORDER[(i + dir.signum().max(-1)).rem_euclid(3) as usize];
+        vec![self.codec_action()]
+    }
+
     // ── géométrie ──
 
     fn panel_rect(&self) -> Rect {
-        let help = if self.show_shortcuts { HELP_LINES.len() as f32 * HELP_LINE_H + 10.0 } else { 0.0 };
+        // Les raccourcis s'affichent dans un panneau voisin (help_rect) : le menu tient en 720p.
         let pads = if self.gamepads.is_empty() { 0.0 } else { PADS_H };
-        let h = TITLE_H + self.rows().len() as f32 * ROW_H + help + FOOTER_H + pads + 8.0;
+        let h = TITLE_H + self.rows().len() as f32 * ROW_H + FOOTER_H + pads + 8.0;
         let w = PANEL_W.min(self.view_w - 16.0).max(200.0);
         let (x, y) = place(self.menu_pos, (w, h), (self.view_w, self.view_h), MARGIN);
         Rect::new(x, y, w, h)
+    }
+
+    /// Panneau des raccourcis : à droite du menu s'il y a la place, sinon à gauche, sinon dessous.
+    fn help_rect(&self) -> Rect {
+        let p = self.panel_rect();
+        let (w, h) = (p.w, HELP_LINES.len() as f32 * HELP_LINE_H + 20.0);
+        let y = p.y.min((self.view_h - h - MARGIN).max(0.0));
+        if p.x + p.w + 8.0 + w <= self.view_w - MARGIN {
+            Rect::new(p.x + p.w + 8.0, y, w, h)
+        } else if p.x - 8.0 - w >= MARGIN {
+            Rect::new(p.x - 8.0 - w, y, w, h)
+        } else {
+            Rect::new(p.x, (p.y + p.h + 8.0).min((self.view_h - h).max(0.0)), w, h)
+        }
     }
 
     fn stats_rect(&self) -> Rect {
@@ -1053,6 +1130,8 @@ impl Overlay {
                     .map_or(String::new(), |k| format!("  (max {:.0})", k as f64 / 1000.0));
                 vec![
                     ("Flux".into(), format!("{}x{} {}", st.width, st.height, st.codec)),
+                    ("Encodeur".into(), if st.encoder.is_empty() { "?".into() } else { st.encoder.clone() }),
+                    ("Décodeur".into(), if st.decoder.is_empty() { "?".into() } else { st.decoder.clone() }),
                     ("FPS".into(), format!("{:.0}", st.fps)),
                     ("Débit".into(), format!("{:.1} Mb/s{cap}", st.video_mbps)),
                     ("RTT".into(), format!("{:.1} ms", st.rtt_ms)),
@@ -1169,6 +1248,9 @@ impl Overlay {
                 s.fill(Rect::new(r.x, r.y + 9.0, 3.0, r.h - 18.0), 1.5, ACCENT);
             }
             let (label, mut hint) = row_label(row, &self.capture_key);
+            if row == Row::Decoder && !self.decoder_hint.is_empty() {
+                hint = self.decoder_hint.clone();
+            }
             if let Some(Hit::Preset(r, j)) = self.hit() {
                 if r == row {
                     hint = Preset::ALL.get(j).map_or("Réinitialiser", |p| p.label()).to_string();
@@ -1267,6 +1349,10 @@ impl Overlay {
                     let t = if self.show_shortcuts { "\u{25B4}" } else { "\u{25BE}" };
                     s.text(Rect::new(w.x, w.y, w.w - 12.0, w.h), t, 14.0, DIM, Align::Right, Font::Ui);
                 }
+                Row::Decoder => {
+                    let t = format!("\u{2039} {} \u{203A}", self.decoder.label());
+                    s.text(Rect::new(w.x, w.y, w.w - 8.0, w.h), t, 13.5, TEXT, Align::Right, Font::UiBold);
+                }
                 r => {
                     let on = self.toggle_state(r).unwrap_or(false);
                     Self::draw_toggle(s, w, on, enabled);
@@ -1274,15 +1360,18 @@ impl Overlay {
             }
         }
 
-        let mut y = self.row_rect(rows.len() - 1).y + ROW_H + 4.0;
+        let y = self.row_rect(rows.len() - 1).y + ROW_H + 4.0;
         if self.show_shortcuts {
+            let hr = self.help_rect();
+            s.fill(hr, 12.0, BG);
+            s.stroke(hr, 12.0, BORDER, 1.0);
+            let mut hy = hr.y + 10.0;
             for (k, d) in HELP_LINES {
                 let k = if k.is_empty() { self.capture_key.as_str() } else { k };
-                s.text(Rect::new(p.x + PAD + 4.0, y, 150.0, HELP_LINE_H), k, 12.0, ACCENT, Align::Left, Font::Mono);
-                s.text(Rect::new(p.x + PAD + 160.0, y, p.w - 2.0 * PAD - 160.0, HELP_LINE_H), d, 12.5, TEXT, Align::Left, Font::Ui);
-                y += HELP_LINE_H;
+                s.text(Rect::new(hr.x + PAD + 4.0, hy, 150.0, HELP_LINE_H), k, 12.0, ACCENT, Align::Left, Font::Mono);
+                s.text(Rect::new(hr.x + PAD + 160.0, hy, hr.w - 2.0 * PAD - 160.0, HELP_LINE_H), d, 12.5, TEXT, Align::Left, Font::Ui);
+                hy += HELP_LINE_H;
             }
-            y += 10.0;
         }
         let footer = match self.host {
             Some(h) => format!(
@@ -1303,7 +1392,7 @@ impl Overlay {
 }
 
 /// Lignes du panneau de statistiques quand elles sont disponibles (voir `draw_stats`).
-const STATS_LINES: usize = 11;
+const STATS_LINES: usize = 13;
 
 const HELP_LINES: [(&str, &str); 9] = [
     ("Ctrl+Maj+M", "Ouvrir / fermer ce menu"),
@@ -1348,6 +1437,9 @@ fn row_label(r: Row, capture_key: &str) -> (&'static str, String) {
         Row::Capture => ("Capture souris", ""),
         Row::KbdLock => ("Verrouiller le clavier", "Win, Alt+Tab -> host"),
         Row::Vsync => ("VSync", ""),
+        Row::Decoder => ("Décodeur", ""),
+        Row::Color444 => ("Couleur 4:4:4", "texte net, NVIDIA HEVC"),
+        Row::TenBit => ("Préférer 10 bits", "HEVC Main10 / HDR10"),
         Row::Button => ("Bouton flottant", "glisser pour déplacer"),
         Row::MenuPos => ("Position du menu", "ou glisser le titre"),
         Row::StatsPos => ("Position des stats", "ou glisser le panneau"),
@@ -1723,3 +1815,7 @@ mod tests {
         let _ = o.scene();
     }
 }
+
+#[cfg(test)]
+#[path = "overlay_codec_tests.rs"]
+mod codec_tests;

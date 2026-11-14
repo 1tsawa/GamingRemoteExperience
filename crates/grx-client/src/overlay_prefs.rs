@@ -20,6 +20,12 @@ pub struct OverlayPrefs {
     pub fps_cap: Option<u32>,         // None
     /// Écran distant choisi (`overlay::display_key`), redemandé à la connexion s'il existe encore.
     pub display: Option<String>,      // None
+    /// Choix « Décodeur » : "auto" (défaut), "hardware", "software".
+    pub decoder: String,
+    /// « Couleur 4:4:4 » (comme Parsec) : demandé au host, appliqué si les deux côtés le savent.
+    pub yuv444: bool,
+    /// « Préférer 10 bits » (HEVC Main10 / AV1 10 bits, HDR10 si la source est HDR).
+    pub ten_bit: bool,
 }
 
 impl Default for OverlayPrefs {
@@ -38,6 +44,9 @@ impl Default for OverlayPrefs {
             bitrate_cap_mbps: None,
             fps_cap: None,
             display: None,
+            decoder: "auto".into(),
+            yuv444: false,
+            ten_bit: false,
         }
     }
 }
@@ -64,6 +73,10 @@ impl OverlayPrefs {
         self.fps_cap = self.fps_cap.map(|v| v.clamp(10, 240));
         // Clé d'écran bornée (fichier modifiable à la main).
         self.display = self.display.filter(|d| !d.is_empty()).map(|d| d.chars().take(128).collect());
+        // Valeur inconnue (fichier modifié à la main) : Auto.
+        if grx_render::DecoderPref::parse(&self.decoder).is_err() {
+            self.decoder = "auto".into();
+        }
 
         self
     }
@@ -167,6 +180,9 @@ mod tests {
             bitrate_cap_mbps: Some(50),
             fps_cap: Some(60),
             display: Some("VG27A 2560x1440 @-2560,0".into()),
+            decoder: "software".into(),
+            yuv444: true,
+            ten_bit: true,
         };
         let json = original.to_json();
         let loaded = OverlayPrefs::from_json(&json);

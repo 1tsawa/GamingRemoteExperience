@@ -49,6 +49,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--external-port",
     "--upnp-lease",
     "--codec",
+    "--encoder",
+    "--chroma",
     "--fps",
     "--max-bitrate",
     "--start-bitrate",

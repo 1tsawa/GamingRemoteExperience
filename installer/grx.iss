@@ -70,6 +70,10 @@ french.TaskAssoc=Ouvrir les liens d'invitation grx:// avec GamingRemoteExperienc
 english.TaskAssoc=Open grx:// invitation links with GamingRemoteExperience
 french.TaskFirewall=Autoriser grx-host dans le pare-feu Windows (UDP entrant)
 english.TaskFirewall=Allow grx-host through Windows Firewall (inbound UDP)
+french.TaskOpenH264=Télécharger le codec H.264 logiciel OpenH264 (secours sans encodeur/décodeur matériel compatible). OpenH264 Video Codec provided by Cisco Systems, Inc.
+english.TaskOpenH264=Download the OpenH264 software H.264 codec (fallback without a compatible hardware encoder/decoder). OpenH264 Video Codec provided by Cisco Systems, Inc.
+french.FetchingOpenH264=Téléchargement d'OpenH264 depuis Cisco (vérifié par SHA-256)...
+english.FetchingOpenH264=Downloading OpenH264 from Cisco (SHA-256 verified)...
 french.GroupOther=Autres options :
 english.GroupOther=Other options:
 french.RunGui=Lancer GamingRemoteExperience
@@ -95,6 +99,10 @@ Name: "vigem"; Description: "{cm:CompVigem}"; Types: full; Check: not ViGEmInsta
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "assoc"; Description: "{cm:TaskAssoc}"; GroupDescription: "{cm:GroupOther}"
 Name: "firewall"; Description: "{cm:TaskFirewall}"; GroupDescription: "{cm:GroupOther}"; Check: IsAdminInstallMode
+; OpenH264 : la licence de brevets de Cisco exige un téléchargement séparé depuis ses serveurs sur le
+; poste de l'utilisateur (jamais intégré au setup) et la possibilité de le désactiver (case à décocher,
+; désinstallation, ou « grx-host fetch-openh264 --remove »).
+Name: "openh264"; Description: "{cm:TaskOpenH264}"; GroupDescription: "{cm:GroupOther}"
 
 [Files]
 Source: "{#BinDir}\grx-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -102,6 +110,8 @@ Source: "{#BinDir}\grx-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\grx-client.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\TUTO.md"; DestDir: "{app}"; Flags: ignoreversion
+; Texte de licence du binaire OpenH264 de Cisco (le binaire lui-même est téléchargé à l'installation).
+Source: "..\third_party\openh264\BINARY_LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "OpenH264-BINARY_LICENSE.txt"; Flags: ignoreversion
 ; Décodeur de secours FFmpeg (LGPL, facultatif : voir tools\build-setup.ps1 -FfmpegDir).
 #ifdef FfmpegDir
 Source: "{#FfmpegDir}\avcodec-62.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -138,9 +148,16 @@ Filename: "{tmp}\ViGEmBus_setup.exe"; Parameters: "/exenoui /qn /norestart"; Sta
 ; Pare-feu (installation machine uniquement) : on retire d'abord une éventuelle ancienne règle.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Tasks: firewall; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRule}"" dir=in action=allow protocol=UDP program=""{app}\grx-host.exe"" enable=yes profile=any"; Tasks: firewall; Flags: runhidden waituntilterminated
+; Codec OpenH264 de Cisco : téléchargé et vérifié (SHA-256) par grx-host ; sans réseau, l'étape
+; échoue sans bloquer l'installation (voie logicielle simplement désactivée).
+Filename: "{app}\grx-host.exe"; Parameters: "fetch-openh264 --dir ""{app}"""; StatusMsg: "{cm:FetchingOpenH264}"; Tasks: openh264; Flags: runhidden waituntilterminated
 Filename: "{app}\grx-gui.exe"; Description: "{cm:RunGui}"; Flags: nowait postinstall skipifsilent
 ; Mise à jour silencieuse lancée par grx-gui avec /RELAUNCH : on rouvre la GUI (jamais élevée).
 Filename: "{app}\grx-gui.exe"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
+
+[UninstallDelete]
+Type: files; Name: "{app}\openh264-2.6.0-win64.dll"
+Type: files; Name: "{app}\OpenH264-NOTICE.txt"
 
 [UninstallRun]
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#FirewallRule}"""; Tasks: firewall; Flags: runhidden waituntilterminated; RunOnceId: "DelFirewallRule"

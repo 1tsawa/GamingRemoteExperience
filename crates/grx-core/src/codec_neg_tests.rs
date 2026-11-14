@@ -59,13 +59,13 @@ fn roundtrip_host_codec() {
         for reason in [ChoiceReason::Auto, ChoiceReason::ClientPreference, ChoiceReason::HostForced, ChoiceReason::NoClientInfo, ChoiceReason::Fallback] {
             for fmt in [FormatSet::YUV420_8, FormatSet::YUV444_8] {
                 let encoders = enc(set(&[H, V, A]), BackendId::MF_NVIDIA);
-                let h = HostCodec { codec, format: fmt, encoders: encoders.clone(), reason };
+                let h = HostCodec { codec, format: fmt, encoders: encoders.clone(), reason, encoder: None, transfer: Transfer::Sdr };
                 assert_eq!(HostCodec::decode(&h.encode()), Some(h.clone()));
             }
         }
     }
     // encoders vide
-    let h_empty = HostCodec { codec: H, format: FormatSet::YUV420_8, encoders: Vec::new(), reason: ChoiceReason::Auto };
+    let h_empty = HostCodec { codec: H, format: FormatSet::YUV420_8, encoders: Vec::new(), reason: ChoiceReason::Auto, encoder: None, transfer: Transfer::Sdr };
     assert_eq!(HostCodec::decode(&h_empty.encode()), Some(h_empty.clone()));
 }
 
@@ -201,7 +201,7 @@ fn reject_invalid_messages() {
 
     // GRX-COD n'est pas décodé comme HostCodec et inversement
     assert!(HostCodec::decode(&valid_cc.encode()).is_none());
-    let valid_h = HostCodec { codec: H, format: FormatSet::YUV420_8, encoders: vec![], reason: ChoiceReason::Auto };
+    let valid_h = HostCodec { codec: H, format: FormatSet::YUV420_8, encoders: vec![], reason: ChoiceReason::Auto, encoder: None, transfer: Transfer::Sdr };
     assert!(ClientCodecs::decode(&valid_h.encode()).is_none());
 
     // is_client_codecs/is_host_codec distinguent et refusent b"GRX-BYE"

@@ -3,21 +3,23 @@
 
 use std::sync::Mutex;
 
-use grx_video::{Codec, EncodedFrame};
-use windows::core::Interface;
+use grx_video::{Codec, EncodedFrame, PixelFormat};
+use windows::core::{Interface, GUID};
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
-use crate::chain::{self, Attempt, ChainError, DecoderKind, DisabledDecoders};
+use crate::chain::{self, Attempt, ChainError, DecoderKind, DecoderPref, DisabledDecoders};
 use crate::decoder::{sync_device, DecodedFrame, DecoderStats, FrameKeep, MfDecoder};
 use crate::error::{RenderError, Result};
 use crate::ffmpeg::FfDecoder;
 use crate::gpu;
+use crate::soft_decoder::SoftDecoder;
 
 enum Inner {
     Mf(MfDecoder),
     Ff { dec: FfDecoder, device: ID3D11Device, stats: DecoderStats, query: Option<ID3D11Query> },
+    Soft { dec: SoftDecoder, query: Option<ID3D11Query> },
 }
 
 /// Décodeur vidéo matériel zéro copie (sortie : texture NV12 du device donné).
@@ -26,6 +28,7 @@ pub struct VideoDecoder {
     kind: DecoderKind,
     codec: Codec,
     next_pts: u64,
+    hdr: bool,
 }
 
 // SAFETY : voir MfDecoder / FfDecoder (device protégé multithread, usage via &mut self).
@@ -63,8 +66,31 @@ impl VideoDecoder {
                     query: None,
                 }
             }
+            DecoderKind::OpenH264 => {
+                if codec != Codec::H264 {
+                    return Err(RenderError::Other("OpenH264 ne décode que le H.264".into()));
+                }
+                Inner::Soft { dec: SoftDecoder::openh264(device)?, query: None }
+            }
+            DecoderKind::FfmpegSoftware => Inner::Soft { dec: SoftDecoder::ffmpeg(device, codec)?, query: None },
         };
-        Ok(VideoDecoder { inner, kind, codec, next_pts: 0 })
+        Ok(VideoDecoder { inner, kind, codec, next_pts: 0, hdr: false })
+    }
+
+    /// Premier décodeur utilisable parmi les voies de `pref` (Auto : matériel puis logiciel).
+    pub fn create_best_pref(
+        device: &ID3D11Device,
+        codec: Codec,
+        disabled: &DisabledDecoders,
+        pref: DecoderPref,
+    ) -> std::result::Result<(Self, Vec<Attempt>), ChainError> {
+        chain::create_with_pref(codec, disabled, pref, |k| Self::with_kind(device, codec, k).map_err(|e| short_error(&e)))
+            .map(|(d, _, a)| (d, a))
+    }
+
+    /// Flux HDR10 annoncé par le host (`GRX-CDC`) : les images sont marquées PQ/BT.2020.
+    pub fn set_hdr(&mut self, hdr: bool) {
+        self.hdr = hdr;
     }
 
     /// Premier décodeur utilisable de la chaîne MF -> FFmpeg D3D11VA ; renvoie aussi les échecs.
@@ -87,6 +113,7 @@ impl VideoDecoder {
         match &self.inner {
             Inner::Mf(d) => d.backend_name(),
             Inner::Ff { dec, .. } => dec.name(),
+            Inner::Soft { dec, .. } => dec.name(),
         }
     }
 
@@ -99,6 +126,7 @@ impl VideoDecoder {
         match &self.inner {
             Inner::Mf(d) => d.device(),
             Inner::Ff { device, .. } => device,
+            Inner::Soft { dec, .. } => &dec.device,
         }
     }
 
@@ -107,6 +135,7 @@ impl VideoDecoder {
         match &self.inner {
             Inner::Mf(d) => d.size(),
             Inner::Ff { dec, .. } => dec.size(),
+            Inner::Soft { dec, .. } => dec.size(),
         }
     }
 
@@ -114,6 +143,7 @@ impl VideoDecoder {
         match &self.inner {
             Inner::Mf(d) => d.stats(),
             Inner::Ff { stats, .. } => *stats,
+            Inner::Soft { dec, .. } => dec.stats,
         }
     }
 
@@ -123,6 +153,7 @@ impl VideoDecoder {
         match &self.inner {
             Inner::Mf(d) => d.needs_keyframe(),
             Inner::Ff { dec, .. } => dec.needs_keyframe(),
+            Inner::Soft { dec, .. } => dec.needs_keyframe(),
         }
     }
 
@@ -140,14 +171,25 @@ impl VideoDecoder {
     }
 
     pub fn decode_pts(&mut self, data: &[u8], pts_us: u64) -> Result<Option<DecodedFrame>> {
+        let hdr = self.hdr;
+        self.decode_inner(data, pts_us).map(|o| {
+            o.map(|mut f| {
+                f.hdr |= hdr;
+                f
+            })
+        })
+    }
+
+    fn decode_inner(&mut self, data: &[u8], pts_us: u64) -> Result<Option<DecodedFrame>> {
         match &mut self.inner {
             Inner::Mf(d) => d.decode_pts(data, pts_us),
+            Inner::Soft { dec, .. } => dec.decode_pts(data, pts_us),
             Inner::Ff { dec, stats, .. } => {
                 stats.packets_in += 1;
                 let out = dec.decode(data, &mut stats.skipped_waiting_idr)?;
                 Ok(out.map(|(texture, subresource, width, height, keep)| {
                     stats.frames_out += 1;
-                    DecodedFrame { texture, subresource, width, height, pts: pts_us, _keep: FrameKeep::Ff(keep) }
+                    DecodedFrame { texture, subresource, width, height, pts: pts_us, hdr: false, _keep: FrameKeep::Ff(keep) }
                 }))
             }
         }
@@ -158,6 +200,7 @@ impl VideoDecoder {
         match &mut self.inner {
             Inner::Mf(d) => d.sync_gpu(),
             Inner::Ff { device, query, .. } => sync_device(device, query),
+            Inner::Soft { dec, query } => sync_device(&dec.device, query),
         }
     }
 
@@ -169,6 +212,10 @@ impl VideoDecoder {
                 dec.reset();
                 Ok(None)
             }
+            Inner::Soft { dec, .. } => {
+                dec.reset();
+                Ok(None)
+            }
         }
     }
 
@@ -177,6 +224,10 @@ impl VideoDecoder {
         match &mut self.inner {
             Inner::Mf(d) => d.reset(),
             Inner::Ff { dec, .. } => {
+                dec.reset();
+                Ok(())
+            }
+            Inner::Soft { dec, .. } => {
                 dec.reset();
                 Ok(())
             }
@@ -206,13 +257,50 @@ fn decoder_profile(codec: Codec) -> windows::core::GUID {
 
 /// Le GPU sait-il décoder ce codec (profil 8 bits 4:2:0, sortie NV12) via D3D11 Video ?
 pub fn gpu_supports(device: &ID3D11Device, codec: Codec) -> bool {
+    gpu_supports_format(device, codec, PixelFormat::Yuv420)
+}
+
+/// DXVA HEVC RExt Main 4:4:4 8 bits (dxva.h, `DXVA_ModeHEVC_VLD_Main444`).
+const HEVC_VLD_MAIN444: GUID = GUID::from_u128(0x4008018f_f537_4b36_98cf_61af8a2c1a33);
+
+fn profile_for(codec: Codec, f: PixelFormat) -> Option<(GUID, DXGI_FORMAT)> {
+    Some(match (codec, f) {
+        (_, PixelFormat::Yuv420) => (decoder_profile(codec), DXGI_FORMAT_NV12),
+        (Codec::Hevc, PixelFormat::Yuv420P10) => (D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, DXGI_FORMAT_P010),
+        (Codec::Av1, PixelFormat::Yuv420P10) => (D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0, DXGI_FORMAT_P010),
+        (Codec::Hevc, PixelFormat::Yuv444) => (HEVC_VLD_MAIN444, DXGI_FORMAT_AYUV),
+        _ => return None,
+    })
+}
+
+/// Le GPU expose-t-il un profil D3D11 pour ce codec dans ce format (4:2:0 8/10 bits, HEVC 4:4:4) ?
+pub fn gpu_supports_format(device: &ID3D11Device, codec: Codec, f: PixelFormat) -> bool {
+    let Some((want, fmt)) = profile_for(codec, f) else { return false };
     let Ok(vdev) = device.cast::<ID3D11VideoDevice>() else { return false };
-    let want = decoder_profile(codec);
     let n = unsafe { vdev.GetVideoDecoderProfileCount() };
     (0..n).any(|i| {
         unsafe { vdev.GetVideoDecoderProfile(i) }.is_ok_and(|g| g == want)
-            && unsafe { vdev.CheckVideoDecoderFormat(&want, DXGI_FORMAT_NV12) }.is_ok_and(|b| b.as_bool())
+            && unsafe { vdev.CheckVideoDecoderFormat(&want, fmt) }.is_ok_and(|b| b.as_bool())
     })
+}
+
+/// Formats annoncés pour une voie : matériel = profils D3D11 du GPU (le 4:4:4 HEVC sort en AYUV
+/// du décodeur Microsoft, vérifié sur RTX 4070 Ti) ; OpenH264 = 4:2:0 8 bits ; FFmpeg logiciel =
+/// tout (4:2:0/4:4:4, 8/10 bits).
+pub fn kind_formats(device: &ID3D11Device, codec: Codec, kind: DecoderKind) -> Vec<PixelFormat> {
+    match kind {
+        DecoderKind::OpenH264 => vec![PixelFormat::Yuv420],
+        DecoderKind::FfmpegSoftware => PixelFormat::ALL.to_vec(),
+        // FFmpeg 8.1 D3D11VA : le HEVC 4:4:4 retombe en logiciel (mesuré, RTX 4070 Ti) -> 4:2:0 seulement.
+        DecoderKind::FfmpegD3d11va => [PixelFormat::Yuv420, PixelFormat::Yuv420P10]
+            .into_iter()
+            .filter(|&f| gpu_supports_format(device, codec, f))
+            .collect(),
+        _ => [PixelFormat::Yuv420, PixelFormat::Yuv420P10, PixelFormat::Yuv444]
+            .into_iter()
+            .filter(|&f| gpu_supports_format(device, codec, f))
+            .collect(),
+    }
 }
 
 /// Résultat du sondage pour un codec.
@@ -227,6 +315,8 @@ pub struct ProbeEntry {
     pub attempts: Vec<Attempt>,
     /// Durée du sondage de ce codec (ms).
     pub probe_ms: f64,
+    /// Voies utilisables et leurs formats (matérielle retenue, puis logicielles disponibles).
+    pub caps: Vec<(DecoderKind, Vec<PixelFormat>)>,
 }
 
 impl ProbeEntry {
@@ -268,7 +358,7 @@ pub fn probe_decoders(device: &ID3D11Device, disabled: &DisabledDecoders) -> Vec
             .into_iter()
             .map(|codec| {
                 let t0 = std::time::Instant::now();
-                let mut e = ProbeEntry { codec, kind: None, backend: String::new(), attempts: Vec::new(), probe_ms: 0.0 };
+                let mut e = ProbeEntry { codec, kind: None, backend: String::new(), attempts: Vec::new(), probe_ms: 0.0, caps: Vec::new() };
                 if !gpu_supports(dev, codec) {
                     let msg = format!("le GPU n'expose pas de profil D3D11 {} 8 bits", chain::codec_key(codec));
                     e.attempts = DecoderKind::CHAIN.iter().map(|&kind| Attempt { kind, error: msg.clone() }).collect();
@@ -278,8 +368,25 @@ pub fn probe_decoders(device: &ID3D11Device, disabled: &DisabledDecoders) -> Vec
                             e.kind = Some(d.kind());
                             e.backend = d.backend_name().to_string();
                             e.attempts = a;
+                            e.caps.push((d.kind(), kind_formats(dev, codec, d.kind())));
                         }
                         Err(err) => e.attempts = err.attempts,
+                    }
+                }
+                // Voies logicielles (secours, ou choix « Logiciel ») : création réelle.
+                for kind in DecoderKind::SOFTWARE_CHAIN {
+                    if dis.is_disabled(kind, codec) || (kind == DecoderKind::OpenH264 && codec != Codec::H264) {
+                        continue;
+                    }
+                    match VideoDecoder::with_kind(dev, codec, kind) {
+                        Ok(d) => {
+                            if e.kind.is_none() {
+                                e.kind = Some(kind);
+                                e.backend = d.backend_name().to_string();
+                            }
+                            e.caps.push((kind, kind_formats(dev, codec, kind)));
+                        }
+                        Err(err) => e.attempts.push(Attempt { kind, error: short_error(&err) }),
                     }
                 }
                 e.probe_ms = t0.elapsed().as_secs_f64() * 1000.0;

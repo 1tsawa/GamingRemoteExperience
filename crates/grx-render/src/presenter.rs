@@ -7,7 +7,7 @@
 //! Les images arrivent dans une boîte aux lettres à une place : si le présentateur n'a pas fini
 //! la précédente, la plus ancienne est jetée (« latest frame wins ») pour ne jamais accumuler de latence.
 
-use crate::blit::{fit_rect, Blitter};
+use crate::blit::{fit_rect, BlitColor, Blitter};
 use crate::decoder::DecodedFrame;
 use crate::error::{RenderError, Result, WinCtx};
 use crate::gpu;
@@ -393,6 +393,12 @@ struct Gfx {
     blitter: Blitter,
     overlay: crate::overlay::OverlayLayer,
     cursor: crate::cursor::CursorLayer,
+    /// Flux HDR10 : conversion PQ -> back buffer (tone-mapping SDR ou scRGB).
+    hdr: Option<crate::hdr_present::HdrPresent>,
+    /// Back buffer FP16 scRGB (écran HDR) au lieu de BGRA 8 bits.
+    hdr_out: bool,
+    /// Dernière vérification « l'écran de la fenêtre est-il en HDR ? ».
+    hdr_check: Option<(Instant, bool)>,
 }
 
 impl Gfx {
@@ -448,6 +454,9 @@ impl Gfx {
             blitter: Blitter::new(device)?,
             overlay: Default::default(),
             cursor: Default::default(),
+            hdr: None,
+            hdr_out: false,
+            hdr_check: None,
         };
         g.fetch_backbuffer()?;
         if std::env::var("GRX_RENDER_DEBUG").is_ok() {
@@ -465,17 +474,61 @@ impl Gfx {
         if w == 0 || h == 0 || (w == self.w && h == self.h) {
             return Ok(());
         }
+        self.rebuild(w, h, DXGI_FORMAT_UNKNOWN)
+    }
+
+    /// Recrée les tampons de la swapchain (taille et/ou format) après avoir relâché les vues.
+    fn rebuild(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<()> {
         self.blitter.release_output();
         self.overlay.release_target();
         self.cursor.release_target();
+        if let Some(h) = &mut self.hdr {
+            h.release_target();
+        }
         self.backbuffer = None;
         unsafe { self.context.ClearState() };
         unsafe { self.context.Flush() };
-        unsafe { self.swapchain.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(self.flags as i32)) }
+        unsafe { self.swapchain.ResizeBuffers(0, w, h, format, DXGI_SWAP_CHAIN_FLAG(self.flags as i32)) }
             .ctx("ResizeBuffers")?;
         self.w = w;
         self.h = h;
         self.fetch_backbuffer()
+    }
+
+    /// L'écran qui affiche la fenêtre est-il en mode HDR (PQ BT.2020) ? Vérifié toutes les 2 s.
+    fn display_is_hdr(&mut self) -> bool {
+        if let Some((t, v)) = self.hdr_check {
+            if t.elapsed() < Duration::from_secs(2) {
+                return v;
+            }
+        }
+        let v = (|| -> windows::core::Result<bool> {
+            let o = unsafe { self.swapchain.GetContainingOutput() }?;
+            let o6: IDXGIOutput6 = o.cast()?;
+            Ok(unsafe { o6.GetDesc1() }?.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+        })()
+        .unwrap_or(false)
+            && std::env::var_os("GRX_FORCE_SDR_PRESENT").is_none();
+        self.hdr_check = Some((Instant::now(), v));
+        v
+    }
+
+    /// Bascule le back buffer FP16 scRGB (écran HDR) <-> BGRA 8 bits.
+    fn set_hdr_out(&mut self, on: bool) -> Result<()> {
+        if on == self.hdr_out {
+            return Ok(());
+        }
+        let fmt = if on { DXGI_FORMAT_R16G16B16A16_FLOAT } else { DXGI_FORMAT_B8G8R8A8_UNORM };
+        self.rebuild(self.w, self.h, fmt)?;
+        let cs = if on { DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 } else { DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 };
+        if let Ok(sc3) = self.swapchain.cast::<IDXGISwapChain3>() {
+            unsafe { sc3.SetColorSpace1(cs) }.ctx("SetColorSpace1")?;
+        }
+        self.hdr_out = on;
+        if std::env::var("GRX_RENDER_DEBUG").is_ok() {
+            eprintln!("grx-render: back buffer {}", if on { "FP16 scRGB (HDR)" } else { "BGRA 8 bits (SDR)" });
+        }
+        Ok(())
     }
 
     /// Attend que la swapchain accepte une nouvelle image (frame latency waitable).
@@ -491,8 +544,24 @@ impl Gfx {
                     .into(),
             ));
         }
+        if f.hdr {
+            // HDR10 : YCbCr PQ -> RGB PQ (VideoProcessor) -> tone-mapping SDR ou scRGB (écran HDR).
+            let want = self.display_is_hdr();
+            self.set_hdr_out(want)?;
+            if self.hdr.is_none() {
+                self.hdr = Some(crate::hdr_present::HdrPresent::new(&self.device)?);
+            }
+            let (w, h) = (self.w, self.h);
+            let inter = self.hdr.as_mut().unwrap().intermediate(w, h)?;
+            self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &inter, w, h, BlitColor::Pq)?;
+            let bb = self.backbuffer.clone().ok_or_else(|| RenderError::Other("no back buffer".into()))?;
+            self.hdr.as_mut().unwrap().draw(&bb, w, h, self.hdr_out)?;
+        } else {
+            self.set_hdr_out(false)?;
+            let bb = self.backbuffer.clone().ok_or_else(|| RenderError::Other("no back buffer".into()))?;
+            self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &bb, self.w, self.h, BlitColor::Sdr)?;
+        }
         let bb = self.backbuffer.clone().ok_or_else(|| RenderError::Other("no back buffer".into()))?;
-        self.blitter.blit(&f.texture, f.subresource, f.width, f.height, &bb, self.w, self.h)?;
         self.cursor.draw(&self.device, &self.context, &bb, self.w, self.h, f.width, f.height);
         self.overlay.draw(&self.device, &self.swapchain);
         let (interval, flags) = if self.vsync {

@@ -186,7 +186,8 @@ impl D2d {
         }
         let surface: IDXGISurface = unsafe { swapchain.GetBuffer(0) }.ctx("GetBuffer(IDXGISurface)")?;
         let props = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            // Format du back buffer (BGRA 8 bits, ou FP16 scRGB pour un flux HDR sur écran HDR).
+            pixelFormat: D2D1_PIXEL_FORMAT { format: surface_format(&surface), alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0,
             dpiY: 96.0,
             bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
@@ -310,4 +311,8 @@ mod tests {
         assert_eq!(r.inset(80.0, 80.0).w, 0.0);
         assert_eq!(Color::rgb(255, 0, 0).with_alpha(0.5), Color { r: 1.0, g: 0.0, b: 0.0, a: 0.5 });
     }
+}
+/// Format DXGI d'une surface (BGRA 8 bits par défaut).
+fn surface_format(s: &windows::Win32::Graphics::Dxgi::IDXGISurface) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    unsafe { s.GetDesc() }.map(|d| d.Format).unwrap_or(DXGI_FORMAT_B8G8R8A8_UNORM)
 }

@@ -39,8 +39,10 @@ mod decoder;
 mod ffmpeg;
 mod error;
 mod gpu;
+mod hdr_present;
 mod overlay;
 mod presenter;
+mod soft_decoder;
 mod video_decoder;
 
 pub use annexb::{
@@ -49,9 +51,9 @@ pub use annexb::{
 };
 pub use blit::fit_rect;
 pub use cursor::{cursor_quad, CursorShape, RemoteCursor};
-pub use chain::{codec_key, create_with, Attempt, ChainError, DecoderKind, DisabledDecoders};
+pub use chain::{codec_key, create_with, create_with_pref, Attempt, ChainError, DecoderKind, DecoderPref, DisabledDecoders};
 pub use decoder::{DecodedFrame, DecoderStats};
-pub use video_decoder::{gpu_supports, probe_decoders, ProbeEntry, VideoDecoder};
+pub use video_decoder::{gpu_supports, gpu_supports_format, kind_formats, probe_decoders, ProbeEntry, VideoDecoder};
 /// Voie FFmpeg D3D11VA : `Ok(version et dossier)` si les DLL LGPL sont chargeables, sinon la raison.
 pub fn ffmpeg_availability() -> std::result::Result<String, String> {
     ffmpeg::availability()

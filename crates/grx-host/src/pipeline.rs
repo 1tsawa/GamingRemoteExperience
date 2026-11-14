@@ -10,7 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use grx_audio::{AudioCapturer, CaptureConfig, OpusConfig, OpusEncoder};
 use grx_input::{InjectorConfig, InputInjector, Rumble};
+use crate::codec::Want;
+use grx_core::codec_neg::BackendId;
 use grx_video::{Encoder, EncoderConfig, OutputInfo, ScreenCapturer};
+use grx_video::{D3D11Device as ID3D11Device, D3D11Texture as ID3D11Texture2D};
 
 /// Microsecondes depuis l'epoch Unix : horloge commune host/client (même machine ou NTP) qui
 /// sert de `pts` pour mesurer la latence de bout en bout.
@@ -39,6 +42,12 @@ pub struct PipelineOpts {
     pub max_bitrate_bps: u64,
     /// Écran de départ (nom GDI résolu depuis `--display N`), `None` = choix par défaut.
     pub display: Option<String>,
+    /// `run --encoder` : vendeur d'encodeur voulu (auto = adaptateur de l'écran capturé).
+    pub encoder: grx_video::EncoderPref,
+    /// `run --chroma` : 4:2:0 / 4:4:4 (auto = préférence du client).
+    pub chroma: grx_core::codec_neg::ChromaPref,
+    /// Caché (tests) : remplace la capture par une mire HDR synthétique (FP16, jusqu'à 1000 nits).
+    pub test_pattern_hdr: bool,
 }
 
 pub struct VideoOut {
@@ -113,7 +122,16 @@ impl Pipeline {
             max_fps: AtomicU32::new(0),
             cursor: Arc::new(grx_video::CursorTracker::new()),
             displays: Arc::new(crate::display::Displays::new()),
-            codec: Arc::new(crate::codec::CodecState::new(opts.codec)),
+            codec: Arc::new({
+                // Encodeurs de l'adaptateur de l'écran de départ ; source HDR si cet écran l'est.
+                let start = grx_video::list_displays()
+                    .ok()
+                    .and_then(|l| crate::display::pick_initial(&l, opts.display.as_deref()).cloned());
+                let hdr = opts.test_pattern_hdr
+                    || start.as_ref().is_some_and(|d| grx_video::output_is_hdr(d.adapter_index, d.output_index));
+                let adapter = opts.display.as_ref().and(start.as_ref()).map(|d| d.adapter_index);
+                crate::codec::CodecState::new(opts.codec, opts.encoder, opts.chroma, adapter, hdr)
+            }),
         });
         let mut threads = Vec::new();
 
@@ -204,23 +222,42 @@ fn video_thread(sh: Arc<Shared>, o: PipelineOpts, tx: SyncSender<VideoOut>) {
     }
 }
 
+/// Crée l'encodeur de `want` (voie choisie par `grx_video` selon `run --encoder` et l'adaptateur
+/// de `dev`) ; renvoie aussi l'identifiant de backend annoncé au client.
+fn make_encoder(dev: &ID3D11Device, o: &PipelineOpts, w: u32, h: u32, kbps: u32, want: Want) -> grx_video::Result<(Encoder, Option<BackendId>)> {
+    let cfg = EncoderConfig {
+        codec: want.codec,
+        width: w,
+        height: h,
+        fps: o.fps,
+        bitrate_kbps: kbps,
+        pref: o.encoder,
+        format: want.format,
+        hdr: want.hdr,
+    };
+    Encoder::with_device(dev, cfg).map(|e| {
+        let b = crate::codec::backend_id(e.backend().kind());
+        (e, Some(b))
+    })
+}
+
+/// Ouvre l'encodeur voulu pour la capture `cap` (repli géré par `codec::open_encoder`).
+fn open_for(cap: &ScreenCapturer, sh: &Shared, o: &PipelineOpts, kbps: u32) -> Result<(Encoder, Want), String> {
+    let (w, h) = cap.size();
+    crate::codec::open_encoder(&sh.codec, |want| make_encoder(cap.device(), o, w, h, kbps, want))
+}
+
 /// Ouvre la capture de `target` et un encodeur à sa taille. `reuse` : capturer + encodeur en
 /// cours ; s'ils sont sur le même adaptateur, le device est gardé (bascule de sortie seulement) et
 /// l'encodeur aussi tant que la taille ne change pas. Sinon tout est recréé sur le bon adaptateur.
 fn open_display(
     target: &OutputInfo,
-    reuse: Option<(ScreenCapturer, Encoder)>,
+    reuse: Option<(ScreenCapturer, Encoder, Want)>,
     sh: &Shared,
     o: &PipelineOpts,
     kbps: u32,
-) -> Result<(ScreenCapturer, Encoder), String> {
-    let make_enc = |cap: &ScreenCapturer| {
-        let (w, h) = cap.size();
-        crate::codec::open_encoder(&sh.codec, |codec| {
-            Encoder::with_device(cap.device(), EncoderConfig { codec, width: w, height: h, fps: o.fps, bitrate_kbps: kbps })
-        })
-    };
-    if let Some((mut cap, mut enc)) = reuse {
+) -> Result<(ScreenCapturer, Encoder, Want), String> {
+    if let Some((mut cap, mut enc, mut want)) = reuse {
         if cap.adapter_output().0 == target.adapter_index {
             cap.switch_output(target.output_index).map_err(|e| format!("capture : {e}"))?;
             let (w, h) = cap.size();
@@ -228,17 +265,30 @@ fn open_display(
             if (c.width, c.height) != (w, h) {
                 // Autre résolution : encodeur recréé à la taille native (le client suit via le SPS).
                 drop(enc);
-                enc = make_enc(&cap)?;
+                (enc, want) = open_for(&cap, sh, o, kbps)?;
             } else {
                 enc.request_keyframe();
             }
-            return Ok((cap, enc));
+            return Ok((cap, enc, want));
         }
     }
     let mut cap = ScreenCapturer::with_output(target.adapter_index, target.output_index).map_err(|e| format!("capture : {e}"))?;
     cap.set_cursor_tracker(sh.cursor.clone());
-    let enc = make_enc(&cap)?;
-    Ok((cap, enc))
+    let (enc, want) = open_for(&cap, sh, o, kbps)?;
+    Ok((cap, enc, want))
+}
+
+/// Description courte de l'encodeur pour le journal (« NVIDIA HEVC Encoder MFT, HEVC 4:2:0 10 bits HDR10 »).
+fn describe_encoder(enc: &Encoder, want: Want) -> String {
+    let (w, h) = enc.output_size();
+    format!(
+        "{} [{}], {:?} {}{}, {w}x{h}",
+        enc.backend().name(),
+        enc.backend().vendor().label(),
+        want.codec,
+        want.format.label(),
+        if want.hdr { " HDR10 (PQ BT.2020)" } else { "" }
+    )
 }
 
 /// Curseur juste après une bascule (DXGI ne redonne la position qu'au prochain mouvement) :
@@ -264,21 +314,17 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
     let start = o.display.as_deref().and_then(|_| crate::display::pick_initial(&list, o.display.as_deref()).cloned());
     // Codec : on attend (brièvement) les décodeurs annoncés par le client (`codec.rs`).
     sh.codec.wait_decided(crate::codec::DECIDE_TIMEOUT, &sh.stop);
-    let (mut cap, mut enc) = match &start {
+    let (mut cap, mut enc, mut cur_want) = match &start {
         Some(t) => open_display(t, None, sh, o, cur_kbps)?,
         None => {
             let mut cap = ScreenCapturer::new().map_err(|e| format!("capture : {e}"))?;
             cap.set_cursor_tracker(sh.cursor.clone());
-            let (w, h) = cap.size();
-            let enc = crate::codec::open_encoder(&sh.codec, |codec| {
-                Encoder::with_device(
-                    cap.device(),
-                    EncoderConfig { codec, width: w, height: h, fps: o.fps, bitrate_kbps: cur_kbps },
-                )
-            })?;
-            (cap, enc)
+            let (enc, want) = open_for(&cap, sh, o, cur_kbps)?;
+            (cap, enc, want)
         }
     };
+    // Mire HDR synthétique (tests de la voie 10 bits sans écran HDR).
+    let mut pattern: Option<(ID3D11Texture2D, (u32, u32))> = None;
     let mut active = {
         let (a, i) = cap.adapter_output();
         list.iter().find(|d| (d.adapter_index, d.output_index) == (a, i)).cloned()
@@ -288,7 +334,13 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
         displays.set_active(&a.device_name);
     }
     let (w, h) = cap.size();
-    println!("  vidéo : {w}x{h} {:?} {} fps, {:?}, {} kb/s initial", enc.config().codec, o.fps, enc.backend(), cur_kbps);
+    println!(
+        "  vidéo : {w}x{h} {} fps, {} kb/s initial, encodeur {}{}",
+        o.fps,
+        cur_kbps,
+        describe_encoder(&enc, cur_want),
+        if cap.is_hdr() { " (capture HDR FP16)" } else if o.test_pattern_hdr { " (mire HDR synthétique)" } else { "" }
+    );
     for (i, d) in list.iter().enumerate() {
         let mark = if active.as_ref().is_some_and(|a| a.device_name == d.device_name) { "  <- capturé" } else { "" };
         println!("  écran {}{mark}", crate::display::describe(i, d));
@@ -309,22 +361,27 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
 
     while !sh.stop.load(Ordering::Relaxed) {
         // Changement de codec négocié (renégociation du client) : encodeur recréé, image clé.
-        if let Some(c) = sh.codec.take_switch(enc.config().codec) {
-            let (t0, old) = (Instant::now(), enc.config().codec);
-            let (w, h) = cap.size();
+        if let Some(c) = sh.codec.take_switch(cur_want) {
+            let (t0, old) = (Instant::now(), cur_want);
             drop(enc);
-            enc = crate::codec::open_encoder(&sh.codec, |codec| {
-                Encoder::with_device(cap.device(), EncoderConfig { codec, width: w, height: h, fps: o.fps, bitrate_kbps: cur_kbps })
-            })?;
-            println!("  vidéo : codec {old:?} -> {:?} (demandé {c:?}, {:?}) en {:.1} ms", enc.config().codec, enc.backend(), t0.elapsed().as_secs_f64() * 1000.0);
+            (enc, cur_want) = open_for(&cap, sh, o, cur_kbps)?;
+            println!(
+                "  vidéo : {:?} {} -> {} (demandé {:?} {}) en {:.1} ms",
+                old.codec,
+                old.format.label(),
+                describe_encoder(&enc, cur_want),
+                c.codec,
+                c.format.label(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
             sh.want_key.store(true, Ordering::SeqCst);
         }
         // Bascule d'écran demandée par le client (GRX-MON) ou repli après disparition de l'écran.
         if let Some(target) = displays.take_request() {
             if active.as_ref().is_none_or(|a| a.device_name != target.device_name) {
                 let t0 = Instant::now();
-                match open_display(&target, Some((cap, enc)), sh, o, cur_kbps) {
-                    Ok(ce) => (cap, enc) = ce,
+                match open_display(&target, Some((cap, enc, cur_want)), sh, o, cur_kbps) {
+                    Ok(ce) => (cap, enc, cur_want) = ce,
                     Err(err) => {
                         eprintln!("  écran : bascule vers {} impossible ({err})", target.display_name());
                         // Le capturer a été consommé : on rouvre l'écran précédent (ou le principal).
@@ -335,7 +392,7 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
                             .or_else(|| list.iter().find(|d| d.primary).cloned())
                             .or_else(|| list.first().cloned())
                             .ok_or_else(|| "aucun écran à rouvrir".to_string())?;
-                        (cap, enc) = open_display(&back, None, sh, o, cur_kbps)?;
+                        (cap, enc, cur_want) = open_display(&back, None, sh, o, cur_kbps)?;
                         displays.set_active(&back.device_name);
                         active = Some(back);
                         sh.want_key.store(true, Ordering::SeqCst);
@@ -360,7 +417,7 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
             }
         }
         let got = cap.capture(if o.fill { fill_ms } else { 100 });
-        let frame = match got {
+        let mut frame = match got {
             Ok(Some(f)) => {
                 errors = 0;
                 f
@@ -392,6 +449,14 @@ fn video_loop(sh: &Shared, o: &PipelineOpts, tx: &SyncSender<VideoOut>) -> Resul
                 continue;
             }
         };
+        if o.test_pattern_hdr {
+            let size = (frame.width, frame.height);
+            if pattern.as_ref().is_none_or(|(_, s)| *s != size) {
+                let t = grx_video::hdr_test_pattern(cap.device(), size.0, size.1, 0).map_err(|e| format!("mire HDR : {e}"))?;
+                pattern = Some((t, size));
+            }
+            frame.texture = pattern.as_ref().unwrap().0.clone();
+        }
         // FPS max du client (overlay), appliqué à chaud.
         let f = crate::control::effective_fps(o.fps, sh.max_fps.load(Ordering::Relaxed));
         if f != eff_fps {

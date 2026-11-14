@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Encodeurs AMD (AMF) et Intel (Quick Sync) via leurs MFT, choisis selon le GPU de l'écran capturé ; `run --encoder`.
+- Secours logiciel OpenH264 (Cisco, téléchargé à l'installation, SHA-256 vérifié) : encodeur host et décodeur client ; `fetch-openh264`.
+- Décodeur au choix (Auto / Matériel / Logiciel) dans le menu et `play --decoder` ; FFmpeg logiciel ; MFT décodeurs asynchrones (Intel).
+- Couleur 4:4:4 (HEVC RExt via NVENC direct) : case du menu, `run --chroma`.
+- 10 bits / HDR10 : HEVC Main10, capture HDR FP16, affichage HDR ou tone-mapping SDR ; case « Préférer 10 bits ».
+- Statistiques : encodeur (vendeur), profil, chroma, profondeur, décodeur.
+- grx-gui : onglet Paramètres (choix du codec HEVC/H.264/AV1 ou Auto, options client/host).
+
 ## 0.2.1
 
 - Négociation automatique du codec (HEVC, H.264, AV1) selon les décodeurs du client ; repli H.264 sans extension HEVC.

@@ -4,10 +4,16 @@
 //! *D3D11 aware* : le gestionnaire de device DXGI lui est donné, il décode avec l'ID3D11VideoDecoder
 //! du GPU (NVDEC sur NVIDIA) et rend des textures NV12 GPU. Aucun pixel ne passe par le CPU.
 //! Mode `MF_LOW_LATENCY` : une entrée = une sortie, sans réordonnancement.
+//!
+//! Phase 2 : les MFT décodeurs matériels **asynchrones** (Intel Quick Sync…) sont aussi pilotés,
+//! via la machine à événements `METransformNeedInput`/`METransformHaveOutput`
+//! ([`grx_video::mft_async`]) ; les MFT synchrones de Microsoft restent essayés d'abord. Sorties
+//! acceptées : NV12 (8 bits), P010 (10 bits), AYUV / Y410 (4:4:4) selon le flux.
 
 use crate::annexb;
 use crate::error::{RenderError, Result, WinCtx};
 use crate::gpu;
+use grx_video::mft_async::{self, AsyncMft, MftEvent};
 use grx_video::Codec;
 use std::sync::Once;
 use windows::core::{Interface, PWSTR, VARIANT};
@@ -39,6 +45,8 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Horodatage de présentation (µs), recopié depuis l'entrée.
     pub pts: u64,
+    /// Flux HDR10 (PQ, BT.2020) : le présentateur convertit (tone-mapping SDR ou sortie HDR).
+    pub hdr: bool,
     pub(crate) _keep: FrameKeep,
 }
 
@@ -46,6 +54,8 @@ pub struct DecodedFrame {
 pub(crate) enum FrameKeep {
     Mf(#[allow(dead_code)] IMFSample),
     Ff(#[allow(dead_code)] crate::ffmpeg::FrameRef),
+    /// Image logicielle téléversée (texture du pool du décodeur).
+    Soft,
 }
 
 impl std::fmt::Debug for DecodedFrame {
@@ -85,6 +95,12 @@ pub(crate) struct MfDecoder {
     wait_idr: bool,
     discontinuity: bool,
     stats: DecoderStats,
+    /// MFT asynchrone (Intel QSV…) : événements + compteur d'entrées acceptées.
+    events: Option<IMFMediaEventGenerator>,
+    need_input: u32,
+    async_out: Option<DecodedFrame>,
+    /// Sous-type de sortie négocié (NV12, P010, AYUV, Y410).
+    pub out_subtype: windows::core::GUID,
 }
 
 fn subtype(codec: Codec) -> windows::core::GUID {
@@ -99,12 +115,41 @@ impl MfDecoder {
     pub fn with_device(device: &ID3D11Device, codec: Codec) -> Result<Self> {
         gpu::init_com();
         mf_startup()?;
-        let (mft, name) = create_mft(codec)?;
+        let cands = create_mft(codec)?;
+        let mut last = None;
+        // Synchrones (Microsoft, DXVA) d'abord, puis asynchrones matériels (Intel QSV…).
+        for want_async in [false, true] {
+            for (a, n) in &cands {
+                let Ok(mft) = (unsafe { a.ActivateObject::<IMFTransform>() }) else { continue };
+                let is_async = unsafe { mft.GetAttributes() }
+                    .ok()
+                    .and_then(|at| unsafe { at.GetUINT32(&MF_TRANSFORM_ASYNC) }.ok())
+                    .unwrap_or(0)
+                    != 0;
+                if is_async != want_async {
+                    let _ = unsafe { a.ShutdownObject() };
+                    continue;
+                }
+                match Self::open(device, codec, mft, n.clone(), is_async) {
+                    Ok(d) => return Ok(d),
+                    Err(e) => {
+                        let _ = unsafe { a.ShutdownObject() };
+                        last = Some(e);
+                    }
+                }
+            }
+        }
+        Err(last.unwrap_or(RenderError::NoDecoder(codec)))
+    }
 
+    fn open(device: &ID3D11Device, codec: Codec, mft: IMFTransform, name: String, is_async: bool) -> Result<Self> {
         let attrs = unsafe { mft.GetAttributes() }.ctx("IMFTransform::GetAttributes")?;
         let aware = unsafe { attrs.GetUINT32(&MF_SA_D3D11_AWARE) }.unwrap_or(0) != 0;
-        if !aware {
+        if !aware && !is_async {
             return Err(RenderError::Other(format!("MFT '{name}' is not D3D11 aware")));
+        }
+        if is_async {
+            unsafe { attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1) }.ctx("MF_TRANSFORM_ASYNC_UNLOCK")?;
         }
         let _ = unsafe { attrs.SetUINT32(&MF_LOW_LATENCY, 1) };
         if let Ok(api) = mft.cast::<ICodecAPI>() {
@@ -119,18 +164,23 @@ impl MfDecoder {
         unsafe { mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr.as_raw() as usize) }
             .ctx("MFT_MESSAGE_SET_D3D_MANAGER")?;
 
+        let events = if is_async { Some(mft.cast::<IMFMediaEventGenerator>().ctx("IMFMediaEventGenerator")?) } else { None };
         let mut dec = MfDecoder {
             query: None,
             codec,
             device: device.clone(),
             mft,
             _mgr: mgr,
-            name,
+            name: if is_async { format!("{name} (asynchrone)") } else { name },
             width: 0,
             height: 0,
             wait_idr: true,
             discontinuity: true,
             stats: DecoderStats::default(),
+            events,
+            need_input: 0,
+            async_out: None,
+            out_subtype: MFVideoFormat_NV12,
         };
         dec.configure()?;
         Ok(dec)
@@ -168,24 +218,34 @@ impl MfDecoder {
         Ok(())
     }
 
-    /// Sélectionne NV12 comme type de sortie et lit la taille visible.
+    /// Sélectionne le meilleur type de sortie proposé (Y410 > AYUV > P010 > NV12 : fidélité
+    /// maximale du flux) et lit la taille visible.
     fn negotiate_output(&mut self) -> Result<()> {
-        for i in 0.. {
-            let t = match unsafe { self.mft.GetOutputAvailableType(0, i) } {
-                Ok(t) => t,
-                Err(e) => return Err(RenderError::Win { context: "GetOutputAvailableType(NV12)", source: e }),
-            };
-            if unsafe { t.GetGUID(&MF_MT_SUBTYPE) }.ok() != Some(MFVideoFormat_NV12) {
-                continue;
+        let mut offered = Vec::new();
+        for i in 0..64 {
+            match unsafe { self.mft.GetOutputAvailableType(0, i) } {
+                Ok(t) => {
+                    if let Ok(g) = unsafe { t.GetGUID(&MF_MT_SUBTYPE) } {
+                        offered.push((g, t));
+                    }
+                }
+                Err(e) if offered.is_empty() => {
+                    return Err(RenderError::Win { context: "GetOutputAvailableType", source: e })
+                }
+                Err(_) => break,
             }
+        }
+        for want in [MFVideoFormat_Y410, MFVideoFormat_AYUV, MFVideoFormat_P010, MFVideoFormat_NV12] {
+            let Some((_, t)) = offered.iter().find(|(g, _)| *g == want) else { continue };
             if unsafe { t.GetUINT64(&MF_MT_FRAME_SIZE) }.is_err() {
                 unsafe { t.SetUINT64(&MF_MT_FRAME_SIZE, (1920u64 << 32) | 1080) }.ctx("FRAME_SIZE(out)")?;
             }
-            unsafe { self.mft.SetOutputType(0, &t, 0) }.ctx("SetOutputType(NV12)")?;
+            unsafe { self.mft.SetOutputType(0, t, 0) }.ctx("SetOutputType")?;
+            self.out_subtype = want;
             self.read_output_size();
             return Ok(());
         }
-        unreachable!()
+        Err(RenderError::Other("aucune sortie NV12/P010/AYUV/Y410 proposée par le MFT".into()))
     }
 
     fn read_output_size(&mut self) {
@@ -262,6 +322,9 @@ impl MfDecoder {
             }
         }
 
+        if self.events.is_some() {
+            return self.decode_async(&sample);
+        }
         let mut latest: Option<DecodedFrame> = None;
         let mut retried = false;
         loop {
@@ -280,6 +343,50 @@ impl MfDecoder {
             self.stats.frames_out += 1;
         }
         Ok(latest)
+    }
+
+    /// MFT asynchrone : attend `NeedInput`, soumet, puis attend la sortie (ou une nouvelle demande
+    /// d'entrée : le décodeur veut plus de données avant de sortir une image).
+    fn decode_async(&mut self, sample: &IMFSample) -> Result<Option<DecodedFrame>> {
+        let to = |e: mft_async::PumpError| RenderError::Other(format!("MFT asynchrone : {e}"));
+        mft_async::pump(self, std::time::Duration::from_millis(500), |s| s.need_input > 0).map_err(to)?;
+        unsafe { self.mft.ProcessInput(0, sample, 0) }.ctx("ProcessInput")?;
+        self.need_input -= 1;
+        let r = mft_async::pump(self, std::time::Duration::from_millis(40), |s| s.async_out.is_some() || s.need_input > 0);
+        match r {
+            Ok(()) | Err(mft_async::PumpError::Timeout) => {}
+            Err(e) => return Err(to(e)),
+        }
+        let out = self.async_out.take();
+        if out.is_some() {
+            self.stats.frames_out += 1;
+        }
+        Ok(out)
+    }
+
+    /// Une sortie d'un MFT asynchrone (après `METransformHaveOutput`).
+    fn async_output(&mut self) -> Result<()> {
+        let mut buf = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: std::mem::ManuallyDrop::new(None),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        };
+        let mut status = 0u32;
+        let r = unsafe { self.mft.ProcessOutput(0, std::slice::from_mut(&mut buf), &mut status) };
+        let sample = unsafe { std::mem::ManuallyDrop::take(&mut buf.pSample) };
+        let _events = unsafe { std::mem::ManuallyDrop::take(&mut buf.pEvents) };
+        match r {
+            Ok(()) => {
+                if let Some(s) = sample {
+                    self.async_out = Some(self.make_frame(s)?);
+                }
+                Ok(())
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => self.negotiate_output(),
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(()),
+            Err(e) => Err(RenderError::Win { context: "ProcessOutput(async)", source: e }),
+        }
     }
 
     /// Récupère toutes les sorties disponibles ; garde la plus récente.
@@ -321,7 +428,7 @@ impl MfDecoder {
         if self.width == 0 {
             self.read_output_size();
         }
-        Ok(DecodedFrame { texture, subresource, width: self.width, height: self.height, pts, _keep: FrameKeep::Mf(sample) })
+        Ok(DecodedFrame { texture, subresource, width: self.width, height: self.height, pts, hdr: false, _keep: FrameKeep::Mf(sample) })
     }
 
     pub fn sync_gpu(&mut self) -> Result<()> {
@@ -349,7 +456,38 @@ impl MfDecoder {
         }
         self.wait_idr = true;
         self.discontinuity = true;
+        // Le MFT asynchrone redemande ses entrées après le redémarrage du flux.
+        self.need_input = 0;
+        self.async_out = None;
         Ok(())
+    }
+}
+
+impl AsyncMft for MfDecoder {
+    fn next_event(&mut self) -> std::result::Result<Option<MftEvent>, String> {
+        let Some(ev) = &self.events else { return Ok(None) };
+        match unsafe { ev.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(e) => {
+                let ty = MF_EVENT_TYPE(unsafe { e.GetType() }.map_err(|e| e.to_string())? as i32);
+                Ok(Some(if ty == METransformNeedInput {
+                    MftEvent::NeedInput
+                } else if ty == METransformHaveOutput {
+                    MftEvent::HaveOutput
+                } else if ty == MEError {
+                    MftEvent::Error(unsafe { e.GetStatus() }.map(|h| h.0).unwrap_or(-1))
+                } else {
+                    MftEvent::Other
+                }))
+            }
+            Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => Ok(None),
+            Err(e) => Err(format!("GetEvent : {e}")),
+        }
+    }
+    fn on_need_input(&mut self) {
+        self.need_input += 1;
+    }
+    fn on_have_output(&mut self) -> std::result::Result<(), String> {
+        self.async_output().map_err(|e| e.to_string())
     }
 }
 
@@ -368,7 +506,7 @@ impl Drop for MfDecoder {
 
 /// Décodeurs candidats, matériels d'abord (les MFT synchrones DXVA de Microsoft sont classés
 /// « logiciels » par MF mais décodent sur le GPU quand le device manager leur est fourni).
-fn create_mft(codec: Codec) -> Result<(IMFTransform, String)> {
+fn create_mft(codec: Codec) -> Result<Vec<(IMFActivate, String)>> {
     let info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     let mut pp: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
@@ -400,28 +538,14 @@ fn create_mft(codec: Codec) -> Result<(IMFTransform, String)> {
         }
     }
     unsafe { CoTaskMemFree(Some(pp as *const _)) };
-    let mut last_err = None;
-    for (a, n) in cands {
-        match unsafe { a.ActivateObject::<IMFTransform>() } {
-            Ok(t) => {
-                // Les MFT asynchrones ne sont pas pilotés ici.
-                let is_async = unsafe { t.GetAttributes() }
-                    .ok()
-                    .and_then(|at| unsafe { at.GetUINT32(&MF_TRANSFORM_ASYNC) }.ok())
-                    .unwrap_or(0)
-                    != 0;
-                if is_async {
-                    continue;
-                }
-                return Ok((t, n));
-            }
-            Err(e) => last_err = Some(e),
-        }
+    if std::env::var_os("GRX_NO_ASYNC_DECODERS").is_some() {
+        // Diagnostic : ignore les MFT asynchrones (comportement phase 1).
+        cands.retain(|(a, _)| unsafe { a.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) == 0);
     }
-    match last_err {
-        Some(e) => Err(RenderError::Win { context: "IMFActivate::ActivateObject", source: e }),
-        None => Err(RenderError::NoDecoder(codec)),
+    if cands.is_empty() {
+        return Err(RenderError::NoDecoder(codec));
     }
+    Ok(cands)
 }
 
 /// Bloque jusqu'à ce que le GPU ait fini toutes les commandes soumises sur le device

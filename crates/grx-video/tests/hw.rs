@@ -52,7 +52,7 @@ fn noise(w: u32, h: u32, seed: &mut u64) -> Vec<u8> {
 
 fn run_stream(codec: Codec) {
     let (w, h) = (1280u32, 720u32);
-    let cfg = EncoderConfig { codec, width: w, height: h, fps: 60, bitrate_kbps: 8000 };
+    let cfg = EncoderConfig { codec, width: w, height: h, fps: 60, bitrate_kbps: 8000, ..Default::default() };
     let Some(mut enc) = skip(Encoder::new(cfg), "Encoder::new") else { return };
     let mut frames = Vec::new();
     for t in 0..40 {
@@ -90,7 +90,7 @@ fn h264_synthetic_stream() {
 #[test]
 fn bitrate_change_takes_effect() {
     let (w, h) = (1280u32, 720u32);
-    let cfg = EncoderConfig { codec: Codec::Hevc, width: w, height: h, fps: 60, bitrate_kbps: 12_000 };
+    let cfg = EncoderConfig { codec: Codec::Hevc, width: w, height: h, fps: 60, bitrate_kbps: 12_000, ..Default::default() };
     let Some(mut enc) = skip(Encoder::new(cfg), "Encoder::new") else { return };
     let mut seed = 0x9E3779B97F4A7C15u64;
     let mut avg = |enc: &mut Encoder, n: usize| -> f64 {
@@ -111,7 +111,7 @@ fn bitrate_change_takes_effect() {
 
 #[test]
 fn source_resolution_change_is_scaled() {
-    let cfg = EncoderConfig { codec: Codec::Hevc, width: 1280, height: 720, fps: 60, bitrate_kbps: 6000 };
+    let cfg = EncoderConfig { codec: Codec::Hevc, width: 1280, height: 720, fps: 60, bitrate_kbps: 6000, ..Default::default() };
     let Some(mut enc) = skip(Encoder::new(cfg), "Encoder::new") else { return };
     for (w, h) in [(640u32, 360u32), (1920, 1080), (1280, 720), (800, 600)] {
         let f = enc.encode_bgra(&gradient(w, h, 1), w, h, w * 4).unwrap();
@@ -124,7 +124,7 @@ fn source_resolution_change_is_scaled() {
 fn texture_from_other_device_is_rejected() {
     use windows::Win32::Graphics::Direct3D11::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
-    let cfg = EncoderConfig { codec: Codec::Hevc, width: 640, height: 360, fps: 60, bitrate_kbps: 2000 };
+    let cfg = EncoderConfig { codec: Codec::Hevc, width: 640, height: 360, fps: 60, bitrate_kbps: 2000, ..Default::default() };
     let Some(mut enc) = skip(Encoder::new(cfg), "Encoder::new") else { return };
     let adapters = list_adapters().unwrap();
     let Some(ai) = adapters.iter().find(|a| !a.is_software) else { return };
@@ -153,7 +153,7 @@ fn capture_and_encode_screen() {
     let Some(mut cap) = skip(ScreenCapturer::new(), "ScreenCapturer::new") else { return };
     let (w, h) = cap.size();
     assert!(w > 0 && h > 0);
-    let cfg = EncoderConfig { codec: Codec::Hevc, width: w, height: h, fps: 60, bitrate_kbps: 20_000 };
+    let cfg = EncoderConfig { codec: Codec::Hevc, width: w, height: h, fps: 60, bitrate_kbps: 20_000, ..Default::default() };
     let Some(mut enc) = skip(Encoder::with_device(cap.device(), cfg), "Encoder::with_device") else { return };
     // Le premier AcquireNextFrame après (re)création rend toujours l'image courante.
     let f = cap.capture(2000).unwrap().expect("first frame");

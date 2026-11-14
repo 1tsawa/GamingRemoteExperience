@@ -154,20 +154,27 @@ impl BackendId {
     pub const MEDIA_FOUNDATION: BackendId = BackendId(1);
     /// libavcodec + hwaccel D3D11VA (DLL LGPL chargées dynamiquement).
     pub const FFMPEG_D3D11VA: BackendId = BackendId(2);
-    /// Décodeur/encodeur logiciel (CPU) — réservé (phase 2).
+    /// Décodeur/encodeur logiciel (CPU) : OpenH264 (Cisco), FFmpeg logiciel (LGPL).
     pub const SOFTWARE: BackendId = BackendId(3);
     /// Encodeur MFT NVIDIA (NVENC).
     pub const MF_NVIDIA: BackendId = BackendId(16);
-    /// Encodeur MFT AMD (AMF) — réservé (phase 2).
+    /// Encodeur MFT AMD (AMF).
     pub const MF_AMD: BackendId = BackendId(17);
-    /// Encodeur MFT Intel (Quick Sync) — réservé (phase 2).
+    /// Encodeur MFT Intel (Quick Sync).
     pub const MF_INTEL: BackendId = BackendId(18);
     /// Autre MFT matériel.
     pub const MF_OTHER: BackendId = BackendId(19);
+    /// API NVENC directe (`nvEncodeAPI64.dll`) : 4:4:4 (phase 2).
+    pub const NVENC: BackendId = BackendId(20);
 
     /// Backends compris par cette version (les autres sont ignorés au décodage).
     pub fn known(self) -> bool {
-        matches!(self.0, 1..=3 | 16..=19)
+        matches!(self.0, 1..=3 | 16..=20)
+    }
+
+    /// Backend logiciel (CPU) ?
+    pub fn is_software(self) -> bool {
+        self == BackendId::SOFTWARE
     }
 
     pub fn label(self) -> &'static str {
@@ -178,6 +185,7 @@ impl BackendId {
             BackendId::MF_NVIDIA => "NVIDIA (MF)",
             BackendId::MF_AMD => "AMD (MF)",
             BackendId::MF_INTEL => "Intel (MF)",
+            BackendId::NVENC => "NVIDIA (NVENC)",
             _ => "MF matériel",
         }
     }
@@ -207,6 +215,86 @@ impl FormatSet {
     pub fn union(self, o: FormatSet) -> FormatSet {
         FormatSet(self.0 | o.0)
     }
+    pub fn intersect(self, o: FormatSet) -> FormatSet {
+        FormatSet(self.0 & o.0)
+    }
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    /// Format unique : 4:2:0 ou 4:4:4, 8 ou 10 bits.
+    pub fn single(yuv444: bool, ten_bit: bool) -> FormatSet {
+        FormatSet(1 << ((yuv444 as u8) * 2 + ten_bit as u8))
+    }
+    /// Contient un format 4:4:4 (pour un format unique : flux 4:4:4).
+    pub fn is_444(self) -> bool {
+        self.0 & (Self::YUV444_8.0 | Self::YUV444_10.0) != 0
+    }
+    /// Contient un format 10 bits (pour un format unique : flux 10 bits).
+    pub fn is_10bit(self) -> bool {
+        self.0 & (Self::YUV420_10.0 | Self::YUV444_10.0) != 0
+    }
+    /// Formats uniques contenus, du plus simple au plus riche.
+    pub fn iter(self) -> impl Iterator<Item = FormatSet> {
+        (0..4).map(|i| FormatSet(1 << i)).filter(move |f| self.0 & f.0 != 0)
+    }
+    /// Libellé (« 4:2:0 8 bits », liste séparée par « , » pour plusieurs formats).
+    pub fn label(self) -> String {
+        let one = |f: FormatSet| {
+            format!("{} {} bits", if f.is_444() { "4:4:4" } else { "4:2:0" }, if f.is_10bit() { 10 } else { 8 })
+        };
+        let v: Vec<String> = self.iter().map(one).collect();
+        if v.is_empty() {
+            "aucun".into()
+        } else {
+            v.join(", ")
+        }
+    }
+}
+
+impl std::ops::BitOr for FormatSet {
+    type Output = FormatSet;
+    fn bitor(self, o: FormatSet) -> FormatSet {
+        self.union(o)
+    }
+}
+
+/// Préférences d'image du client (overlay « Couleur 4:4:4 », « Préférer 10 bits ») et écran HDR.
+/// Sur le fil (`GRX-COD` clé 5) : un octet, bit 0 = 4:4:4, bit 1 = 10 bits, bit 2 = écran HDR ;
+/// les autres bits (futurs) sont ignorés.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FormatPrefs {
+    pub yuv444: bool,
+    pub ten_bit: bool,
+    pub hdr_display: bool,
+}
+
+impl FormatPrefs {
+    pub fn to_byte(self) -> u8 {
+        self.yuv444 as u8 | (self.ten_bit as u8) << 1 | (self.hdr_display as u8) << 2
+    }
+    pub fn from_byte(b: u8) -> FormatPrefs {
+        FormatPrefs { yuv444: b & 1 != 0, ten_bit: b & 2 != 0, hdr_display: b & 4 != 0 }
+    }
+}
+
+/// `run --chroma auto|420|444` : sous-échantillonnage voulu par le host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ChromaPref {
+    /// Suit la préférence du client (overlay « Couleur 4:4:4 »).
+    #[default]
+    Auto,
+    /// Toujours 4:2:0.
+    Yuv420,
+    /// 4:4:4 dès que les deux côtés le savent.
+    Yuv444,
+}
+
+/// Fonction de transfert du flux (`GRX-CDC` clé 6) : 0 = SDR BT.709, 1 = HDR10 (PQ, BT.2020).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Transfer {
+    #[default]
+    Sdr,
+    Pq,
 }
 
 /// Une capacité : ce backend sait décoder (client) ou encoder (host) ce codec dans ces formats.
@@ -243,10 +331,12 @@ pub struct ClientCodecs {
     /// Envoyé après une panne de décodeur en cours de session (journal côté host).
     pub renegotiate: bool,
     pub decoder_mode: DecoderMode,
+    /// Préférences 4:4:4 / 10 bits et écran HDR (clé 5, phase 2).
+    pub prefs: FormatPrefs,
 }
 
 impl ClientCodecs {
-    /// Codecs décodables en 4:2:0 8 bits (le format diffusé aujourd'hui).
+    /// Codecs décodables en 4:2:0 8 bits (le format de base, toujours possible).
     pub fn decodable(&self) -> CodecSet {
         self.decoders.iter().filter(|c| c.formats.contains(FormatSet::YUV420_8)).map(|c| c.codec).collect()
     }
@@ -260,6 +350,16 @@ impl ClientCodecs {
     pub fn backend_for(&self, c: VideoCodec) -> Option<BackendId> {
         self.decoders.iter().find(|d| d.codec == c).map(|d| d.backend)
     }
+
+    /// Formats décodables pour ce codec (toutes voies confondues).
+    pub fn formats_for(&self, c: VideoCodec) -> FormatSet {
+        formats_of(&self.decoders, c)
+    }
+}
+
+/// Union des formats des capacités de `caps` pour le codec `c`.
+pub fn formats_of(caps: &[CodecCap], c: VideoCodec) -> FormatSet {
+    caps.iter().filter(|d| d.codec == c).fold(FormatSet::default(), |a, d| a.union(d.formats))
 }
 
 /// Pourquoi le host a choisi ce codec.
@@ -312,11 +412,15 @@ impl ChoiceReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCodec {
     pub codec: VideoCodec,
-    /// Format du flux (un seul bit ; 4:2:0 8 bits aujourd'hui).
+    /// Format du flux (un seul bit).
     pub format: FormatSet,
-    /// Encodeurs matériels disponibles sur le host.
+    /// Encodeurs disponibles sur le host.
     pub encoders: Vec<CodecCap>,
     pub reason: ChoiceReason,
+    /// Encodeur réellement utilisé (clé 5, phase 2 ; `None` : ancien host ou backend inconnu).
+    pub encoder: Option<BackendId>,
+    /// Fonction de transfert du flux (clé 6, phase 2).
+    pub transfer: Transfer,
 }
 
 impl HostCodec {
@@ -330,6 +434,9 @@ const K_CAPS: u8 = 1; // client : décodeurs ; host : encodeurs
 const K_CODEC: u8 = 2; // client : préférence (0 = auto) ; host : codec choisi (obligatoire)
 const K_FLAGS: u8 = 3; // client : bit 0 = renégociation ; host : raison du choix
 const K_MODE: u8 = 4; // client : DecoderMode ; host : format du flux (un bit de FormatSet)
+const K_PREFS: u8 = 5; // client : FormatPrefs ; host : encodeur utilisé (BackendId)
+const K_ENCODER: u8 = K_PREFS;
+const K_TRANSFER: u8 = 6; // host : Transfer (0 SDR, 1 PQ)
 
 fn encode_entries(magic: &[u8; 7], entries: &[(u8, Vec<u8>)]) -> Vec<u8> {
     let mut v = Vec::with_capacity(9 + entries.iter().map(|e| 2 + e.1.len()).sum::<usize>());
@@ -415,6 +522,7 @@ impl ClientCodecs {
                 (K_CODEC, vec![self.preferred.map_or(0, VideoCodec::id)]),
                 (K_FLAGS, vec![self.renegotiate as u8]),
                 (K_MODE, vec![mode]),
+                (K_PREFS, vec![self.prefs.to_byte()]),
             ],
         )
     }
@@ -445,6 +553,7 @@ impl ClientCodecs {
                         _ => return None,
                     }
                 }
+                K_PREFS => c.prefs = FormatPrefs::from_byte(one(v)?),
                 _ => {}
             }
         }
@@ -454,19 +563,22 @@ impl ClientCodecs {
 
 impl HostCodec {
     pub fn encode(&self) -> Vec<u8> {
-        encode_entries(
-            HOST_CODEC_MAGIC,
-            &[
-                (K_CAPS, encode_caps(&self.encoders)),
-                (K_CODEC, vec![self.codec.id()]),
-                (K_FLAGS, vec![self.reason.id()]),
-                (K_MODE, vec![self.format.bits()]),
-            ],
-        )
+        let mut e = vec![
+            (K_CAPS, encode_caps(&self.encoders)),
+            (K_CODEC, vec![self.codec.id()]),
+            (K_FLAGS, vec![self.reason.id()]),
+            (K_MODE, vec![self.format.bits()]),
+            (K_TRANSFER, vec![(self.transfer == Transfer::Pq) as u8]),
+        ];
+        if let Some(b) = self.encoder {
+            e.push((K_ENCODER, vec![b.0]));
+        }
+        encode_entries(HOST_CODEC_MAGIC, &e)
     }
 
     pub fn decode(b: &[u8]) -> Option<HostCodec> {
         let (mut codec, mut reason, mut format, mut encoders) = (None, ChoiceReason::Auto, FormatSet::YUV420_8, Vec::new());
+        let (mut encoder, mut transfer) = (None, Transfer::Sdr);
         for (k, v) in decode_entries(HOST_CODEC_MAGIC, b)? {
             match k {
                 K_CAPS => encoders = decode_caps(v)?,
@@ -478,11 +590,21 @@ impl HostCodec {
                         return None;
                     }
                 }
+                // Backend inconnu (version future) : simplement non affiché.
+                K_ENCODER => encoder = Some(BackendId(one(v)?)).filter(|b| b.known()),
+                K_TRANSFER => {
+                    transfer = match one(v)? {
+                        0 => Transfer::Sdr,
+                        1 => Transfer::Pq,
+                        // Transfert inconnu : couleurs fausses assurées, on refuse.
+                        _ => return None,
+                    }
+                }
                 _ => {}
             }
         }
         // Le codec est obligatoire.
-        Some(HostCodec { codec: codec?, format, encoders, reason })
+        Some(HostCodec { codec: codec?, format, encoders, reason, encoder, transfer })
     }
 }
 
@@ -532,6 +654,52 @@ pub fn choose(host_pref: CodecPref, host_enc: CodecSet, client: Option<&ClientCo
     }
 }
 
+/// Format du flux pour `codec` (déjà choisi par [`choose`]).
+///
+/// * `host_enc` : encodeurs du host (formats par backend) ; `client` : annonce `GRX-COD` ;
+/// * `chroma` : `run --chroma` ; `hdr_source` : l'écran capturé est en HDR.
+///
+/// Règles : sans annonce, 4:2:0 8 bits. Sinon, candidats = formats encodables ∩ décodables pour
+/// ce codec. 4:4:4 voulu si `--chroma 444`, ou `auto` et l'overlay du client le demande ; 10 bits
+/// voulu si le client le préfère, ou si la source et l'écran du client sont HDR. On essaie
+/// (4:4:4 voulu, 10 bits voulu), puis sans 10 bits, puis sans 4:4:4, puis 4:2:0 8 bits (le
+/// format de base de tous les encodeurs/décodeurs).
+pub fn choose_format(
+    codec: VideoCodec,
+    host_enc: &[CodecCap],
+    client: Option<&ClientCodecs>,
+    chroma: ChromaPref,
+    hdr_source: bool,
+) -> FormatSet {
+    let Some(cl) = client else { return FormatSet::YUV420_8 };
+    let common = formats_of(host_enc, codec).intersect(cl.formats_for(codec));
+    let want444 = match chroma {
+        ChromaPref::Yuv420 => false,
+        ChromaPref::Yuv444 => true,
+        ChromaPref::Auto => cl.prefs.yuv444,
+    };
+    let want10 = cl.prefs.ten_bit || (hdr_source && cl.prefs.hdr_display);
+    [(want444, want10), (want444, false), (false, want10)]
+        .into_iter()
+        .map(|(a, b)| FormatSet::single(a, b))
+        .find(|f| common.contains(*f))
+        .unwrap_or(FormatSet::YUV420_8)
+}
+
+/// Transfert du flux : PQ seulement pour une source HDR encodée en 10 bits ; sinon SDR (une source
+/// HDR en 8 bits est convertie en SDR par le host).
+pub fn choose_transfer(format: FormatSet, hdr_source: bool) -> Transfer {
+    if hdr_source && format.is_10bit() {
+        Transfer::Pq
+    } else {
+        Transfer::Sdr
+    }
+}
+
 #[cfg(test)]
 #[path = "codec_neg_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "codec_neg_phase2_tests.rs"]
+mod phase2_tests;

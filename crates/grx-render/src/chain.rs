@@ -5,8 +5,9 @@
 //! Si tout échoue, [`ChainError`] décrit chaque tentative et les solutions ; le client annonce
 //! alors le codec comme indisponible et le host passe en H.264.
 //!
-//! Point d'extension (phase 2) : ajouter un variant (décodeur logiciel…) à [`DecoderKind`] et à
-//! [`DecoderKind::CHAIN`], et son identifiant de protocole dans [`DecoderKind::backend_id`].
+//! Phase 2 : voies logicielles de secours ([`DecoderKind::OpenH264`] pour H.264,
+//! [`DecoderKind::FfmpegSoftware`] pour HEVC/AV1/4:4:4) après les voies matérielles, et choix de
+//! l'utilisateur ([`DecoderPref`] : Auto = matériel puis logiciel, Matériel, Logiciel).
 
 use grx_video::Codec;
 
@@ -17,17 +18,70 @@ pub enum DecoderKind {
     MediaFoundation,
     /// libavcodec + hwaccel D3D11VA (zéro copie, DLL LGPL chargées dynamiquement).
     FfmpegD3d11va,
+    /// OpenH264 de Cisco (CPU, H.264 4:2:0 8 bits), image téléversée sur le GPU.
+    OpenH264,
+    /// libavcodec sans hwaccel (CPU : H.264/HEVC/AV1, 4:2:0/4:4:4, 8/10 bits).
+    FfmpegSoftware,
+}
+
+/// Choix de l'utilisateur (`play --decoder`, ligne « Décodeur » de l'overlay).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DecoderPref {
+    /// Matériel d'abord, logiciel en secours.
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+
+impl DecoderPref {
+    pub fn parse(s: &str) -> Result<DecoderPref, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(DecoderPref::Auto),
+            "hardware" | "materiel" | "matériel" | "hw" => Ok(DecoderPref::Hardware),
+            "software" | "logiciel" | "sw" => Ok(DecoderPref::Software),
+            o => Err(format!("décodeur « {o} » inconnu (auto, hardware, software)")),
+        }
+    }
+
+    /// Voies essayées, dans l'ordre.
+    pub fn chain(self) -> &'static [DecoderKind] {
+        match self {
+            DecoderPref::Auto => &DecoderKind::ALL,
+            DecoderPref::Hardware => &DecoderKind::CHAIN,
+            DecoderPref::Software => &DecoderKind::SOFTWARE_CHAIN,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DecoderPref::Auto => "Auto",
+            DecoderPref::Hardware => "Matériel",
+            DecoderPref::Software => "Logiciel",
+        }
+    }
 }
 
 impl DecoderKind {
-    /// Ordre d'essai.
+    /// Voies matérielles, dans l'ordre d'essai (comportement phase 1).
     pub const CHAIN: [DecoderKind; 2] = [DecoderKind::MediaFoundation, DecoderKind::FfmpegD3d11va];
+    /// Voies logicielles (secours).
+    pub const SOFTWARE_CHAIN: [DecoderKind; 2] = [DecoderKind::OpenH264, DecoderKind::FfmpegSoftware];
+    /// Toutes les voies : matérielles puis logicielles.
+    pub const ALL: [DecoderKind; 4] =
+        [DecoderKind::MediaFoundation, DecoderKind::FfmpegD3d11va, DecoderKind::OpenH264, DecoderKind::FfmpegSoftware];
+
+    pub fn is_software(self) -> bool {
+        matches!(self, DecoderKind::OpenH264 | DecoderKind::FfmpegSoftware)
+    }
 
     /// Nom court des options (`--disable-decoder mf-hevc`).
     pub fn key(self) -> &'static str {
         match self {
             DecoderKind::MediaFoundation => "mf",
             DecoderKind::FfmpegD3d11va => "ffmpeg",
+            DecoderKind::OpenH264 => "openh264",
+            DecoderKind::FfmpegSoftware => "ffsw",
         }
     }
 
@@ -36,6 +90,8 @@ impl DecoderKind {
         match self {
             DecoderKind::MediaFoundation => "MF matériel",
             DecoderKind::FfmpegD3d11va => "FFmpeg D3D11VA",
+            DecoderKind::OpenH264 => "OpenH264 (logiciel)",
+            DecoderKind::FfmpegSoftware => "FFmpeg logiciel",
         }
     }
 
@@ -44,6 +100,7 @@ impl DecoderKind {
         match self {
             DecoderKind::MediaFoundation => 1,
             DecoderKind::FfmpegD3d11va => 2,
+            DecoderKind::OpenH264 | DecoderKind::FfmpegSoftware => 3,
         }
     }
 }
@@ -77,17 +134,17 @@ impl DisabledDecoders {
     pub fn parse(s: &str) -> Result<DisabledDecoders, String> {
         let mut entries = Vec::new();
         for tok in s.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty() && t != "none") {
-            let kind_of = |k: &str| DecoderKind::CHAIN.into_iter().find(|d| d.key() == k);
+            let kind_of = |k: &str| DecoderKind::ALL.into_iter().find(|d| d.key() == k);
             let codec_of = |k: &str| [Codec::H264, Codec::Hevc, Codec::Av1].into_iter().find(|c| codec_key(*c) == k);
             let e = match tok.split_once('-') {
                 Some((k, c)) => match (kind_of(k), codec_of(c)) {
                     (Some(k), Some(c)) => (Some(k), Some(c)),
-                    _ => return Err(format!("« {tok} » : attendu mf|ffmpeg[-h264|-hevc|-av1] ou h264|hevc|av1")),
+                    _ => return Err(format!("« {tok} » : attendu mf|ffmpeg|openh264|ffsw[-h264|-hevc|-av1] ou h264|hevc|av1")),
                 },
                 None => match (kind_of(&tok), codec_of(&tok)) {
                     (Some(k), _) => (Some(k), None),
                     (_, Some(c)) => (None, Some(c)),
-                    _ => return Err(format!("« {tok} » : attendu mf|ffmpeg[-h264|-hevc|-av1] ou h264|hevc|av1")),
+                    _ => return Err(format!("« {tok} » : attendu mf|ffmpeg|openh264|ffsw[-h264|-hevc|-av1] ou h264|hevc|av1")),
                 },
             };
             entries.push(e);
@@ -144,7 +201,8 @@ impl ChainError {
 
 impl std::fmt::Display for ChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "aucun décodeur matériel {} utilisable sur ce PC", codec_label(self.codec))?;
+        let sw = !self.attempts.is_empty() && self.attempts.iter().all(|a| a.kind.is_software());
+        write!(f, "aucun décodeur {} {} utilisable sur ce PC", if sw { "logiciel" } else { "matériel" }, codec_label(self.codec))?;
         if !self.attempts.is_empty() {
             let d: Vec<String> = self.attempts.iter().map(|a| format!("{} : {}", a.kind.label(), a.error)).collect();
             write!(f, " ({})", d.join(" ; "))?;
@@ -160,10 +218,20 @@ impl std::error::Error for ChainError {}
 pub fn create_with<T>(
     codec: Codec,
     disabled: &DisabledDecoders,
+    make: impl FnMut(DecoderKind) -> Result<T, String>,
+) -> Result<(T, DecoderKind, Vec<Attempt>), ChainError> {
+    create_with_pref(codec, disabled, DecoderPref::Hardware, make)
+}
+
+/// Comme [`create_with`], sur les voies de `pref` ([`DecoderPref::chain`]).
+pub fn create_with_pref<T>(
+    codec: Codec,
+    disabled: &DisabledDecoders,
+    pref: DecoderPref,
     mut make: impl FnMut(DecoderKind) -> Result<T, String>,
 ) -> Result<(T, DecoderKind, Vec<Attempt>), ChainError> {
     let mut attempts = Vec::new();
-    for kind in DecoderKind::CHAIN {
+    for &kind in pref.chain() {
         if disabled.is_disabled(kind, codec) {
             attempts.push(Attempt { kind, error: "désactivé (--disable-decoder)".into() });
             continue;
@@ -179,3 +247,7 @@ pub fn create_with<T>(
 #[cfg(test)]
 #[path = "chain_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "chain_pref_tests.rs"]
+mod pref_tests;

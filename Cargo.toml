@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/grx-core", "crates/grx-host", "crates/grx-client", "crates/grx-video", "crates/grx-input", "crates/grx-audio", "crates/grx-transport", "crates/grx-render", "crates/grx-gui", "crates/grx-portmap", "crates/grx-update"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 

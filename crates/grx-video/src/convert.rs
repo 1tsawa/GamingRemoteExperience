@@ -1,4 +1,6 @@
-//! Conversion BGRA -> NV12 (+ mise à l'échelle) entièrement sur le GPU via ID3D11VideoProcessor.
+//! Conversion BGRA -> NV12 / P010 (+ mise à l'échelle) entièrement sur le GPU via
+//! ID3D11VideoProcessor. Mode HDR10 : entrée R10G10B10A2 PQ/BT.2020 (sortie de
+//! `shader::HdrPass`), sortie P010 PQ/BT.2020 (espaces couleur `ID3D11VideoContext1`).
 
 use crate::error::{Result, VideoError, WinCtx};
 use windows::core::Interface;
@@ -7,6 +9,15 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 const POOL_SIZE: usize = 6;
+
+/// Colorimétrie de la conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorMode {
+    /// RGB sRGB plein débit -> YCbCr BT.709 plage limitée.
+    Sdr709,
+    /// RGB PQ/BT.2020 plein débit -> YCbCr PQ/BT.2020 plage limitée (HDR10).
+    Pq2020,
+}
 
 pub(crate) struct Converter {
     device: ID3D11Device,
@@ -27,10 +38,27 @@ pub(crate) struct Converter {
     context: ID3D11DeviceContext,
     // Texture intermédiaire (BIND_RENDER_TARGET) pour les sources qui n'ont pas ce flag.
     staging: Option<ID3D11Texture2D>,
+    out_format: DXGI_FORMAT,
+    color: ColorMode,
 }
 
 impl Converter {
     pub fn new(device: &ID3D11Device, in_w: u32, in_h: u32, out_w: u32, out_h: u32, fps: u32) -> Result<Self> {
+        Self::with_format(device, in_w, in_h, out_w, out_h, fps, false, ColorMode::Sdr709)
+    }
+
+    /// Comme [`Converter::new`] ; `ten_bit` : sortie P010 au lieu de NV12.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_format(
+        device: &ID3D11Device,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
+        fps: u32,
+        ten_bit: bool,
+        color: ColorMode,
+    ) -> Result<Self> {
         let vdev: ID3D11VideoDevice = device.cast().ctx("ID3D11VideoDevice")?;
         let ctx = unsafe { device.GetImmediateContext() }.ctx("GetImmediateContext")?;
         let vctx: ID3D11VideoContext = ctx.cast().ctx("ID3D11VideoContext")?;
@@ -57,6 +85,8 @@ impl Converter {
             input_views: Vec::new(),
             context: ctx,
             staging: None,
+            out_format: if ten_bit { DXGI_FORMAT_P010 } else { DXGI_FORMAT_NV12 },
+            color,
         };
         c.setup_processor();
         c.create_pool()?;
@@ -95,8 +125,16 @@ impl Converter {
             // Entrée : RGB plein débit (0-255). Sortie : YCbCr BT.709, plage limitée 16-235.
             let in_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 };
             let out_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: (1 << 2) | (1 << 4) };
-            self.vctx.VideoProcessorSetStreamColorSpace(vp, 0, &in_cs);
-            self.vctx.VideoProcessorSetOutputColorSpace(vp, &out_cs);
+            match (self.color, self.vctx.cast::<ID3D11VideoContext1>()) {
+                (ColorMode::Pq2020, Ok(v1)) => {
+                    v1.VideoProcessorSetStreamColorSpace1(vp, 0, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                    v1.VideoProcessorSetOutputColorSpace1(vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020);
+                }
+                _ => {
+                    self.vctx.VideoProcessorSetStreamColorSpace(vp, 0, &in_cs);
+                    self.vctx.VideoProcessorSetOutputColorSpace(vp, &out_cs);
+                }
+            }
             let src = RECT { left: 0, top: 0, right: self.in_w as i32, bottom: self.in_h as i32 };
             let dst = RECT { left: 0, top: 0, right: self.out_w as i32, bottom: self.out_h as i32 };
             self.vctx.VideoProcessorSetStreamSourceRect(vp, 0, true, Some(&src));
@@ -112,7 +150,7 @@ impl Converter {
             Height: self.out_h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
+            Format: self.out_format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
@@ -121,7 +159,7 @@ impl Converter {
         };
         for _ in 0..POOL_SIZE {
             let mut t = None;
-            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut t)) }.ctx("CreateTexture2D(NV12)")?;
+            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut t)) }.ctx("CreateTexture2D(NV12/P010)")?;
             let t = t.unwrap();
             let vd = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,

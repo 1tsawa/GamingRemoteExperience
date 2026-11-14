@@ -1,33 +1,31 @@
-//! Encodeur H.264/H.265 matériel via Media Foundation (MFT NVENC de NVIDIA).
+﻿//! Encodeur H.264/HEVC/AV1 matÃ©riel via les MFT Media Foundation des pilotes (NVIDIA NVENC,
+//! AMD AMF, Intel Quick Sync), choisis sur l'adaptateur de l'Ã©cran capturÃ© (`MFTEnum2` +
+//! `MFT_ENUM_ADAPTER_LUID`).
 //!
-//! Entrée : textures D3D11 (zéro copie CPU) converties en NV12 par le VideoProcessor GPU.
-//! Le MFT NVIDIA est *asynchrone* : on pilote sa machine à événements
-//! (`METransformNeedInput` / `METransformHaveOutput`) en mode synchrone côté appelant.
+//! EntrÃ©e : textures D3D11 (zÃ©ro copie CPU) converties en NV12 (8 bits) ou P010 (10 bits) par le
+//! VideoProcessor GPU. Les MFT matÃ©riels sont *asynchrones* : leur machine Ã  Ã©vÃ©nements
+//! (`METransformNeedInput` / `METransformHaveOutput`) est pilotÃ©e par [`crate::mft_async::pump`].
+//! RÃ©glages basse latence communs (CODECAPI) : CBR, `AVLowLatencyMode`, 0 image B, GOP infini
+//! (IDR Ã  la demande), `QualityVsSpeed` = 0, VBV ~ 1,5 image ; acceptÃ©s par les trois vendeurs
+//! (un rÃ©glage refusÃ© est seulement journalisÃ©, voir [`MfEncoder::warnings`]).
 
-use crate::capture::CapturedFrame;
-use crate::convert::Converter;
+use crate::convert::{ColorMode, Converter};
 use crate::error::{Result, VideoError, WinCtx};
+use crate::mft_async::{self, AsyncMft, MftEvent, PumpError};
+use crate::select::Vendor;
 use crate::{gpu, nal, Codec, EncodedFrame, EncoderConfig};
 use std::collections::VecDeque;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID, PWSTR, VARIANT};
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Com::CoTaskMemFree;
 
-/// Backend d'encodage effectivement utilisé.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EncoderBackend {
-    /// MFT matériel Media Foundation (nom convivial fourni par le driver).
-    MediaFoundation { name: String },
-}
-
 static MF_INIT: Once = Once::new();
 
-fn mf_startup() -> Result<()> {
+pub(crate) fn mf_startup() -> Result<()> {
     let mut res: Result<()> = Ok(());
     MF_INIT.call_once(|| {
         res = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) }.ctx("MFStartup");
@@ -35,30 +33,18 @@ fn mf_startup() -> Result<()> {
     res
 }
 
-/// Codecs pour lesquels un encodeur MFT matériel est enregistré (H.264, HEVC, AV1), avec le nom
-/// du premier (NVIDIA d'abord). Simple énumération (pas de création) ; résultat mis en cache.
-/// La création peut encore échouer : l'appelant se replie alors sur H.264.
-pub fn available_encoders() -> Vec<(Codec, String)> {
-    static CACHE: std::sync::OnceLock<Vec<(Codec, String)>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            gpu::init_com();
-            if mf_startup().is_err() {
-                return Vec::new();
-            }
-            [Codec::H264, Codec::Hevc, Codec::Av1]
-                .into_iter()
-                .filter_map(|c| {
-                    let mut names = enum_hw_encoders(c).ok()?.into_iter().map(|(_, n)| n).collect::<Vec<_>>();
-                    names.sort_by_key(|n| !n.to_ascii_lowercase().contains("nvidia"));
-                    names.into_iter().next().map(|n| (c, n))
-                })
-                .collect()
-        })
-        .clone()
+fn alloc_string(a: &IMFActivate, key: &GUID) -> Option<String> {
+    let mut p = PWSTR::null();
+    let mut len = 0u32;
+    unsafe { a.GetAllocatedString(key, &mut p, &mut len) }.ok()?;
+    let s = unsafe { p.to_string() }.ok();
+    unsafe { CoTaskMemFree(Some(p.0 as *const _)) };
+    s
 }
 
-fn enum_hw_encoders(codec: Codec) -> Result<Vec<(IMFActivate, String)>> {
+/// MFT encodeurs matÃ©riels de `codec` : `(activation, nom, vendeur)`. Avec `luid`, seulement
+/// ceux de cet adaptateur (`MFTEnum2`, Windows 10 1703+) ; sinon tous.
+pub(crate) fn enum_hw_encoders(codec: Codec, luid: Option<i64>) -> Result<Vec<(IMFActivate, String, Vendor)>> {
     let out_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: match codec {
@@ -69,32 +55,31 @@ fn enum_hw_encoders(codec: Codec) -> Result<Vec<(IMFActivate, String)>> {
     };
     let mut pp: *mut Option<IMFActivate> = std::ptr::null_mut();
     let mut count = 0u32;
-    unsafe {
-        MFTEnumEx(
-            MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0),
-            None,
-            Some(&out_info),
-            &mut pp,
-            &mut count,
-        )
+    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    let by_luid = luid.and_then(|l| {
+        let mut attrs: Option<IMFAttributes> = None;
+        unsafe { MFCreateAttributes(&mut attrs, 1) }.ok()?;
+        let attrs = attrs?;
+        unsafe { attrs.SetBlob(&MFT_ENUM_ADAPTER_LUID, &l.to_le_bytes()) }.ok()?;
+        unsafe { MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER, flags, None, Some(&out_info), &attrs, &mut pp, &mut count) }.ok()
+    });
+    if by_luid.is_none() {
+        pp = std::ptr::null_mut();
+        count = 0;
+        unsafe { MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, None, Some(&out_info), &mut pp, &mut count) }
+            .ctx("MFTEnumEx")?;
     }
-    .ctx("MFTEnumEx")?;
-    let mut cands: Vec<(IMFActivate, String)> = Vec::new();
+    let mut cands: Vec<(IMFActivate, String, Vendor)> = Vec::new();
     if pp.is_null() {
         return Ok(cands);
     }
     for i in 0..count as usize {
-        // Prend possession de chaque IMFActivate (libéré au drop).
+        // Prend possession de chaque IMFActivate (libÃ©rÃ© au drop).
         if let Some(a) = unsafe { std::ptr::read(pp.add(i)) } {
-            let mut name = String::new();
-            let mut p = PWSTR::null();
-            let mut len = 0u32;
-            if unsafe { a.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut p, &mut len) }.is_ok() {
-                name = unsafe { p.to_string() }.unwrap_or_default();
-                unsafe { CoTaskMemFree(Some(p.0 as *const _)) };
-            }
-            cands.push((a, name));
+            let name = alloc_string(&a, &MFT_FRIENDLY_NAME_Attribute).unwrap_or_default();
+            let ven = alloc_string(&a, &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute);
+            let vendor = Vendor::from_mft(ven.as_deref(), &name);
+            cands.push((a, name, vendor));
         }
     }
     unsafe { CoTaskMemFree(Some(pp as *const _)) };
@@ -107,9 +92,11 @@ struct RawOutput {
     pts_100ns: i64,
 }
 
-pub struct Encoder {
+pub(crate) struct MfEncoder {
     cfg: EncoderConfig,
-    backend: EncoderBackend,
+    pub name: String,
+    #[allow(dead_code)]
+    pub vendor: Vendor,
     device: ID3D11Device,
     conv: Converter,
     mft: IMFTransform,
@@ -136,25 +123,22 @@ fn type_u64(t: &IMFMediaType, key: &GUID, hi: u32, lo: u32) -> Result<()> {
     unsafe { t.SetUINT64(key, ((hi as u64) << 32) | lo as u64) }.ctx("SetUINT64")
 }
 
-impl Encoder {
-    /// Crée un encodeur avec son propre device D3D11 (adaptateur NVIDIA préféré).
-    /// Pour encoder les textures d'un [`crate::ScreenCapturer`], utiliser plutôt [`Encoder::with_device`].
-    pub fn new(cfg: EncoderConfig) -> Result<Self> {
-        gpu::init_com();
-        let adapter = gpu::preferred_adapter()?;
-        let (device, _ctx) = gpu::create_device_for_adapter(&adapter)?;
-        Self::with_device(&device, cfg)
-    }
-
-    /// Crée un encodeur sur le device D3D11 `device` (celui du capturer : les textures doivent
-    /// vivre sur le même device).
-    pub fn with_device(device: &ID3D11Device, cfg: EncoderConfig) -> Result<Self> {
+impl MfEncoder {
+    /// CrÃ©e l'encodeur du MFT `act` sur le device D3D11 `device` (celui du capturer : les textures
+    /// doivent vivre sur le mÃªme device).
+    pub fn with_activate(device: &ID3D11Device, cfg: EncoderConfig, act: &IMFActivate, name: String, vendor: Vendor) -> Result<Self> {
         gpu::init_com();
         mf_startup()?;
+        if cfg.format.is_444() {
+            return Err(VideoError::Other("les MFT matÃ©riels n'encodent pas en 4:4:4".into()));
+        }
+        if cfg.format.is_10bit() && cfg.codec == Codec::H264 {
+            return Err(VideoError::Other("H.264 10 bits non supportÃ©".into()));
+        }
+        let mft = unsafe { act.ActivateObject::<IMFTransform>() }.ctx("IMFActivate::ActivateObject")?;
         unsafe { timeBeginPeriod(1) };
-        let (mft, name) = Self::create_mft(cfg.codec)?;
 
-        // Débloque le mode asynchrone + low latency.
+        // DÃ©bloque le mode asynchrone + low latency.
         let attrs = unsafe { mft.GetAttributes() }.ctx("IMFTransform::GetAttributes")?;
         let is_async = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
         if !is_async {
@@ -175,9 +159,11 @@ impl Encoder {
         let codec_api: ICodecAPI = mft.cast().ctx("ICodecAPI")?;
         let events: IMFMediaEventGenerator = mft.cast().ctx("IMFMediaEventGenerator")?;
 
-        let mut enc = Encoder {
-            conv: Converter::new(device, cfg.width, cfg.height, cfg.width, cfg.height, cfg.fps)?,
-            backend: EncoderBackend::MediaFoundation { name },
+        let color = if cfg.hdr { ColorMode::Pq2020 } else { ColorMode::Sdr709 };
+        let mut enc = MfEncoder {
+            conv: Converter::with_format(device, cfg.width, cfg.height, cfg.width, cfg.height, cfg.fps, cfg.format.is_10bit(), color)?,
+            name,
+            vendor,
             device: device.clone(),
             mft,
             events,
@@ -199,25 +185,6 @@ impl Encoder {
         Ok(enc)
     }
 
-    fn create_mft(codec: Codec) -> Result<(IMFTransform, String)> {
-        let mut cands = enum_hw_encoders(codec)?;
-        if cands.is_empty() {
-            return Err(VideoError::NoEncoder(codec));
-        }
-        // Préfère NVIDIA.
-        cands.sort_by_key(|(_, n)| !n.to_ascii_lowercase().contains("nvidia"));
-        let mut last_err = None;
-        for (a, n) in cands {
-            match unsafe { a.ActivateObject::<IMFTransform>() } {
-                Ok(t) => return Ok((t, n)),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        match last_err {
-            Some(e) => Err(VideoError::Win { context: "IMFActivate::ActivateObject", source: e }),
-            None => Err(VideoError::NoEncoder(codec)),
-        }
-    }
 
     fn configure(&mut self) -> Result<()> {
         let cfg = self.cfg.clone();
@@ -227,7 +194,7 @@ impl Encoder {
                 self.warnings.push(format!("{what}: {e}"));
             }
         };
-        // --- Réglages low-latency (avant SetOutputType) ---
+        // --- RÃ©glages low-latency (avant SetOutputType) ---
         warn(
             "RateControlMode=CBR",
             set_u32(&api, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32),
@@ -235,14 +202,14 @@ impl Encoder {
         warn("MeanBitRate", set_u32(&api, &CODECAPI_AVEncCommonMeanBitRate, cfg.bitrate_kbps * 1000));
         warn("LowLatencyMode", unsafe { api.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true)) });
         warn("BPictureCount=0", set_u32(&api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0));
-        // GOP « infini » : des IDR uniquement à la demande (request_keyframe).
+        // GOP Â« infini Â» : des IDR uniquement Ã  la demande (request_keyframe).
         warn("GOPSize=inf", set_u32(&api, &CODECAPI_AVEncMPVGOPSize, u32::MAX));
         warn("QualityVsSpeed", set_u32(&api, &CODECAPI_AVEncCommonQualityVsSpeed, 0));
-        // VBV ~ 1,5 image : lisse le débit sans ajouter de latence.
+        // VBV ~ 1,5 image : lisse le dÃ©bit sans ajouter de latence.
         let vbv_bits = (cfg.bitrate_kbps as u64 * 1000 * 3 / 2 / cfg.fps.max(1) as u64) as u32;
         warn("BufferSize", set_u32(&api, &CODECAPI_AVEncCommonBufferSize, vbv_bits));
 
-        // --- Type de sortie (flux compressé) ---
+        // --- Type de sortie (flux compressÃ©) ---
         let out_t = unsafe { MFCreateMediaType() }.ctx("MFCreateMediaType")?;
         unsafe {
             out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("MAJOR_TYPE")?;
@@ -261,21 +228,23 @@ impl Encoder {
             type_u64(&out_t, &MF_MT_FRAME_RATE, cfg.fps, 1)?;
             type_u64(&out_t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
             out_t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("INTERLACE")?;
-            let profile = match cfg.codec {
-                Codec::H264 => eAVEncH264VProfile_High.0,
-                Codec::Hevc => eAVEncH265VProfile_Main_420_8.0,
-                Codec::Av1 => eAVEncAV1VProfile_Main_420_8.0,
+            let ten = cfg.format.is_10bit();
+            let profile = match (cfg.codec, ten) {
+                (Codec::H264, _) => eAVEncH264VProfile_High.0,
+                (Codec::Hevc, false) => eAVEncH265VProfile_Main_420_8.0,
+                (Codec::Hevc, true) => eAVEncH265VProfile_Main_420_10.0,
+                (Codec::Av1, false) => eAVEncAV1VProfile_Main_420_8.0,
+                (Codec::Av1, true) => eAVEncAV1VProfile_Main_420_10.0,
             };
-            let _ = out_t.SetUINT32(&MF_MT_MPEG2_PROFILE, profile as u32);
-            // Métadonnées colorimétriques (VUI) : BT.709, plage limitée — cohérent avec le VideoProcessor.
-            let _ = out_t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32);
-            let _ = out_t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32);
-            let _ = out_t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
-            let _ = out_t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
+            out_t.SetUINT32(&MF_MT_MPEG2_PROFILE, profile as u32).ctx("MPEG2_PROFILE")?;
+            // MÃ©tadonnÃ©es colorimÃ©triques (VUI) : BT.709 SDR ou BT.2020/PQ (HDR10), plage
+            // limitÃ©e â€” cohÃ©rent avec le VideoProcessor.
+            set_color(&out_t, cfg.hdr);
             self.mft.SetOutputType(0, &out_t, 0).ctx("SetOutputType")?;
         }
 
-        // --- Type d'entrée : NV12 ---
+        // --- Type d'entrÃ©e : NV12 (8 bits) ou P010 (10 bits) ---
+        let want = if cfg.format.is_10bit() { MFVideoFormat_P010 } else { MFVideoFormat_NV12 };
         let mut set = false;
         for i in 0.. {
             let t = match unsafe { self.mft.GetInputAvailableType(0, i) } {
@@ -283,27 +252,27 @@ impl Encoder {
                 Err(_) => break,
             };
             let sub = unsafe { t.GetGUID(&MF_MT_SUBTYPE) }.ctx("input subtype")?;
-            if sub == MFVideoFormat_NV12 {
+            if sub == want {
                 unsafe {
                     type_u64(&t, &MF_MT_FRAME_SIZE, cfg.width, cfg.height)?;
                     type_u64(&t, &MF_MT_FRAME_RATE, cfg.fps, 1)?;
                     type_u64(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
                     let _ = t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
-                    let _ = t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32);
-                    let _ = t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32);
-                    let _ = t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
-                    let _ = t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
-                    self.mft.SetInputType(0, &t, 0).ctx("SetInputType(NV12)")?;
+                    set_color(&t, cfg.hdr);
+                    self.mft.SetInputType(0, &t, 0).ctx("SetInputType")?;
                 }
                 set = true;
                 break;
             }
         }
         if !set {
-            return Err(VideoError::Other("MFT does not accept NV12 input".into()));
+            return Err(VideoError::Other(format!(
+                "le MFT n'accepte pas l'entrÃ©e {}",
+                if cfg.format.is_10bit() { "P010 (10 bits)" } else { "NV12" }
+            )));
         }
 
-        // Certains drivers ignorent les réglages faits avant SetOutputType : on les rejoue.
+        // Certains drivers ignorent les rÃ©glages faits avant SetOutputType : on les rejoue.
         let api = self.codec_api.clone();
         let _ = set_u32(&api, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32);
         let _ = set_u32(&api, &CODECAPI_AVEncCommonMeanBitRate, cfg.bitrate_kbps * 1000);
@@ -312,7 +281,7 @@ impl Encoder {
         self.provides_samples = (info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
         self.out_buf_size = info.cbSize.max(1 << 20);
 
-        // Récupère l'en-tête de séquence (VPS/SPS/PPS) si le MFT l'expose.
+        // RÃ©cupÃ¨re l'en-tÃªte de sÃ©quence (VPS/SPS/PPS) si le MFT l'expose.
         self.refresh_seq_header();
 
         unsafe {
@@ -333,32 +302,23 @@ impl Encoder {
         }
     }
 
-    /// Backend utilisé (nom du MFT).
-    pub fn backend(&self) -> &EncoderBackend {
-        &self.backend
-    }
-
-    pub fn config(&self) -> &EncoderConfig {
-        &self.cfg
-    }
-
-    /// Réglages non appliqués par le driver (diagnostic).
+    /// RÃ©glages non appliquÃ©s par le driver (diagnostic).
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
 
-    /// Demande une image IDR pour la prochaine image encodée.
+    /// Demande une image IDR pour la prochaine image encodÃ©e.
     pub fn request_keyframe(&mut self) {
         self.force_idr = true;
     }
 
-    /// Compromis qualité/vitesse du preset NVENC, 0..=100 (défaut 0 = le plus rapide).
-    /// Mesuré sur RTX 4070 Ti en 1440p : 0 -> ~2 ms, 50 -> ~5 ms, 100 -> ~11 ms par image.
+    /// Compromis qualitÃ©/vitesse du preset NVENC, 0..=100 (dÃ©faut 0 = le plus rapide).
+    /// MesurÃ© sur RTX 4070 Ti en 1440p : 0 -> ~2 ms, 50 -> ~5 ms, 100 -> ~11 ms par image.
     pub fn set_quality_vs_speed(&mut self, v: u32) -> Result<()> {
         set_u32(&self.codec_api, &CODECAPI_AVEncCommonQualityVsSpeed, v.min(100)).ctx("set_quality_vs_speed")
     }
 
-    /// Change le débit cible (CBR) à chaud, en kbit/s.
+    /// Change le dÃ©bit cible (CBR) Ã  chaud, en kbit/s.
     pub fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
         self.cfg.bitrate_kbps = kbps;
         let r = set_u32(&self.codec_api, &CODECAPI_AVEncCommonMeanBitRate, kbps * 1000);
@@ -368,12 +328,7 @@ impl Encoder {
         r.ctx("set_bitrate")
     }
 
-    /// Encode une frame capturée et attend le bitstream correspondant (bloquant, quelques ms).
-    pub fn encode(&mut self, frame: &CapturedFrame) -> Result<EncodedFrame> {
-        self.encode_texture(&frame.texture, frame.width, frame.height)
-    }
-
-    /// Encode une texture D3D11 (BGRA/RGB10A2…) vivant sur le device de l'encodeur.
+    /// Encode une texture D3D11 (BGRA/RGB10A2â€¦) vivant sur le device de l'encodeur.
     pub fn encode_texture(&mut self, tex: &ID3D11Texture2D, _w: u32, _h: u32) -> Result<EncodedFrame> {
         let dev = unsafe { tex.GetDevice() }.ctx("ID3D11Texture2D::GetDevice")?;
         if dev.as_raw() != self.device.as_raw() {
@@ -386,25 +341,6 @@ impl Encoder {
         self.submit_nv12(&nv12)
     }
 
-    /// Chemin lent pour les tests/outils : encode des pixels BGRA CPU (`stride` = octets par ligne).
-    pub fn encode_bgra(&mut self, bgra: &[u8], width: u32, height: u32, stride: u32) -> Result<EncodedFrame> {
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let init = D3D11_SUBRESOURCE_DATA { pSysMem: bgra.as_ptr() as *const _, SysMemPitch: stride, SysMemSlicePitch: 0 };
-        let mut t = None;
-        unsafe { self.device.CreateTexture2D(&desc, Some(&init), Some(&mut t)) }.ctx("CreateTexture2D(upload)")?;
-        self.encode_texture(&t.unwrap(), width, height)
-    }
 
     fn submit_nv12(&mut self, nv12: &ID3D11Texture2D) -> Result<EncodedFrame> {
         let now = Instant::now();
@@ -429,8 +365,8 @@ impl Encoder {
             sample.SetSampleDuration(10_000_000 / self.cfg.fps.max(1) as i64).ctx("SetSampleDuration")?;
         }
 
-        // Attend que le MFT réclame une entrée.
-        self.pump(Duration::from_millis(2000), |s| s.need_input > 0)?;
+        // Attend que le MFT rÃ©clame une entrÃ©e.
+        self.wait(|s| s.need_input > 0)?;
         if self.force_idr {
             self.force_idr = false;
             let _ = set_u32(&self.codec_api, &CODECAPI_AVEncVideoForceKeyFrame, 1);
@@ -439,8 +375,8 @@ impl Encoder {
         self.need_input -= 1;
         self.frames_in += 1;
 
-        // Attend la sortie (low-latency : 1 entrée -> 1 sortie).
-        self.pump(Duration::from_millis(2000), |s| !s.out_q.is_empty())?;
+        // Attend la sortie (low-latency : 1 entrÃ©e -> 1 sortie).
+        self.wait(|s| !s.out_q.is_empty())?;
         let raw = self.out_q.pop_front().unwrap();
         Ok(self.finish(raw))
     }
@@ -462,41 +398,12 @@ impl Encoder {
         }
     }
 
-    /// Fait tourner la machine à événements du MFT jusqu'à ce que `cond` soit vraie.
-    fn pump(&mut self, timeout: Duration, cond: impl Fn(&Self) -> bool) -> Result<()> {
-        let t0 = Instant::now();
-        loop {
-            if cond(self) {
-                return Ok(());
-            }
-            match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(ev) => {
-                    let ty = unsafe { ev.GetType() }.ctx("IMFMediaEvent::GetType")?;
-                    let ty = MF_EVENT_TYPE(ty as i32);
-                    if ty == METransformNeedInput {
-                        self.need_input += 1;
-                    } else if ty == METransformHaveOutput {
-                        self.process_output()?;
-                    } else if ty == MEError {
-                        let hr = unsafe { ev.GetStatus() }.unwrap_or_default();
-                        return Err(VideoError::Other(format!("MFT error event: {hr:?}")));
-                    }
-                }
-                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    let el = t0.elapsed();
-                    if el > timeout {
-                        return Err(VideoError::Timeout("waiting for MFT event"));
-                    }
-                    // Spin court (latence minimale) puis sommeil 1 ms (timeBeginPeriod(1)).
-                    if el < Duration::from_millis(3) {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
-                Err(e) => return Err(VideoError::Win { context: "IMFMediaEventGenerator::GetEvent", source: e }),
-            }
-        }
+    /// Fait tourner la machine Ã  Ã©vÃ©nements du MFT jusqu'Ã  ce que `cond` soit vraie (2 s max).
+    fn wait(&mut self, cond: impl Fn(&Self) -> bool) -> Result<()> {
+        mft_async::pump(self, Duration::from_millis(2000), cond).map_err(|e| match e {
+            PumpError::Timeout => VideoError::Timeout("waiting for MFT event"),
+            e => VideoError::Other(format!("MFT Â« {} Â» : {e}", self.name)),
+        })
     }
 
     fn process_output(&mut self) -> Result<()> {
@@ -520,7 +427,7 @@ impl Encoder {
             match r {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    // Renégociation du type de sortie.
+                    // RenÃ©gociation du type de sortie.
                     if let Ok(t) = self.mft.GetOutputAvailableType(0, 0) {
                         let _ = self.mft.SetOutputType(0, &t, 0);
                     }
@@ -547,11 +454,58 @@ impl Encoder {
     }
 }
 
-// SAFETY : le device D3D11 est créé avec la protection multithread et COM est initialisé en MTA ;
-// l'Encoder n'est jamais utilisé depuis deux threads à la fois (&mut self).
-unsafe impl Send for Encoder {}
+/// Lit l'Ã©vÃ©nement suivant de la file du MFT sans attendre.
+pub(crate) fn next_mf_event(events: &IMFMediaEventGenerator) -> std::result::Result<Option<MftEvent>, String> {
+    match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+        Ok(ev) => {
+            let ty = MF_EVENT_TYPE(unsafe { ev.GetType() }.map_err(|e| e.to_string())? as i32);
+            Ok(Some(if ty == METransformNeedInput {
+                MftEvent::NeedInput
+            } else if ty == METransformHaveOutput {
+                MftEvent::HaveOutput
+            } else if ty == MEError {
+                MftEvent::Error(unsafe { ev.GetStatus() }.map(|h| h.0).unwrap_or(-1))
+            } else {
+                MftEvent::Other
+            }))
+        }
+        Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => Ok(None),
+        Err(e) => Err(format!("IMFMediaEventGenerator::GetEvent : {e}")),
+    }
+}
 
-impl Drop for Encoder {
+impl AsyncMft for MfEncoder {
+    fn next_event(&mut self) -> std::result::Result<Option<MftEvent>, String> {
+        next_mf_event(&self.events)
+    }
+    fn on_need_input(&mut self) {
+        self.need_input += 1;
+    }
+    fn on_have_output(&mut self) -> std::result::Result<(), String> {
+        self.process_output().map_err(|e| e.to_string())
+    }
+}
+
+/// Attributs colorimÃ©triques d'un type de mÃ©dia : BT.709 SDR ou BT.2020/PQ, plage limitÃ©e.
+fn set_color(t: &IMFMediaType, hdr: bool) {
+    let (prim, trc, mat) = if hdr {
+        (MFVideoPrimaries_BT2020.0, MFVideoTransFunc_2084.0, MFVideoTransferMatrix_BT2020_10.0)
+    } else {
+        (MFVideoPrimaries_BT709.0, MFVideoTransFunc_709.0, MFVideoTransferMatrix_BT709.0)
+    };
+    unsafe {
+        let _ = t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, prim as u32);
+        let _ = t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, trc as u32);
+        let _ = t.SetUINT32(&MF_MT_YUV_MATRIX, mat as u32);
+        let _ = t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
+    }
+}
+
+// SAFETY : le device D3D11 est crÃ©Ã© avec la protection multithread et COM est initialisÃ© en MTA ;
+// l'encodeur n'est jamais utilisÃ© depuis deux threads Ã  la fois (&mut self).
+unsafe impl Send for MfEncoder {}
+
+impl Drop for MfEncoder {
     fn drop(&mut self) {
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);

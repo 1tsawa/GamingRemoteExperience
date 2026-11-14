@@ -9,6 +9,10 @@
 #   avutil-60.dll (+ swresample-6.dll si la build en dépend), LICENSE.txt (texte LGPL) et
 #   SOURCE.txt (provenance : URL de la build et des sources). Une build GPL est REFUSÉE
 #   (« --enable-gpl » / « --enable-nonfree » dans la configuration embarquée). Voir docs/ARCHITECTURE.md.
+# - OpenH264 (Cisco, BSD) : PAS intégré (la licence de brevets de Cisco exige un téléchargement
+#   séparé sur le poste de l'utilisateur) ; le setup installe seulement le texte de licence
+#   (third_party\openh264\BINARY_LICENSE.txt) et propose une tâche qui lance « grx-host
+#   fetch-openh264 » (SHA-256 épinglés dans grx-update/src/openh264.rs). Vérifié ici : pin cohérent.
 [CmdletBinding()]
 param(
     [string]$BinDir,
@@ -100,6 +104,13 @@ function Get-VerifiedFfmpeg([string]$dir) {
     return (Resolve-Path $dir).Path
 }
 
+$ohLicense = Join-Path $root "third_party\openh264\BINARY_LICENSE.txt"
+if (-not (Test-Path $ohLicense) -or -not ((Get-Content -Raw $ohLicense) -match "OpenH264 Video Codec provided by Cisco Systems")) {
+    throw "third_party\openh264\BINARY_LICENSE.txt manquant ou inattendu (texte de licence Cisco requis par le setup)"
+}
+$ohPin = Select-String -Path (Join-Path $root "crates\grx-update\src\openh264.rs") -Pattern 'DLL_SHA256: &str = "([0-9a-f]{64})"'
+if (-not $ohPin) { throw "SHA-256 OpenH264 introuvable dans grx-update" }
+Write-Host "OpenH264 : téléchargé par le setup depuis Cisco (tâche facultative), DLL SHA-256 $($ohPin.Matches[0].Groups[1].Value)"
 $iscc = Find-Iscc
 $defs = @("/DAppVersion=$version", "/DBinDir=$BinDir", "/DOutDir=$OutDir")
 if (-not $NoVigem) { $defs += "/DVigemExe=$(Get-VerifiedVigem)" }

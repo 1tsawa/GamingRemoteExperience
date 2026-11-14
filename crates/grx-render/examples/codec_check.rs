@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     for codec in [Codec::Hevc, Codec::H264, Codec::Av1] {
-        let mut enc = match Encoder::new(EncoderConfig { codec, width: w, height: h, fps: 60, bitrate_kbps: 20_000 }) {
+        let mut enc = match Encoder::new(EncoderConfig { codec, width: w, height: h, fps: 60, bitrate_kbps: 20_000, ..Default::default() }) {
             Ok(e) => e,
             Err(e) => {
                 println!("{codec:?} : pas d'encodeur ({e})");

@@ -25,6 +25,14 @@ pub fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u3
     ((dst_w - w) / 2, (dst_h - h) / 2, w, h)
 }
 
+/// Colorimétrie d'un blit : SDR (YCbCr BT.709 -> RGB) ou HDR10 (YCbCr PQ BT.2020 -> RGB PQ
+/// BT.2020, sans tone-mapping : voir `hdr_present`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlitColor {
+    Sdr,
+    Pq,
+}
+
 pub(crate) struct Blitter {
     device: ID3D11Device,
     vdev: ID3D11VideoDevice,
@@ -37,6 +45,7 @@ struct State {
     in_h: u32,
     out_w: u32,
     out_h: u32,
+    color: BlitColor,
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     out_view: Option<(usize, ID3D11VideoProcessorOutputView)>,
@@ -52,8 +61,8 @@ impl Blitter {
         Ok(Blitter { device: device.clone(), vdev, vctx, state: None })
     }
 
-    fn ensure(&mut self, in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> Result<&mut State> {
-        let ok = matches!(&self.state, Some(s) if s.in_w == in_w && s.in_h == in_h && s.out_w == out_w && s.out_h == out_h);
+    fn ensure(&mut self, in_w: u32, in_h: u32, out_w: u32, out_h: u32, color: BlitColor) -> Result<&mut State> {
+        let ok = matches!(&self.state, Some(s) if s.in_w == in_w && s.in_h == in_h && s.out_w == out_w && s.out_h == out_h && s.color == color);
         if !ok {
             let rate = DXGI_RATIONAL { Numerator: 60, Denominator: 1 };
             let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
@@ -77,14 +86,22 @@ impl Blitter {
                 let in_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: (1 << 2) | (1 << 4) };
                 // Sortie : RGB plein débit 0-255.
                 let out_cs = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 };
-                self.vctx.VideoProcessorSetStreamColorSpace(vp, 0, &in_cs);
-                self.vctx.VideoProcessorSetOutputColorSpace(vp, &out_cs);
+                match (color, self.vctx.cast::<ID3D11VideoContext1>()) {
+                    (BlitColor::Pq, Ok(v1)) => {
+                        v1.VideoProcessorSetStreamColorSpace1(vp, 0, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020);
+                        v1.VideoProcessorSetOutputColorSpace1(vp, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                    }
+                    _ => {
+                        self.vctx.VideoProcessorSetStreamColorSpace(vp, 0, &in_cs);
+                        self.vctx.VideoProcessorSetOutputColorSpace(vp, &out_cs);
+                    }
+                }
                 let black = D3D11_VIDEO_COLOR {
                     Anonymous: D3D11_VIDEO_COLOR_0 { RGBA: D3D11_VIDEO_COLOR_RGBA { R: 0.0, G: 0.0, B: 0.0, A: 1.0 } },
                 };
                 self.vctx.VideoProcessorSetOutputBackgroundColor(vp, false, &black);
             }
-            self.state = Some(State { in_w, in_h, out_w, out_h, enumerator, processor, out_view: None, in_views: Vec::new() });
+            self.state = Some(State { in_w, in_h, out_w, out_h, color, enumerator, processor, out_view: None, in_views: Vec::new() });
         }
         Ok(self.state.as_mut().unwrap())
     }
@@ -100,13 +117,14 @@ impl Blitter {
         backbuffer: &ID3D11Texture2D,
         out_w: u32,
         out_h: u32,
+        color: BlitColor,
     ) -> Result<()> {
         let mut sd = D3D11_TEXTURE2D_DESC::default();
         unsafe { src.GetDesc(&mut sd) };
         let vdev = self.vdev.clone();
         let vctx = self.vctx.clone();
         let _ = &self.device;
-        let st = self.ensure(sd.Width, sd.Height, out_w, out_h)?;
+        let st = self.ensure(sd.Width, sd.Height, out_w, out_h, color)?;
 
         let bb_key = backbuffer.as_raw() as usize;
         if !matches!(&st.out_view, Some((k, _)) if *k == bb_key) {

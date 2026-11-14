@@ -26,6 +26,25 @@ use crate::pipeline::PipelineOpts;
 use crate::server::RunOpts;
 
 #[derive(Clone, Copy, ValueEnum)]
+enum EncoderArg {
+    Auto,
+    Nvidia,
+    Amd,
+    Intel,
+    /// OpenH264 de Cisco (à installer : `grx-host fetch-openh264`)
+    Software,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ChromaArg {
+    Auto,
+    #[value(name = "420")]
+    _420,
+    #[value(name = "444")]
+    _444,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum CodecArg {
     /// Négocié avec le client : HEVC si son PC le décode, sinon H.264 (AV1 seulement sur demande)
     Auto,
@@ -105,6 +124,16 @@ enum Cmd {
     Revoke { fingerprint: String },
     /// Change le rôle d'un client : `view-only`, `full` ou `total`. Une session en cours est coupée.
     SetRole { fingerprint: String, #[arg(value_enum)] role: RoleArg },
+    /// Télécharge depuis Cisco le codec OpenH264 (encodeur H.264 logiciel de secours, « OpenH264
+    /// Video Codec provided by Cisco Systems, Inc. »), vérifié par SHA-256, à côté de l'exécutable
+    FetchOpenh264 {
+        /// Dossier d'installation (défaut : celui de grx-host.exe)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Supprime le codec (désactivation)
+        #[arg(long)]
+        remove: bool,
+    },
     /// Mode « Contrôle total » : host lancé élevé par une tâche planifiée (voir la sous-commande)
     #[command(subcommand)]
     Elevation(ElevationCmd),
@@ -131,6 +160,17 @@ enum Cmd {
         /// décoder est remplacé automatiquement (H.264 en dernier recours)
         #[arg(long, value_enum, default_value = "auto")]
         codec: CodecArg,
+        /// Encodeur : auto (celui du GPU de l'écran capturé, puis logiciel), nvidia, amd, intel,
+        /// software (OpenH264, H.264 seulement)
+        #[arg(long, value_enum, default_value = "auto")]
+        encoder: EncoderArg,
+        /// Sous-échantillonnage : auto (4:4:4 si le client l'active dans son menu), 420, 444
+        /// (« Couleur 4:4:4 » de Parsec : NVIDIA HEVC uniquement, client capable de le décoder)
+        #[arg(long, value_enum, default_value = "auto")]
+        chroma: ChromaArg,
+        /// Caché (tests) : mire HDR synthétique au lieu de la capture (voie 10 bits/HDR10)
+        #[arg(long, hide = true)]
+        test_pattern_hdr: bool,
         /// Cadence maximale de capture/encodage
         #[arg(long, default_value_t = 60)]
         fps: u32,
@@ -280,12 +320,28 @@ fn main() -> Result<()> {
             println!("{n} client(s) modifié(s) ; un host en cours d'exécution coupe la session du client concerné (il doit se reconnecter)");
         }
         Cmd::Elevation(cmd) => return run_elevation(cmd),
+        Cmd::FetchOpenh264 { dir, remove } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => std::env::current_exe()?.parent().map(PathBuf::from).unwrap_or_default(),
+            };
+            if remove {
+                grx_update::openh264::remove(&dir)?;
+                println!("OpenH264 supprimé de {} (voie H.264 logicielle désactivée)", dir.display());
+            } else {
+                let p = grx_update::openh264::fetch(&dir).map_err(|e| anyhow::anyhow!(e))?;
+                println!("{}\nInstallé : {} (SHA-256 vérifié)", grx_update::openh264::NOTICE, p.display());
+            }
+        }
         Cmd::Run {
             bind,
             no_upnp,
             external_port,
             upnp_lease,
             codec,
+            encoder,
+            chroma,
+            test_pattern_hdr,
             fps,
             max_bitrate,
             start_bitrate,
@@ -318,6 +374,11 @@ fn main() -> Result<()> {
             if fps == 0 || max_bitrate <= 0.0 || start_bitrate <= 0.0 || idle_timeout <= 0.0 {
                 bail!("--fps, --max-bitrate, --start-bitrate et --idle-timeout doivent être > 0");
             }
+            if matches!(encoder, EncoderArg::Software) {
+                if let Err(e) = grx_video::openh264::availability() {
+                    bail!("--encoder software : {e}");
+                }
+            }
             let max_bps = (max_bitrate * 1e6) as u64;
             let opts = RunOpts {
                 bind,
@@ -332,6 +393,19 @@ fn main() -> Result<()> {
                             CodecArg::Av1 => CodecPref::Force(VideoCodec::Av1),
                         }
                     },
+                    encoder: match encoder {
+                        EncoderArg::Auto => grx_video::EncoderPref::Auto,
+                        EncoderArg::Nvidia => grx_video::EncoderPref::Nvidia,
+                        EncoderArg::Amd => grx_video::EncoderPref::Amd,
+                        EncoderArg::Intel => grx_video::EncoderPref::Intel,
+                        EncoderArg::Software => grx_video::EncoderPref::Software,
+                    },
+                    chroma: match chroma {
+                        ChromaArg::Auto => grx_core::codec_neg::ChromaPref::Auto,
+                        ChromaArg::_420 => grx_core::codec_neg::ChromaPref::Yuv420,
+                        ChromaArg::_444 => grx_core::codec_neg::ChromaPref::Yuv444,
+                    },
+                    test_pattern_hdr,
                     fps,
                     fill,
                     audio: !no_audio,

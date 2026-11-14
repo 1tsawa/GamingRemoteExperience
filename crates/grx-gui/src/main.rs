@@ -8,6 +8,7 @@
 mod app;
 mod backend;
 mod hoststatus;
+mod launch_opts;
 mod logic;
 mod qr;
 mod settings;
@@ -22,6 +23,7 @@ use clap::{Parser, ValueEnum};
 enum TabArg {
     Host,
     Client,
+    Settings,
 }
 
 #[derive(Parser)]
@@ -133,6 +135,7 @@ fn main() -> eframe::Result {
         tab: match cli.tab {
             TabArg::Host => app::Tab::Host,
             TabArg::Client => app::Tab::Client,
+            TabArg::Settings => app::Tab::Settings,
         },
         prefill_link: cli.prefill_link,
         prefill_addr: cli.prefill_addr,

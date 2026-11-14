@@ -50,6 +50,16 @@ pub enum CodecArg {
 enum Cmd {
     /// Affiche l'empreinte de ce client
     Info,
+    /// Télécharge depuis Cisco le codec OpenH264 (décodeur H.264 logiciel de secours, « OpenH264
+    /// Video Codec provided by Cisco Systems, Inc. »), vérifié par SHA-256, à côté de l'exécutable
+    FetchOpenh264 {
+        /// Dossier d'installation (défaut : celui de grx-client.exe)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Supprime le codec (désactivation)
+        #[arg(long)]
+        remove: bool,
+    },
     /// Liste les hosts mémorisés
     Hosts,
     /// Se connecte avec un lien grx:// (nouvelle invitation) ou le nom d'un host mémorisé,
@@ -134,7 +144,11 @@ enum Cmd {
         /// que ce PC ne sait pas décoder n'est jamais imposé)
         #[arg(long, value_enum, default_value = "auto")]
         codec: PlayCodecArg,
-        /// (tests) voies de décodage à ignorer, ex. mf-hevc, ffmpeg, av1, ffmpeg-h264
+        /// Décodeur : auto (matériel, puis logiciel en secours), hardware, software ; sans
+        /// l'option, le choix « Décodeur » mémorisé de l'overlay
+        #[arg(long)]
+        decoder: Option<String>,
+        /// (tests) voies de décodage à ignorer, ex. mf-hevc, ffmpeg, av1, ffmpeg-h264, openh264, ffsw
         #[arg(long, hide = true, default_value = "")]
         disable_decoder: String,
         /// (tests) panne simulée du décodeur : codec:images, ex. hevc:120
@@ -154,6 +168,8 @@ enum Cmd {
         #[arg(long)]
         rumble_test: bool,
     },
+    /// Sonde les décodeurs vidéo de ce PC et affiche le résultat en JSON (utilisé par grx-gui)
+    Decoders,
     /// Banc d'essai sans fenêtre : reçoit vidéo/audio, mesure FPS/débit/RTT/perte, valide le H.265
     Bench {
         /// Lien grx:// ou nom d'un host mémorisé
@@ -226,7 +242,22 @@ fn main() -> Result<()> {
     let identity = Identity::load_or_create(&dir.join("identity.json"))?;
     let mut store = Store::load(&dir)?;
 
+    if let Cmd::FetchOpenh264 { dir, remove } = &cli.cmd {
+        let dir = match dir {
+            Some(d) => d.clone(),
+            None => std::env::current_exe()?.parent().map(PathBuf::from).unwrap_or_default(),
+        };
+        if *remove {
+            grx_update::openh264::remove(&dir)?;
+            println!("OpenH264 supprimé de {} (voie H.264 logicielle désactivée)", dir.display());
+        } else {
+            let p = grx_update::openh264::fetch(&dir).map_err(|e| anyhow!(e))?;
+            println!("{}\nInstallé : {} (SHA-256 vérifié)", grx_update::openh264::NOTICE, p.display());
+        }
+        return Ok(());
+    }
     match cli.cmd {
+        Cmd::FetchOpenh264 { .. } => unreachable!("traité avant"),
         Cmd::Info => println!("Empreinte de ce client : {}", identity.fingerprint()),
         Cmd::Hosts => {
             for h in store.0.hosts() {
@@ -288,6 +319,7 @@ fn main() -> Result<()> {
             sim_gamepad,
             gamepad_verbose,
             codec,
+            decoder,
             disable_decoder,
             fail_decoder_after,
         } => {
@@ -329,6 +361,10 @@ fn main() -> Result<()> {
                             PlayCodecArg::Av1 => Some(VideoCodec::Av1),
                         }
                     },
+                    decoder: match decoder.as_deref() {
+                        None => None,
+                        Some(s) => Some(grx_render::DecoderPref::parse(s).map_err(|e| anyhow!("--decoder : {e}"))?),
+                    },
                     disabled_decoders: grx_render::DisabledDecoders::parse(&disable_decoder)
                         .map_err(|e| anyhow!("--disable-decoder : {e}"))?,
                     fail_decoder_after: match fail_decoder_after.as_deref().map(|v| v.split_once(':')) {
@@ -352,6 +388,15 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Gamepads { secs, sim_gamepad, rumble_test } => gamepads::probe(secs, sim_gamepad, rumble_test),
+        Cmd::Decoders => {
+            use grx_core::codec_neg::VideoCodec;
+            let device = grx_render::create_device()?;
+            let d = crate::codec::Decoders::new(grx_render::probe_decoders(&device, &Default::default()), None);
+            let ok = d.decodable();
+            let list: Vec<&str> =
+                [VideoCodec::Hevc, VideoCodec::H264, VideoCodec::Av1].into_iter().filter(|c| ok.contains(*c)).map(|c| c.arg()).collect();
+            println!("{}", serde_json::json!({ "decodable": list, "details": d.summary() }));
+        }
         Cmd::Bench { target, secs, save, save_as, codec, sim_loss, no_input, no_keyframe_request, quiet } => {
             let (invite, known) = store.resolve(&read_target(target)?)?;
             println!("Connexion à {} — empreinte attendue : {}", invite.addr, fingerprint(&invite.host_key));

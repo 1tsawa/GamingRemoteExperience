@@ -1,4 +1,4 @@
-//! Interface egui : onglets Host et Client. Aucune E/S ici : tout passe par `backend`.
+//! Interface egui : onglets Client, Host et Paramètres (`settings_tab.rs`). Aucune E/S ici : tout passe par `backend`.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -17,6 +17,10 @@ use crate::logic::{
     ClientRow, CodecChoice, LinkCheck, Ttl, DEFAULT_PORT,
 };
 use crate::hoststatus::{self, RunStatus, Tone};
+
+#[path = "settings_tab.rs"]
+mod settings_tab;
+pub use settings_tab::DecoderProbe;
 use crate::qr::QrMatrix;
 use crate::settings::{self, GuiSettings};
 use crate::update::{self, BannerAction, MenuAction, UpdateUi};
@@ -27,6 +31,7 @@ pub enum Tab {
     #[default]
     Client,
     Host,
+    Settings,
 }
 
 /// Options de démonstration / test (cachées dans la ligne de commande).
@@ -128,6 +133,9 @@ pub struct App {
 
     // Mises à jour
     update: UpdateUi,
+
+    // Paramètres : sonde des décodeurs de ce PC (`grx-client decoders`), lancée à la demande.
+    decoders: DecoderProbe,
 }
 
 impl App {
@@ -192,6 +200,7 @@ impl App {
             last_link_valid: false,
             scroll_to_pair: 0,
             update: UpdateUi::default(),
+            decoders: DecoderProbe::default(),
             opts,
         }
     }
@@ -414,7 +423,9 @@ impl App {
             ui.label(RichText::new("GamingRemoteExperience").heading().strong());
             ui.label(muted("Appairage"));
             ui.add_space(18.0);
-            for (tab, label) in [(Tab::Client, "Client — PC qui contrôle"), (Tab::Host, "Host — PC à contrôler")] {
+            for (tab, label) in
+                [(Tab::Client, "Client — PC qui contrôle"), (Tab::Host, "Host — PC à contrôler"), (Tab::Settings, "Paramètres")]
+            {
                 let selected = self.tab == tab;
                 let text = RichText::new(label).size(15.5);
                 let btn = egui::Button::selectable(selected, if selected { text.strong() } else { text });
@@ -584,6 +595,9 @@ impl App {
                 self.access_status(ui);
             }
             self.elevation_card(ui, st.running);
+            if settings_tab::forced_badges(ui, &self.settings.host.forced()) {
+                self.tab = Tab::Settings;
+            }
             egui::CollapsingHeader::new("Options de lancement").default_open(false).show(ui, |ui| {
                 let o = &mut self.settings.host;
                 let locked = st.running;
@@ -625,6 +639,9 @@ impl App {
                 });
                 if locked {
                     ui.label(small_muted("Arrêtez le host pour modifier ces options."));
+                }
+                if ui.link("Tous les réglages (débit, écran, manettes…) : onglet Paramètres").clicked() {
+                    self.tab = Tab::Settings;
                 }
             });
             ui.label(muted("Dernières lignes de sortie :"));
@@ -1041,7 +1058,17 @@ impl App {
                     ui.checkbox(&mut self.settings.client.no_input, "sans envoyer d'entrées (--no-input)");
                     ui.checkbox(&mut self.settings.client.no_audio, "sans audio (--no-audio)");
                     ui.checkbox(&mut self.settings.client.fullscreen, "plein écran (--fullscreen)");
+                    if ui.link("autres réglages…").on_hover_text("Onglet Paramètres").clicked() {
+                        self.tab = Tab::Settings;
+                    }
                 });
+                let ctx = ui.ctx().clone();
+                if let Some(w) = self.client_codec_warning(&ctx) {
+                    ui.label(colored(format!("⚠ {w}"), WARN));
+                }
+                if settings_tab::forced_badges(ui, &self.settings.client.forced()) {
+                    self.tab = Tab::Settings;
+                }
             }
             if let Some(p) = connect {
                 let args = self.settings.client.to_args(&self.paths.client_dir, "-", None);
@@ -1421,6 +1448,7 @@ impl eframe::App for App {
                         match self.tab {
                             Tab::Host => self.host_tab(ui),
                             Tab::Client => self.client_tab(ui),
+                            Tab::Settings => self.settings_tab(ui),
                         }
                         ui.add_space(6.0);
                     });

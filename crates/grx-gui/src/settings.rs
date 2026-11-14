@@ -68,4 +68,17 @@ mod tests {
         assert_eq!(load(&p).public_addr, "x:1");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn old_gui_json_gets_new_settings_defaults() {
+        // gui.json d'une version 0.2.1 : aucun des nouveaux réglages de l'onglet Paramètres.
+        let old = br#"{"public_addr":"x:1","host":{"bind":"0.0.0.0:7777","codec":"Hevc","fps":30,"upnp":true},
+            "client":{"no_input":false,"no_audio":true,"fullscreen":true},"update":{"auto_check":false}}"#;
+        let s: GuiSettings = serde_json::from_slice(old).unwrap();
+        assert_eq!(s.host.codec, crate::logic::CodecChoice::Hevc);
+        assert_eq!((s.host.fps, s.host.max_bitrate, s.host.idle_timeout, s.host.display), (30, 50, 5, 0));
+        assert!(s.client.fullscreen && s.client.no_audio && s.client.volume == 80);
+        assert_eq!(s.client.codec, crate::logic::CodecChoice::Auto);
+        assert!(!s.update.auto_check);
+    }
 }

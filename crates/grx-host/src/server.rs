@@ -807,6 +807,9 @@ mod tests {
                 initial_bitrate_bps: 10_000_000,
                 max_bitrate_bps: 20_000_000,
                 display: None,
+            encoder: Default::default(),
+            chroma: Default::default(),
+            test_pattern_hdr: false,
             },
         }
     }

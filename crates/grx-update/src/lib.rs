@@ -16,6 +16,7 @@ pub mod guard;
 pub mod http;
 pub mod install;
 pub mod manifest;
+pub mod openh264;
 pub mod sig;
 
 use std::io::{Read, Write};

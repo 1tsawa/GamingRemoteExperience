@@ -38,16 +38,16 @@ fn center(r: Rect) -> (f32, f32) {
 #[test]
 fn display_row_hidden_with_zero_or_one_screen() {
     let mut o = ov();
-    assert_eq!(o.rows().len(), 13);
+    assert_eq!(o.rows().len(), 16);
     assert!(!o.rows().contains(&Row::Display));
     let h0 = o.panel_rect().h;
 
     o.displays = vec![screen("A", 0, true)];
-    assert_eq!(o.rows().len(), 13);
+    assert_eq!(o.rows().len(), 16);
     assert!(!o.rows().contains(&Row::Display));
 
     o.displays = three().displays;
-    assert_eq!(o.rows().len(), 14);
+    assert_eq!(o.rows().len(), 17);
     let rows = o.rows();
     let fps_idx = rows.iter().position(|&r| r == Row::Fps).unwrap();
     let disp_idx = rows.iter().position(|&r| r == Row::Display).unwrap();

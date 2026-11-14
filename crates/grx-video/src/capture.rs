@@ -114,6 +114,66 @@ pub struct ScreenCapturer {
     pub reopen_count: u32,
     /// Destination des mises à jour du curseur (position/visibilité/forme), si demandée.
     cursor: Option<Arc<CursorTracker>>,
+    /// Sortie en HDR : duplication `DuplicateOutput1` en FP16 scRGB (phase 2).
+    hdr: bool,
+}
+
+/// La sortie `output_index` de l'adaptateur `adapter_index` est-elle en mode HDR (PQ BT.2020) ?
+pub fn output_is_hdr(adapter_index: u32, output_index: u32) -> bool {
+    (|| -> windows::core::Result<bool> {
+        let f: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
+        let a = unsafe { f.EnumAdapters1(adapter_index) }?;
+        let o = unsafe { a.EnumOutputs(output_index) }?;
+        Ok(desc_is_hdr(&o))
+    })()
+    .unwrap_or(false)
+}
+
+fn desc_is_hdr(o: &IDXGIOutput) -> bool {
+    o.cast::<IDXGIOutput6>()
+        .ok()
+        .and_then(|o6| unsafe { o6.GetDesc1() }.ok())
+        .is_some_and(|d| d.ColorSpace == windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+}
+
+fn f16(f: f32) -> u16 {
+    if f <= 0.0 {
+        return 0;
+    }
+    let b = f.to_bits();
+    let e = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+    if e <= 0 {
+        return 0;
+    }
+    ((e.min(30) as u16) << 10) | ((b >> 13) & 0x3FF) as u16
+}
+
+/// Mire HDR synthétique (FP16 scRGB, 1.0 = 80 nits) pour tester la voie 10 bits/HDR sans écran
+/// HDR : dégradé 0 -> 1000 nits en haut, barres de couleurs à 203 nits (blanc SDR) en bas, carrés
+/// à 1000 nits. `t` décale le dégradé (images différentes).
+pub fn hdr_test_pattern(device: &ID3D11Device, w: u32, h: u32, t: u32) -> Result<ID3D11Texture2D> {
+    let mut px = vec![0u16; (w * h * 4) as usize];
+    let bars: [[f32; 3]; 6] = [[1.0, 1.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [0.0, 1.0, 1.0]];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let c = if y < h / 2 {
+                let v = (((x + t * 8) % w) as f32 / w as f32) * 12.5;
+                [v, v, v]
+            } else {
+                let b = bars[((x * 6) / w).min(5) as usize];
+                let hi = (x / 64 + y / 64) % 7 == 0;
+                let s = if hi { 12.5 } else { 203.0 / 80.0 };
+                [b[0] * s, b[1] * s, b[2] * s]
+            };
+            px[i] = f16(c[0]);
+            px[i + 1] = f16(c[1]);
+            px[i + 2] = f16(c[2]);
+            px[i + 3] = f16(1.0);
+        }
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(px.as_ptr() as *const u8, px.len() * 2) };
+    crate::facade::upload_texture(device, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bytes, w, h, w * 8)
 }
 
 /// Liste les sorties de tous les adaptateurs matériels.
@@ -198,6 +258,7 @@ impl ScreenCapturer {
             last_idx: None,
             reopen_count: 0,
             cursor: None,
+            hdr: false,
         };
         c.reopen()?;
         Ok(c)
@@ -239,6 +300,11 @@ impl ScreenCapturer {
     }
 
     /// Résolution courante du bureau capturé.
+    /// Capture HDR (FP16 scRGB) en cours.
+    pub fn is_hdr(&self) -> bool {
+        self.hdr
+    }
+
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -276,7 +342,30 @@ impl ScreenCapturer {
         let output = unsafe { self.adapter.EnumOutputs(self.output_index) }.ctx("EnumOutputs")?;
         let od = unsafe { output.GetDesc() }.ctx("IDXGIOutput::GetDesc")?;
         let output1: IDXGIOutput1 = output.cast().ctx("IDXGIOutput1")?;
-        let dupl = unsafe { output1.DuplicateOutput(&self.device) }.ctx("DuplicateOutput")?;
+        // Écran HDR : DuplicateOutput1 en FP16 scRGB (sans quoi DXGI rend une image SDR délavée).
+        let hdr_dupl = if desc_is_hdr(&output) && std::env::var_os("GRX_NO_HDR_CAPTURE").is_none() {
+            output.cast::<IDXGIOutput5>().ok().and_then(|o5| unsafe {
+                o5.DuplicateOutput1(
+                    &self.device,
+                    0,
+                    &[
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    ],
+                )
+                .ok()
+            })
+        } else {
+            None
+        };
+        self.hdr = hdr_dupl.is_some();
+        let dupl = match hdr_dupl {
+            Some(d) => d,
+            None => unsafe { output1.DuplicateOutput(&self.device) }.ctx("DuplicateOutput")?,
+        };
+        if self.hdr {
+            self.hdr = unsafe { dupl.GetDesc() }.ModeDesc.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        }
         let d = unsafe { dupl.GetDesc() };
         self.width = d.ModeDesc.Width;
         self.height = d.ModeDesc.Height;

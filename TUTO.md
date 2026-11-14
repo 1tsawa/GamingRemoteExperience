@@ -163,6 +163,16 @@ Le bas du menu affiche les limites du host et les plafonds qu'il a réellement a
 
 **Curseur** : le curseur affiché sur l'image est celui **du PC host** (forme personnalisée du jeu comprise, ex. World of Warcraft) ; votre curseur Windows est masqué au-dessus de la vidéo et réapparaît sur les bandes noires. Il reste affiché en mode capture souris, et disparaît quand le jeu le cache (caméra au clic droit). Pour retrouver l'ancien comportement (votre curseur Windows local, pas celui du host) : `--local-cursor`, par exemple `.\grx-client.exe play pc-ludo --local-cursor`.
 
+### Onglet « Paramètres » de grx-gui
+
+Tous les réglages au même endroit, appliqués à « Connecter » et « Démarrer le host », enregistrés tout seuls :
+- **Codec vidéo** : laissez **Automatique** (le host choisit le meilleur codec que votre PC sait décoder). Vous pouvez forcer HEVC, H.264 ou AV1 ; un ⚠ s'affiche si ce PC ne sait pas le décoder. Aussi : décodeur (matériel/logiciel), encodeur du host (NVIDIA/AMD/Intel/logiciel), couleur 4:4:4.
+- **Client** : plein écran, VSync, clavier/souris, manettes, curseur local, volume, statistiques.
+- **Host** : FPS, débits, écran de départ, IPv4/IPv6, entrées autorisées, UPnP, Contrôle total.
+- **Mises à jour** : vérification automatique et « Rechercher des mises à jour ».
+
+Chaque section a un bouton « Valeurs par défaut ». Un réglage forcé apparaît en badge orange dans les onglets Client/Host.
+
 ---
 
 ## 3. Ce qu'il faut tester (et me remonter)
@@ -212,6 +222,23 @@ Envoyez-moi pour chaque test : OK / KO, les lignes de stats, et les messages d'e
 Limites : gyroscope, position sur le pavé tactile, LED, gâchettes adaptatives du DualSense : non transmis. Si DS4Windows / Steam Input émulent déjà une manette Xbox, la manette peut apparaître deux fois (fermez-les ou désactivez l'émulation).
 
 ---
+
+### Phase 2 : encodeurs, 4:4:4, 10 bits (à tester sur le PC Intel Core Ultra 7)
+Le PC de développement n'a qu'un GPU NVIDIA : les voies **Intel/AMD** sont simulées. Sur votre PC Intel :
+1. `cargo run --release -p grx-render --example probe_decoders` : notez les lignes `DEC HEVC ASYNC` (MFT
+   Intel asynchrone) et `ENC H264/HEVC/AV1 HW` (Quick Sync). Si `DEC HEVC` est vide sans l'extension
+   « HEVC Video Extensions » du Store, le MFT HEVC Intel n'est pas exposé à part (Windows le livre
+   via l'extension) : la négociation passe alors en H.264 ou AV1 (rien à régler).
+2. `cargo run --release -p grx-render --example probe_formats` : profils D3D11 (Main10, 4:4:4) du GPU Intel.
+3. Host sur le PC Intel : `grx-host run --encoder intel --fill` puis client depuis l'autre PC : le
+   journal du host doit indiquer `encodeur Intel® Quick Sync Video ... [Intel]` ; essayez aussi
+   `--encoder auto` (même résultat attendu) et `--codec av1`.
+4. Client sur le PC Intel : `grx-client play <host> --stats` ; dans le menu, « Décodeur » sur Matériel
+   puis Logiciel (après `grx-client fetch-openh264`) : la ligne « Décodeur » des statistiques change.
+5. 4:4:4 : sur un host NVIDIA, cochez « Couleur 4:4:4 » sur le client ; le Flux affiche « HEVC RExt
+   4:4:4 8 bits » si le PC Intel le décode, sinon il reste en 4:2:0 (normal).
+6. 10 bits / HDR : cochez « Préférer 10 bits » ; avec Windows HDR activé sur le host, le Flux affiche
+   « HEVC Main10 … HDR10 ». Remontez le journal du host (`client :` et `vidéo :`) et du client.
 
 ## 4. Dépannage
 

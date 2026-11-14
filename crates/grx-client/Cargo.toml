@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 grx-core.workspace = true
+grx-update.workspace = true
 grx-transport = { path = "../grx-transport" }
 grx-video = { path = "../grx-video" }
 grx-input = { path = "../grx-input" }

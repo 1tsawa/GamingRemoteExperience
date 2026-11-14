@@ -66,6 +66,8 @@ pub struct PlayOpts {
     pub gamepad: Option<crate::gamepads::PadOpts>,
     /// `play --codec` : codec demandé au host (`None` = auto, voir `codec.rs`).
     pub codec: Option<grx_core::codec_neg::VideoCodec>,
+    /// `play --decoder` : choix du décodeur (`None` = celui mémorisé par l'overlay).
+    pub decoder: Option<grx_render::DecoderPref>,
     /// (tests) voies de décodage désactivées (`--disable-decoder mf-hevc,...`).
     pub disabled_decoders: grx_render::DisabledDecoders,
     /// (tests) panne simulée du décodeur de ce codec après N images décodées.
@@ -87,6 +89,8 @@ enum Outcome {
 
 /// Titre de la fenêtre : nom du host + (option) stats + état de la capture.
 struct Ui {
+    /// Choix « Décodeur » / 4:4:4 / 10 bits modifié dans l'overlay, à appliquer par le fil vidéo.
+    codec_req: Mutex<Option<(grx_render::DecoderPref, bool, bool)>>,
     base: String,
     line: Mutex<String>,
     show_stats: AtomicBool,
@@ -157,7 +161,7 @@ pub fn run(
     // Décodeurs réellement utilisables sur ce GPU (créés pour de vrai, en cache), annoncés au host.
     let device = grx_render::create_device()?;
     let t_probe = Instant::now();
-    let decoders = crate::codec::Decoders::new(grx_render::probe_decoders(&device, &p.disabled_decoders), p.codec);
+    let mut decoders = crate::codec::Decoders::new(grx_render::probe_decoders(&device, &p.disabled_decoders), p.codec);
     println!("Décodeurs vidéo de ce PC (sondage {:.0} ms) :", t_probe.elapsed().as_secs_f64() * 1e3);
     for l in decoders.summary() {
         println!("  {l}");
@@ -175,16 +179,27 @@ pub fn run(
         t_conn.elapsed().as_secs_f64() * 1e3
     );
     on_connected(&conn)?;
-    // Annonce GRX-COD (un ancien host l'ignore et envoie son codec : on le décode s'il est connu).
-    conn.send_control(&decoders.announce(false).encode());
-    let conn = Arc::new(conn);
-
     let base_title = format!("GRX - {}", conn.host_name());
     // Préférences mémorisées (fichier absent ou corrompu = défauts) ; les options explicites de la
-    // ligne de commande (--vsync, --volume différent du défaut) l'emportent.
+    // ligne de commande (--vsync, --volume différent du défaut, --decoder) l'emportent.
     let prefs = p.prefs_path.as_deref().map(crate::overlay_prefs::OverlayPrefs::load).unwrap_or_default();
     let mut ov = crate::overlay::Overlay::new(conn.host_name(), p.capture_key.to_string());
     ov.apply_prefs(&prefs);
+    if let Some(d) = p.decoder {
+        ov.decoder = d;
+    }
+    decoders.mode = ov.decoder;
+    decoders.prefs = grx_core::codec_neg::FormatPrefs { yuv444: ov.yuv444, ten_bit: ov.ten_bit, hdr_display: any_hdr_display() };
+    println!(
+        "Décodeur : {} ; couleur 4:4:4 : {} ; préférer 10 bits : {} ; écran HDR : {}",
+        ov.decoder.label(),
+        if ov.yuv444 { "oui" } else { "non" },
+        if ov.ten_bit { "oui" } else { "non" },
+        if decoders.prefs.hdr_display { "oui" } else { "non" }
+    );
+    // Annonce GRX-COD (un ancien host l'ignore et envoie son codec : on le décode s'il est connu).
+    conn.send_control(&decoders.announce(false).encode());
+    let conn = Arc::new(conn);
     if p.volume != DEFAULT_VOLUME {
         ov.volume = p.volume;
         ov.muted = false;
@@ -208,6 +223,7 @@ pub fn run(
     })?;
     let handle = presenter.handle();
     let ui = Arc::new(Ui {
+        codec_req: Mutex::new(None),
         base: base_title,
         line: Mutex::new(String::new()),
         show_stats: AtomicBool::new(p.stats),
@@ -388,6 +404,55 @@ pub fn run(
 // ---------------------------------------------------------------------------------------------
 // Vidéo
 
+/// Un écran de ce PC est-il en mode HDR (PQ BT.2020) ? Annoncé au host (`FormatPrefs`).
+fn any_hdr_display() -> bool {
+    grx_video::list_outputs().unwrap_or_default().iter().any(|o| grx_video::output_is_hdr(o.adapter_index, o.output_index))
+}
+
+/// Décodeur pour `codec` dans le format annoncé par le host : voies capables de ce format d'abord
+/// (selon le choix « Décodeur »), puis la chaîne complète du mode en dernier recours.
+fn create_decoder(
+    vc: &VideoCtx,
+    codec: grx_video::Codec,
+    format: grx_video::PixelFormat,
+) -> Result<(VideoDecoder, Vec<grx_render::Attempt>), grx_render::ChainError> {
+    let mut attempts = Vec::new();
+    for kind in vc.decoders.kinds_for(codec, format) {
+        if vc.disabled.is_disabled(kind, codec) {
+            continue;
+        }
+        match VideoDecoder::with_kind(&vc.device, codec, kind) {
+            Ok(d) => return Ok((d, attempts)),
+            Err(e) => attempts.push(grx_render::Attempt { kind, error: e.to_string() }),
+        }
+    }
+    VideoDecoder::create_best_pref(&vc.device, codec, &vc.disabled, vc.decoders.mode).map(|(d, mut a)| {
+        attempts.append(&mut a);
+        (d, attempts)
+    })
+}
+
+/// Libellé du flux pour l'overlay : « HEVC RExt 4:4:4 8 bits », « HEVC Main10 HDR10 »…
+fn stream_label(codec: grx_video::Codec, hc: Option<&grx_core::codec_neg::HostCodec>) -> String {
+    use grx_core::codec_neg::Transfer;
+    let Some(h) = hc else { return crate::codec::label(codec).to_string() };
+    let f = h.format;
+    let profile = match (codec, f.is_444(), f.is_10bit()) {
+        (grx_video::Codec::H264, true, _) => "High 4:4:4",
+        (grx_video::Codec::H264, false, _) => "High",
+        (grx_video::Codec::Hevc, true, _) => "RExt",
+        (grx_video::Codec::Hevc, false, true) => "Main10",
+        (grx_video::Codec::Hevc, false, false) => "Main",
+        (grx_video::Codec::Av1, _, _) => "Main",
+    };
+    format!(
+        "{} {profile} {}{}",
+        crate::codec::label(codec),
+        f.label(),
+        if h.transfer == Transfer::Pq { " HDR10" } else { "" }
+    )
+}
+
 /// Décodage : device partagé avec le présentateur, décodeurs sondés, voies désactivées.
 struct VideoCtx {
     device: grx_render::D3D11Device,
@@ -403,8 +468,22 @@ unsafe impl Send for VideoCtx {}
 /// gère (sans couper la session), sinon `Err(message final)`.
 fn renegotiate(conn: &ClientConnection, vc: &mut VideoCtx, codec: grx_video::Codec, cause: &str) -> Result<(), String> {
     let negotiates = conn.host_codec().0 > 0;
+    // Format évolué (4:4:4, 10 bits) en panne : on retire ce format seulement, le codec reste.
+    let fmt = conn.host_codec().1.map(|h| h.format).filter(|f| *f != grx_core::codec_neg::FormatSet::YUV420_8);
+    if let (Some(f), true) = (fmt, negotiates) {
+        vc.decoders.mark_format_unusable(codec, f);
+        let a = vc.decoders.announce(true);
+        eprintln!("! décodage {} {} impossible ({cause}) : renégociation du format", crate::codec::label(codec), f.label());
+        conn.send_control(&a.encode());
+        conn.request_keyframe();
+        return Ok(());
+    }
     if codec == grx_video::Codec::H264 || !negotiates {
-        return Err(crate::codec::fatal_message(codec, cause, negotiates));
+        let mut m = crate::codec::fatal_message(codec, cause, negotiates);
+        if vc.decoders.mode == grx_render::DecoderPref::Software {
+            m.push_str(" Décodeur « Logiciel » choisi : installez OpenH264 (`grx-client fetch-openh264`) ou repassez le décodeur en Auto (menu, ou `play --decoder auto`).");
+        }
+        return Err(m);
     }
     vc.decoders.mark_unusable(codec);
     let a = vc.decoders.announce(true);
@@ -458,8 +537,11 @@ fn video_loop(
     let (mut decode_errors, mut presented_total, mut dropped_total, mut decoded_total) = (0u64, 0u64, 0u64, 0u64);
     let mut err_logged = 0;
     let mut consecutive_errors = 0u32;
-    // Pour l'overlay : résolution et codec du flux.
+    // Pour l'overlay : résolution et codec du flux, encodeur du host, décodeur local.
     let (mut res, mut codec_name) = ((0u32, 0u32), String::new());
+    let (mut enc_name, mut dec_name) = (String::new(), String::new());
+    // Format/transfert du flux pour lequel le décodeur courant a été créé.
+    let mut dec_stream: Option<(grx_core::codec_neg::FormatSet, grx_core::codec_neg::Transfer)> = None;
     // Liste d'écrans du host déjà vue ; bascule confirmée par le host, en attente de sa 1re image.
     let mut displays_seen = 0u64;
     let mut switch_confirmed: Option<Instant> = None;
@@ -509,6 +591,23 @@ fn video_loop(
             }
         }
 
+        // Choix « Décodeur » / 4:4:4 / 10 bits changé dans l'overlay : nouvelle annonce, nouveau
+        // décodeur à la prochaine image clé (le host renégocie le format si besoin).
+        if let Some((mode, yuv444, ten_bit)) = ui.codec_req.lock().unwrap().take() {
+            vc.decoders.mode = mode;
+            vc.decoders.prefs.yuv444 = yuv444;
+            vc.decoders.prefs.ten_bit = ten_bit;
+            println!(
+                "overlay : décodeur {} | 4:4:4 {} | 10 bits {}",
+                mode.label(),
+                if yuv444 { "oui" } else { "non" },
+                if ten_bit { "oui" } else { "non" }
+            );
+            conn.send_control(&vc.decoders.announce(false).encode());
+            dec = None;
+            dec_stream = None;
+            conn.request_keyframe();
+        }
         if let Some(f) = conn.recv_video_timeout(Duration::from_millis(20)) {
             if f.keyframe {
                 if let Some(t0) = switch_confirmed.take() {
@@ -524,6 +623,14 @@ fn video_loop(
                     println!("Codec du flux : {} -> {}", crate::codec::label(d.codec()), crate::codec::label(c));
                     dec = None;
                 }
+                // Format ou transfert changé (4:4:4, 10 bits, HDR) : voie adaptée au nouveau flux.
+                let now = conn.host_codec().1.map(|h| (h.format, h.transfer));
+                if dec.is_some() && now.is_some() && now != dec_stream {
+                    if let Some((fs, _)) = now {
+                        println!("Format du flux : {}", fs.label());
+                    }
+                    dec = None;
+                }
             }
             if dec.is_none() {
                 match sniff_codec(&f.data) {
@@ -535,22 +642,37 @@ fn video_loop(
                         }
                         continue;
                     }
-                    Some(codec) => match VideoDecoder::create_best(&vc.device, codec, &vc.disabled) {
-                        Ok((d, failed)) => {
+                    Some(codec) => match {
+                        let hc = conn.host_codec().1;
+                        let fmt = hc.as_ref().map_or(grx_video::PixelFormat::Yuv420, |h| {
+                            grx_video::PixelFormat::new(h.format.is_444(), h.format.is_10bit())
+                        });
+                        create_decoder(&vc, codec, fmt)
+                    } {
+                        Ok((mut d, failed)) => {
                             let hc = conn.host_codec().1;
+                            let pq = hc.as_ref().is_some_and(|h| h.transfer == grx_core::codec_neg::Transfer::Pq);
+                            d.set_hdr(pq);
+                            dec_stream = hc.as_ref().map(|h| (h.format, h.transfer));
+                            enc_name = hc.as_ref().and_then(|h| h.encoder).map_or(String::new(), |b| b.label().to_string());
+                            dec_name = format!("{} · {}", d.kind().label(), d.backend_name());
+                            {
+                                let mut ov = ui.ov.lock().unwrap();
+                                ov.decoder_hint = d.kind().label().to_string();
+                            }
                             println!(
                                 "Décodeur : {} ({}, {}){}{}",
                                 d.backend_name(),
                                 crate::codec::label(codec),
                                 d.kind().label(),
-                                hc.map_or(" [host sans négociation]".to_string(), |h| format!(" [codec choisi par le host : {}]", h.reason.label())),
+                                hc.as_ref().map_or(" [host sans négociation]".to_string(), |h| format!(" [codec choisi par le host : {}, {}]", h.reason.label(), stream_label(codec, Some(h)))),
                                 if failed.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" [repli après : {}]", failed.iter().map(|a| format!("{} : {}", a.kind.label(), a.error)).collect::<Vec<_>>().join(" ; "))
                                 }
                             );
-                            codec_name = format!("{} · {}", crate::codec::label(codec), d.kind().label());
+                            codec_name = stream_label(codec, hc.as_ref());
                             consecutive_errors = 0;
                             dec = Some(d);
                         }
@@ -655,6 +777,8 @@ fn video_loop(
                     width: res.0,
                     height: res.1,
                     codec: codec_name.clone(),
+                    encoder: enc_name.clone(),
+                    decoder: dec_name.clone(),
                     frames_lost: s.transport.video_rx.frames_lost,
                     dropped: pres.dropped,
                 });
@@ -861,6 +985,9 @@ impl OverlayGlue {
                     });
                 }
                 Action::SetVsync(on) => self.handle.set_vsync(on),
+                Action::SetCodecPrefs { decoder, yuv444, ten_bit } => {
+                    *ui.codec_req.lock().unwrap() = Some((decoder, yuv444, ten_bit));
+                }
                 Action::SelectDisplay(i) => {
                     *ui.display_switch.lock().unwrap() = Some(Instant::now());
                     send_display_select(&self.conn, i);
