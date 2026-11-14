@@ -4,6 +4,7 @@ mod control;
 mod cursor;
 mod display;
 mod elevation;
+mod encprobe;
 mod firewall;
 mod pipeline;
 mod portmap_task;
@@ -141,6 +142,17 @@ enum Cmd {
     FirewallHelp {
         #[arg(long, default_value_t = 7777)]
         port: u16,
+    },
+    /// Sonde les encodeurs vidéo par test réel (création + 2 images 256x256 + validation du flux)
+    /// et affiche le tableau (vendeur, codec, chroma, profondeur, résultat, temps). Résultats en
+    /// cache (encoder-probe.json), invalidé si le GPU, son pilote ou la version de GRX change.
+    Encoders {
+        /// Ignore le cache et refait la sonde
+        #[arg(long)]
+        refresh: bool,
+        /// Sortie JSON sur une ligne (utilisée par grx-gui)
+        #[arg(long)]
+        json: bool,
     },
     /// Écoute les connexions
     Run {
@@ -322,6 +334,7 @@ fn main() -> Result<()> {
             println!("{n} client(s) modifié(s) ; un host en cours d'exécution coupe la session du client concerné (il doit se reconnecter)");
         }
         Cmd::Elevation(cmd) => return run_elevation(cmd),
+        Cmd::Encoders { refresh, json } => encprobe::cmd_encoders(&dir, refresh, json)?,
         Cmd::FetchOpenh264 { dir, remove } => {
             let dir = match dir {
                 Some(d) => d,
@@ -363,6 +376,9 @@ fn main() -> Result<()> {
             // Coordonnées physiques partout (DXGI, curseur, SendInput) même avec une mise à
             // l'échelle Windows différente par écran.
             set_dpi_aware();
+            // Sonde des encodeurs en arrière-plan (cache sinon test réel) : l'énumération sert
+            // tant qu'elle n'a pas fini.
+            encprobe::start_background(dir.clone());
             let displays = grx_video::list_displays().unwrap_or_default();
             println!("Écrans capturables :");
             for (i, d) in displays.iter().enumerate() {

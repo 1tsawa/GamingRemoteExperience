@@ -6,6 +6,7 @@
 - Décodeur MF : sortie au format du flux (NV12 en 8 bits 4:2:0) au lieu de P010/AYUV/Y410 (conversion par image dans le MFT, GPU Intel saturé).
 - GPU Intel : FFmpeg D3D11VA préféré à Media Foundation (repli MF) ; FFmpeg LGPL 8.1 (avcodec/avutil/swresample) intégré au setup, SHA-256 épinglé.
 - Débit max par défaut 30 Mb/s (au lieu de 50) ; `--max-bitrate` inchangé.
+- Host : encodeurs détectés par test réel (création + 2 images + validation du flux), cache invalidé au changement de GPU/pilote/version ; `grx-host encoders [--refresh]` ; grx-gui signale (⚠) un choix d'encodeur/couleur non supporté.
 - RTT : une 1re mesure aberrante au démarrage ne fausse plus l'affichage pendant ~10 s.
 - `play --stats` : ligne `diag` (voie, Blt/s, Present/s, ProcessOutput/s, resets, IDR/s, décodeurs créés, renégociations, débit reçu) et bilan GPU.
 

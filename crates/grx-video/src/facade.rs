@@ -13,6 +13,7 @@ use crate::capture::CapturedFrame;
 use crate::encoder::{enum_hw_encoders, mf_startup, MfEncoder};
 use crate::error::{Result, VideoError, WinCtx};
 use crate::nvenc::{self, NvencEncoder};
+use crate::probe;
 use crate::select::{plan_routes, Route, Vendor};
 use crate::shader::HdrPass;
 use crate::soft::SoftEncoder;
@@ -125,8 +126,40 @@ impl Encoder {
             && adapter == Vendor::Nvidia
             && nvenc::yuv444_caps(device).iter().any(|&(c, ten)| c == cfg.codec && (ten || !cfg.format.is_10bit()));
         let oh = openh264::availability().is_ok();
-        let routes = plan_routes(cfg.pref, cfg.codec, cfg.format, adapter, &vendors, nv444, oh);
+        let mut routes = plan_routes(cfg.pref, cfg.codec, cfg.format, adapter, &vendors, nv444, oh);
         let mut attempts = Vec::new();
+        // Sonde par test réel (si finie) : les voies qui ont échoué ne sont pas essayées.
+        if let Some(results) = luid.and_then(probe::installed) {
+            let planned = !routes.is_empty();
+            routes.retain(|r| {
+                let kind = match *r {
+                    Route::Mf(i) => EncoderKind::Mf(mfts[i].2),
+                    Route::Nvenc => EncoderKind::Nvenc,
+                    Route::OpenH264 => EncoderKind::OpenH264,
+                };
+                match probe::verdict(&results, kind, cfg.codec, cfg.format) {
+                    Some(Err(why)) => {
+                        attempts.push(format!(
+                            "{} {} {} : écarté par la sonde au démarrage ({why} ; `grx-host encoders --refresh` pour re-tester)",
+                            probe::kind_id(kind),
+                            probe::codec_label(cfg.codec),
+                            cfg.format.label()
+                        ));
+                        false
+                    }
+                    _ => true,
+                }
+            });
+            if planned && routes.is_empty() {
+                return Err(VideoError::Other(format!(
+                    "aucun encodeur {} {} utilisable ({:?}) : {}",
+                    probe::codec_label(cfg.codec),
+                    cfg.format.label(),
+                    cfg.pref,
+                    attempts.join(" ; ")
+                )));
+            }
+        }
         for r in &routes {
             let made = match *r {
                 Route::Mf(i) => {
@@ -272,12 +305,17 @@ fn adapter_by_index(index: Option<u32>) -> Result<IDXGIAdapter1> {
     }
 }
 
-/// Encodeurs disponibles sur l'adaptateur `index` (`None` : adaptateur préféré, NVIDIA d'abord) :
+/// Encodeurs disponibles sur l'adaptateur `index` (`None` : adaptateur préféré, NVIDIA d'abord).
+/// Si la sonde par test réel de cet adaptateur est installée ([`crate::probe::install`]), seules
+/// les combinaisons qui l'ont passée ; sinon l'énumération :
 /// MFT matériels (4:2:0 8 bits ; 10 bits vérifié en créant réellement un encodeur HEVC/AV1),
 /// NVENC direct (4:4:4, interrogé via `nvEncGetEncodeCaps`), OpenH264 si installé.
 /// Coût : ~100 ms au premier appel (création réelle), puis cache.
 pub fn encoders_for_adapter(index: Option<u32>) -> Vec<EncoderInfo> {
     static CACHE: Mutex<Vec<(Option<u32>, Vec<EncoderInfo>)>> = Mutex::new(Vec::new());
+    if let Some(r) = crate::probe_run::adapter_id(index).ok().and_then(|a| probe::installed(a.luid)) {
+        return probe::infos_from_results(&r);
+    }
     if let Some((_, v)) = CACHE.lock().unwrap().iter().find(|(k, _)| *k == index) {
         return v.clone();
     }

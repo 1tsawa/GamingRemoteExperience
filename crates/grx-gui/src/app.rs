@@ -20,7 +20,7 @@ use crate::hoststatus::{self, RunStatus, Tone};
 
 #[path = "settings_tab.rs"]
 mod settings_tab;
-pub use settings_tab::DecoderProbe;
+pub use settings_tab::{DecoderProbe, EncoderProbe};
 use crate::qr::QrMatrix;
 use crate::settings::{self, GuiSettings};
 use crate::update::{self, BannerAction, MenuAction, UpdateUi};
@@ -136,6 +136,7 @@ pub struct App {
 
     // Paramètres : sonde des décodeurs de ce PC (`grx-client decoders`), lancée à la demande.
     decoders: DecoderProbe,
+    encoders: EncoderProbe,
 }
 
 impl App {
@@ -201,6 +202,7 @@ impl App {
             scroll_to_pair: 0,
             update: UpdateUi::default(),
             decoders: DecoderProbe::default(),
+            encoders: EncoderProbe::default(),
             opts,
         }
     }

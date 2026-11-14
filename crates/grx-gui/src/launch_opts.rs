@@ -528,6 +528,84 @@ pub fn codec_warning(choice: CodecChoice, decodable: Option<&[CodecChoice]>) -> 
     ))
 }
 
+/// Une combinaison testée par `grx-host encoders --json` (sonde par test réel).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct EncoderRow {
+    #[serde(default)]
+    pub adapter: String,
+    pub vendor: String,
+    /// `mf-nvidia`, `mf-amd`, `mf-intel`, `mf-other`, `nvenc`, `openh264`.
+    pub kind: String,
+    /// `h264`, `hevc`, `av1`.
+    pub codec: String,
+    /// `420`, `420p10`, `444`, `444p10`.
+    pub format: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub init_ms: u32,
+    #[serde(default)]
+    pub frame_ms: u32,
+}
+
+impl EncoderRow {
+    pub fn summary(&self) -> String {
+        let codec = match self.codec.as_str() {
+            "h264" => "H.264",
+            "hevc" => "HEVC",
+            "av1" => "AV1",
+            o => o,
+        };
+        let fmt = match self.format.as_str() {
+            "420" => "4:2:0",
+            "420p10" => "4:2:0 10 bits",
+            "444" => "4:4:4",
+            "444p10" => "4:4:4 10 bits",
+            o => o,
+        };
+        format!("{} {codec} {fmt}", self.vendor)
+    }
+}
+
+/// Lit la dernière ligne JSON `{"encoders":[…]}` de `grx-host encoders --json`.
+pub fn parse_encoders(out: &str) -> Option<Vec<EncoderRow>> {
+    let line = out.lines().rev().find(|l| l.trim_start().starts_with('{'))?;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    serde_json::from_value(v.get("encoders")?.clone()).ok()
+}
+
+fn encoder_matches(choice: EncoderChoice, kind: &str) -> bool {
+    match choice {
+        EncoderChoice::Auto => true,
+        EncoderChoice::Nvidia => kind == "mf-nvidia" || kind == "nvenc",
+        EncoderChoice::Amd => kind == "mf-amd",
+        EncoderChoice::Intel => kind == "mf-intel",
+        EncoderChoice::Software => kind == "openh264",
+    }
+}
+
+/// Avertissement (⚠) si le choix Encodeur / Couleur / Codec du host n'a passé la sonde pour
+/// aucune combinaison sur ce PC. `None` : choix supporté, ou sonde indisponible.
+pub fn encoder_warning(enc: EncoderChoice, chroma: ChromaChoice, codec: CodecChoice, rows: Option<&[EncoderRow]>) -> Option<String> {
+    let rows = rows?;
+    let ok: Vec<&EncoderRow> = rows.iter().filter(|r| r.ok && encoder_matches(enc, &r.kind)).collect();
+    if ok.is_empty() {
+        return Some(format!("aucun encodeur « {} » n'a passé le test sur ce PC", enc.label()));
+    }
+    let want444 = chroma == ChromaChoice::C444;
+    if want444 && !ok.iter().any(|r| r.format.starts_with("444")) {
+        return Some("4:4:4 non pris en charge par cet encodeur sur ce PC (repli en 4:2:0)".into());
+    }
+    if codec != CodecChoice::Auto {
+        let fits = |r: &&&EncoderRow| r.codec == codec.arg() && (!want444 || r.format.starts_with("444"));
+        if !ok.iter().any(|r| fits(&r)) {
+            return Some(format!("{} non encodable ici avec ces réglages : le host choisira un autre codec", codec.label()));
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -849,6 +927,42 @@ mod tests {
 
         assert!(parse_decodable("not json").is_none());
         assert!(parse_decodable("{\"other\":true}").is_none());
+    }
+
+    fn row(kind: &str, codec: &str, format: &str, ok: bool) -> EncoderRow {
+        EncoderRow { adapter: "GPU".into(), vendor: "NVIDIA".into(), kind: kind.into(), codec: codec.into(), format: format.into(), ok, reason: String::new(), init_ms: 1, frame_ms: 1 }
+    }
+
+    #[test]
+    fn parse_encoders_reads_last_json_line() {
+        let out = "log
+{\"encoders\":[{\"adapter\":\"G\",\"vendor\":\"NVIDIA\",\"kind\":\"nvenc\",\"name\":\"n\",\"codec\":\"hevc\",\"format\":\"444\",\"ok\":true,\"reason\":\"\",\"init_ms\":5,\"frame_ms\":1}]}";
+        let v = parse_encoders(out).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].summary(), "NVIDIA HEVC 4:4:4");
+        assert!(parse_encoders("rien").is_none());
+        assert!(parse_encoders("{\"x\":1}").is_none());
+    }
+
+    #[test]
+    fn encoder_warning_logic() {
+        let rows = vec![
+            row("mf-nvidia", "hevc", "420", true),
+            row("mf-nvidia", "av1", "420", true),
+            row("nvenc", "hevc", "444", true),
+            row("nvenc", "av1", "444", false),
+            row("mf-amd", "h264", "420", false),
+        ];
+        let a = Some(&rows[..]);
+        assert!(encoder_warning(EncoderChoice::Auto, ChromaChoice::Auto, CodecChoice::Auto, None).is_none());
+        assert!(encoder_warning(EncoderChoice::Auto, ChromaChoice::Auto, CodecChoice::Auto, a).is_none());
+        assert!(encoder_warning(EncoderChoice::Nvidia, ChromaChoice::C444, CodecChoice::Hevc, a).is_none());
+        assert!(encoder_warning(EncoderChoice::Amd, ChromaChoice::Auto, CodecChoice::Auto, a).unwrap().contains("AMD"));
+        assert!(encoder_warning(EncoderChoice::Software, ChromaChoice::Auto, CodecChoice::Auto, a).is_some());
+        assert!(encoder_warning(EncoderChoice::Nvidia, ChromaChoice::C444, CodecChoice::Av1, a).unwrap().contains("AV1"));
+        assert!(encoder_warning(EncoderChoice::Auto, ChromaChoice::Auto, CodecChoice::H264, a).is_some());
+        let only420 = vec![row("mf-intel", "h264", "420", true)];
+        assert!(encoder_warning(EncoderChoice::Intel, ChromaChoice::C444, CodecChoice::Auto, Some(&only420)).unwrap().contains("4:4:4"));
     }
 
     #[test]

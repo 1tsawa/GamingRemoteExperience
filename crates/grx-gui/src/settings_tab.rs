@@ -14,8 +14,8 @@ use eframe::egui::{self, RichText, TextEdit};
 
 use super::App;
 use crate::launch_opts::{
-    codec_warning, parse_decodable, ChromaChoice, ClientGamepadAs, ClientPlayOptions, CodecChoice, DecoderChoice,
-    EncoderChoice, HostGamepadType, HostRunOptions,
+    codec_warning, encoder_warning, parse_decodable, parse_encoders, ChromaChoice, ClientGamepadAs, ClientPlayOptions, CodecChoice, DecoderChoice,
+    EncoderChoice, EncoderRow, HostGamepadType, HostRunOptions,
 };
 use crate::theme::{card, colored, muted, small_muted, ERR, WARN};
 use crate::update::{self, MenuAction, UpdatePrefs};
@@ -79,6 +79,65 @@ impl DecoderProbe {
     }
 }
 
+/// Sonde des encodeurs de ce PC par test réel (`grx-host encoders --json`, sans fenêtre) : relit le
+/// cache du host (instantané) ou teste chaque combinaison (quelques secondes).
+#[derive(Default)]
+pub struct EncoderProbe {
+    state: EncState,
+}
+
+#[derive(Default)]
+enum EncState {
+    #[default]
+    NotStarted,
+    Running(Receiver<Option<Vec<EncoderRow>>>),
+    Done(Option<Vec<EncoderRow>>),
+}
+
+impl EncoderProbe {
+    fn start(&mut self, exe: PathBuf, data_dir: PathBuf, refresh: bool, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("--data-dir").arg(data_dir).arg("encoders").arg("--json").stdin(std::process::Stdio::null());
+            if refresh {
+                cmd.arg("--refresh");
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let r = cmd
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| parse_encoders(&String::from_utf8_lossy(&o.stdout)));
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        self.state = EncState::Running(rx);
+    }
+
+    fn poll(&mut self) {
+        if let EncState::Running(rx) = &self.state {
+            match rx.try_recv() {
+                Ok(r) => self.state = EncState::Done(r),
+                Err(TryRecvError::Disconnected) => self.state = EncState::Done(None),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn rows(&self) -> Option<&[EncoderRow]> {
+        match &self.state {
+            EncState::Done(Some(v)) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 /// En-tête de section avec bouton « Valeurs par défaut » à droite. Renvoie `true` si cliqué.
 fn section_header(ui: &mut egui::Ui, hint: &str) -> bool {
     let mut reset = false;
@@ -121,6 +180,13 @@ impl App {
         self.decoders.poll();
     }
 
+    fn ensure_encoder_probe(&mut self, ctx: &egui::Context) {
+        if matches!(self.encoders.state, EncState::NotStarted) {
+            self.encoders.start(self.paths.host_exe.clone(), self.paths.host_dir.clone(), false, ctx);
+        }
+        self.encoders.poll();
+    }
+
     /// Avertissement si le codec demandé par ce client n'est pas décodable ici.
     pub(super) fn client_codec_warning(&mut self, ctx: &egui::Context) -> Option<String> {
         if self.settings.client.codec == CodecChoice::Auto {
@@ -158,6 +224,9 @@ impl App {
                 self.settings.host.chroma = h.chroma;
             }
             let warn = self.client_codec_warning(ctx);
+            self.ensure_encoder_probe(ctx);
+            let h = &self.settings.host;
+            let enc_warn = encoder_warning(h.encoder, h.chroma, h.codec, self.encoders.rows());
             let host_locked = self.host.running;
             egui::Grid::new("set-codec").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Codec demandé (ce PC client)")
@@ -179,8 +248,13 @@ impl App {
                 });
                 ui.end_row();
                 ui.label("Encodeur (ce host)").on_hover_text("run --encoder : GPU utilisé pour l'encodage");
-                ui.add_enabled_ui(!host_locked, |ui| {
-                    combo(ui, "set-enc", &mut self.settings.host.encoder, &EncoderChoice::ALL, EncoderChoice::label)
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!host_locked, |ui| {
+                        combo(ui, "set-enc", &mut self.settings.host.encoder, &EncoderChoice::ALL, EncoderChoice::label)
+                    });
+                    if let Some(w) = &enc_warn {
+                        ui.label(colored(format!("⚠ {w}"), WARN));
+                    }
                 });
                 ui.end_row();
                 ui.label("Couleur (ce host)").on_hover_text("run --chroma : 4:4:4 = texte plus net (NVIDIA HEVC, client compatible)");
@@ -188,6 +262,35 @@ impl App {
                     combo(ui, "set-chroma", &mut self.settings.host.chroma, &ChromaChoice::ALL, ChromaChoice::label)
                 });
                 ui.end_row();
+            });
+            ui.horizontal_wrapped(|ui| {
+                let text = match &self.encoders.state {
+                    EncState::NotStarted | EncState::Running(_) => "Encodeurs de ce PC (test réel) : sondage en cours…".to_string(),
+                    EncState::Done(None) => "Encodeurs de ce PC : sondage impossible (grx-host introuvable ?).".to_string(),
+                    EncState::Done(Some(v)) => {
+                        let ok: Vec<String> = v.iter().filter(|r| r.ok).map(|r| r.summary()).collect();
+                        if ok.is_empty() {
+                            "Encodeurs de ce PC (test réel) : aucun encodeur n'a passé le test.".to_string()
+                        } else {
+                            format!("Encodeurs de ce PC (test réel) : {}", ok.join(", "))
+                        }
+                    }
+                };
+                let failed: Vec<String> = self
+                    .encoders
+                    .rows()
+                    .map(|v| v.iter().filter(|r| !r.ok).map(|r| format!("{} : {}", r.summary(), r.reason)).collect())
+                    .unwrap_or_default();
+                let l = ui.label(small_muted(text));
+                if !failed.is_empty() {
+                    l.on_hover_text(format!("Combinaisons refusées :
+{}", failed.join("
+")));
+                }
+                let busy = matches!(self.encoders.state, EncState::Running(_));
+                if ui.add_enabled(!busy, egui::Button::new("Re-tester").small()).on_hover_text("grx-host encoders --refresh").clicked() {
+                    self.encoders.start(self.paths.host_exe.clone(), self.paths.host_dir.clone(), true, ctx);
+                }
             });
             let probe = match &self.decoders.state {
                 ProbeState::NotStarted | ProbeState::Running(_) => "Décodeurs de ce PC : sondage en cours…".to_string(),

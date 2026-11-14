@@ -42,14 +42,18 @@ mod nvenc;
 mod nvenc_abi;
 pub mod obu;
 pub mod openh264;
+pub mod probe;
+mod probe_run;
 pub mod select;
 mod shader;
 mod soft;
+pub mod streaminfo;
 
 pub use capture::{capturable, hdr_test_pattern, list_displays, list_outputs, output_is_hdr, CapturedFrame, OutputInfo, ScreenCapturer};
 pub use displayconfig::{monitor_names, MonitorName};
 pub use cursor::{cursor_screen_pos, CursorImage, CursorState, CursorTracker};
 pub use facade::{available_encoders, encoders_for_adapter, Encoder, EncoderBackend, EncoderInfo, EncoderKind};
+pub use probe_run::{adapter_id, hardware_adapters, probe_adapter, AdapterId, PROBE_SIZE};
 pub use select::{EncoderPref, Vendor};
 /// Types D3D11 réexportés (crates sans dépendance `windows`).
 pub use windows::Win32::Graphics::Direct3D11::{ID3D11Device as D3D11Device, ID3D11Texture2D as D3D11Texture};
