@@ -89,6 +89,11 @@ impl Identity {
         fingerprint(&self.public)
     }
 
+    /// Clé de sonde de joignabilité de ce host (voir `pairing`) : dérivée de la clé privée, sans la révéler.
+    pub fn probe_key(&self) -> crate::pairing::ProbeKey {
+        crate::pairing::ProbeKey::from_secret(&self.secret)
+    }
+
     pub(crate) fn secret(&self) -> &[u8; 32] {
         &self.secret
     }

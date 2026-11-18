@@ -273,7 +273,7 @@ impl HostRunOptions {
             .bind
             .trim()
             .parse::<std::net::SocketAddr>()
-            .map_err(|_| "Adresse d'écoute invalide : écrivez ip:port (ex. 0.0.0.0:7777).".to_string())?;
+            .map_err(|_| "Adresse d'écoute invalide : écrivez ip:port (ex. 0.0.0.0:443).".to_string())?;
         if addr.port() == 0 {
             return Err("Le port d'écoute doit être entre 1 et 65535.".into());
         }

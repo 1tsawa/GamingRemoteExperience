@@ -31,14 +31,16 @@ chaque machine possède sa propre identité cryptographique et le host décide s
 - **Identité** : paire X25519 générée à la première exécution, stockée dans `%APPDATA%\GamingRemoteExperience\<role>\identity.json`. L'empreinte (`ABCD-EFGH-…`) est un SHA-256 tronqué de la clé publique.
 - **Anti-MITM sans autorité** : le client connaît la clé du host *avant* de se connecter (elle est dans le lien d'invitation, puis mémorisée dans `hosts.json`). Noise IK authentifie le host par cette clé : un imposteur ne peut pas répondre.
 - **Autorisation** : le host n'accepte que (a) une clé présente dans `trust.json`, ou (b) un jeton d'invitation valide, qui est consommé et ajoute la clé du client. Seul le hash du jeton est stocké.
-- **Silence envers les inconnus** : aucune réponse (pas même une erreur) à un client non autorisé → pas de scan de ports applicatif, pas d'amplification UDP.
+- **Silence envers les inconnus** : aucune réponse (pas même une erreur) à un client non autorisé → pas de scan de ports applicatif, pas d'amplification UDP. Seule exception, choisie par le propriétaire du host et limitée dans le temps : les demandes d'accès ouvertes (voir « Demandes d'accès sans invitation »).
 - **Anti-rejeu** : horodatage ±5 min, strictement croissant par client ET postérieur au démarrage du host (un INIT capturé avant un redémarrage ne peut pas être rejoué) sur la poignée de main ; compteur 64 bits explicite + fenêtre glissante de 1024 paquets sur les données (tolère le réordonnancement UDP). La fenêtre n'avance qu'après authentification du paquet.
 - **Révocation** : `grx-host revoke <empreinte>` ; effet sur les nouvelles connexions ET sur la session en cours (revérifiée chaque seconde, voir « Revue de sécurité »).
 
 ### Format des paquets
 ```
 INIT  [0x01][Noise msg1 : e, es, s, ss + {v, ts, name, token?}]
-RESP  [0x02][Noise msg2 : e, ee, se + {v, sid, name}]
+RESP  [0x02][Noise msg2 : e, ee, se + {v, sid, name, pair?}]
+KEY_REQ  [0x03]["GRXK"][version u16 LE][sonde 16][horodatage u64 LE][zéros]   (64 octets)
+KEY_RESP [0x04]["GRXK"][version u16 LE][clé du host 32]     (39 octets)
 DATA  [0x10][sid u32 LE][nonce u64 LE][AES-256-GCM ciphertext + tag 16]
 ```
 
@@ -183,6 +185,32 @@ Le client choisit l'écran du host qu'il voit (ligne « Écran » du menu, `Ctrl
 - Arrêt brutal (processus tué, fermeture de la console) : la redirection reste jusqu'à la fin du bail (≤ 1 h) ; elle est remplacée au prochain démarrage.
 - L'IP publique peut changer : nom DuckDNS conseillé ; l'adresse vue par le host est mise à jour au renouvellement.
 - Exposer un port UDP : le host reste silencieux envers les inconnus (voir « Modèle de sécurité ») ; l'UPnP permet aussi à n'importe quel logiciel du LAN d'ouvrir des ports, c'est un choix de l'utilisateur sur sa box.
+
+## Demandes d'accès sans invitation
+
+Alternative au lien `grx://` : le client tape seulement `IP:port`, le propriétaire du host valide la demande dans son interface (`grx_core::pairing`, `TrustStore::{note,approve,deny}_request`, `grx-client request`, `grx-host requests`).
+
+1. **Ouverture** (host, GUI ou `grx-host requests open --minutes N`) : `requests_open_until_ms` dans `trust.json` (0 = fermé, défaut). Fermé, le host reste muet comme avant.
+2. **Clé** : `KEY_REQ` → `KEY_RESP` (clé publique du host). Réponse plus petite que la requête (pas d'amplification), soumise au même limiteur que les INIT.
+3. **Demande** : INIT Noise IK habituel avec `pair: true`, rembourré à 640 octets (champ `pad`). Le host répond un RESP chiffré `{sid: 0, pair: pending|denied|accepted}` et **ne crée aucune session** (une demande ne peut ni déloger la session active ni consommer de jeton) ; il se tait si cette réponse serait plus grosse que l'INIT (pas d'amplification par adresse usurpée, même pour qui connaît la clé du host). Le client relance toutes les 2 s (horodatage croissant : anti-rejeu inchangé). Demandes fermées : silence pour tout client non autorisé, même déjà refusé ; un client autorisé reçoit `accepted`.
+4. **Décision** (host) : accepter (la clé devient un client autorisé, rôle Complet ou Lecture seule) ou refuser (retenu 1 h). Le client accepté mémorise le host (`hosts.json`), puis se connecte normalement.
+
+- **Bornes** : 16 demandes au plus (la plus ancienne est oubliée), oubliées 10 min après la dernière relance ; nom 64 caractères, nettoyé avant affichage ; `trust.json` réécrit au plus toutes les 15 s par demande. Les clés ne coûtant rien à fabriquer et un INIT de demande se traitant sans aller-retour (adresse source usurpable), les NOUVELLES demandes passent en plus par un seau global (`HostAuth`, 4 d'affilée puis 1 / 5 s) : pas de saturation de `trust.json` ni d'écritures disque en rafale. Le journal du host n'écrit qu'une ligne par changement d'état d'une demande.
+- **Compatibilité** : sans `pair`, le JSON de l'INIT/RESP est identique à l'ancien. Un ancien host ignore `KEY_REQ` et `pair` (silence : le client affiche « ne répond pas »). Une version ancienne qui réécrit `trust.json` perd les demandes et referme les demandes (moindre privilège).
+- **Limite de sécurité (assumée)** : la clé reçue par `KEY_RESP` n'est **pas authentifiée** (confiance au premier usage). Un intermédiaire actif peut substituer la sienne ; il est démasqué en comparant les empreintes : le client affiche celle du host reçue et la sienne, le host affiche celle de la demande. Empreintes de 120 bits : impossibles à forger par force brute, contrairement à un code court. L'invitation reste la méthode sûre sans vérification visuelle.
+- **Demandes ouvertes** : n'importe qui peut alors apprendre qu'un host GRX écoute (et sa clé publique) et déposer une demande (bornée). D'où l'ouverture limitée dans le temps par défaut (15 min / 1 h ; « sans limite » déconseillé).
+
+### Test de joignabilité
+
+`KEY_REQ` portant une **sonde du host** : `SHA-256("GRX-PROBE-v2" ‖ clé de sonde ‖ horodatage)[..16]`, la clé de sonde étant `SHA-256("GRX-PROBE-KEY-v1" ‖ clé privée)` (`Identity::probe_key`, `pairing::ProbeKey`). Le host y répond même demandes fermées, car seul son propriétaire (la GUI, qui lit `identity.json` sur le même PC) sait la produire. Une sonde n'est valable que ±30 s et une seule fois (horodatage strictement croissant, mémorisé par le host) : une sonde capturée sur le réseau ne se rejoue pas. La GUI sonde `127.0.0.1:port`, l'IP locale et l'adresse publique (redirection UPnP ou adresse saisie), une sonde neuve par essai. Un échec sur l'adresse publique depuis l'intérieur est ambigu (box sans « NAT loopback ») : seul un essai depuis l'extérieur tranche.
+
+### Port 443
+
+**Port par défaut depuis 0.2.4 : UDP 443** (`run --bind 0.0.0.0:443`, `invite --port`, `firewall-help --port`, redirection UPnP = port d'écoute, défauts de grx-gui ; avant : 7777). Les réglages déjà enregistrés (`gui.json`, `hosts.json`) sont conservés tels quels ; le préréglage « Port 7777 » reste dans la GUI. Tout le trafic (vidéo, audio, entrées, contrôle) passe par ce seul port UDP. UDP 443 (QUIC/HTTP/3) traverse beaucoup de réseaux filtrés ; pas ceux qui n'autorisent que TCP 443 ou imposent un proxy (encapsulation TCP/TLS : non faite). Windows n'a pas de ports privilégiés : aucun droit administrateur requis. La règle de pare-feu de l'installateur porte sur le programme (`program=grx-host.exe`, sans port) : elle suit. Port déjà pris (WSAEADDRINUSE) ou réservé (WSAEACCES, plages exclues Hyper-V/WSL) : message clair proposant `--bind …:7777`. Vérifié sur le PC de dev : host lié à 0.0.0.0:443 sans droits administrateur, demande d'accès acceptée par la CLI, connexion en boucle locale ; non testé depuis un réseau filtré réel.
+
+### Hosts mémorisés à plusieurs adresses
+
+`hosts.json` : un host = sa clé publique (identité épinglée) + une liste ORDONNÉE d'adresses (`addrs`, 8 au plus). Rétrocompatibilité : `addr` est toujours écrit (= première adresse, la seule lue par les versions < 0.2.4) et `addrs` seulement s'il y a plusieurs adresses ; un fichier ancien se lit tel quel ; si une ancienne version a changé `addr`, celle-ci repasse en tête à la lecture. À la connexion (`ClientConnection::connect`, `ConnectOptions::addrs`), les adresses sont essayées **une à la fois** dans l'ordre (800 ms par adresse au premier tour, puis le délai normal) : un seul INIT en vol, car le host ne garde qu'une session en attente. Une réponse indéchiffrable fait passer à l'adresse suivante. La clé du host étant épinglée par Noise IK, aucune adresse ne peut usurper le host. `play/connect/bench --addr` force une adresse ponctuellement. CLI : `grx-client hosts [list|edit|add-addr|remove-addr|rename|remove]` ; GUI : « Modifier… » (validation `profiles::validate_addr`, partagée).
 
 ## Revue de sécurité
 

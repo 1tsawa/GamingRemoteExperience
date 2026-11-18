@@ -9,6 +9,7 @@ mod overlay;
 mod overlay_layout;
 mod overlay_prefs;
 mod play;
+mod request;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,6 +28,32 @@ struct Cli {
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum HostsCmd {
+    /// Liste les hosts mémorisés (toutes leurs adresses)
+    List,
+    /// Remplace les adresses d'un host, dans l'ordre d'essai (`--addr A --addr B` …)
+    Edit {
+        name: String,
+        /// Adresse IP:port, [IPv6]:port ou nom:port (répétable ; la première est essayée d'abord)
+        #[arg(long = "addr", required = true)]
+        addrs: Vec<String>,
+    },
+    /// Ajoute une adresse (à la fin, ou en tête avec `--first`)
+    AddAddr {
+        name: String,
+        addr: String,
+        #[arg(long)]
+        first: bool,
+    },
+    /// Retire une adresse (pas la dernière)
+    RemoveAddr { name: String, addr: String },
+    /// Renomme un host mémorisé
+    Rename { old: String, new: String },
+    /// Oublie un host mémorisé
+    Remove { name: String },
 }
 
 /// `play --codec` : codec demandé au host.
@@ -60,8 +87,12 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Liste les hosts mémorisés
-    Hosts,
+    /// Hosts mémorisés : liste (sans argument), ou modification des adresses / du nom. Un host
+    /// garde son identité (empreinte) : changer ses adresses ne demande pas de réappairer.
+    Hosts {
+        #[command(subcommand)]
+        cmd: Option<HostsCmd>,
+    },
     /// Se connecte avec un lien grx:// (nouvelle invitation) ou le nom d'un host mémorisé,
     /// vérifie la session quelques secondes puis se déconnecte
     Connect {
@@ -72,6 +103,25 @@ enum Cmd {
         /// Durée de maintien de la session (s)
         #[arg(long, default_value_t = 3.0)]
         secs: f64,
+        /// Force cette adresse (IP:port) au lieu de celles mémorisées, pour cette fois
+        #[arg(long)]
+        addr: Option<String>,
+    },
+    /// Demande l'accès à un host sans lien d'invitation (seulement IP:port) : le propriétaire du
+    /// host doit avoir ouvert les demandes, puis valider celle-ci. Une fois acceptée, le host est
+    /// mémorisé (`play <nom>`). Sortie lisible par grx-gui (lignes `GRX-REQ ...`) ; code 4 si refusée.
+    Request {
+        /// Adresse du host : IP:port, [IPv6]:port ou nom:port ; `-` = lue sur l'entrée standard
+        addr: String,
+        /// Nom à donner à ce host (défaut : l'adresse)
+        #[arg(long)]
+        save_as: Option<String>,
+        /// Attente maximale de la décision (s)
+        #[arg(long, default_value_t = 300)]
+        wait: u64,
+        /// Empreinte attendue du host (si vous la connaissez déjà)
+        #[arg(long)]
+        expect_fingerprint: Option<String>,
     },
     /// Ouvre une fenêtre, affiche le flux du host (décodage matériel), joue l'audio et envoie clavier/souris.
     /// F11 plein écran, F10 stats dans le titre. Le curseur du host (forme et position, envoyés à
@@ -83,6 +133,9 @@ enum Cmd {
         /// Nom à donner à ce host (première connexion)
         #[arg(long)]
         save_as: Option<String>,
+        /// Force cette adresse (IP:port) au lieu de celles mémorisées, pour cette fois
+        #[arg(long)]
+        addr: Option<String>,
         /// N'envoie AUCUNE entrée au host (clavier/souris)
         #[arg(long)]
         no_input: bool,
@@ -198,6 +251,9 @@ enum Cmd {
         /// Ne pas imprimer la ligne de statistiques par seconde
         #[arg(long)]
         quiet: bool,
+        /// Force cette adresse (IP:port) au lieu de celles mémorisées, pour cette fois
+        #[arg(long)]
+        addr: Option<String>,
     },
 }
 
@@ -212,6 +268,24 @@ impl Store {
     /// Lien d'invitation ou nom mémorisé -> `Invite` ; `bool` = host déjà connu.
     fn resolve(&self, target: &str) -> Result<(Invite, bool)> {
         Ok(self.0.resolve(target)?)
+    }
+
+    /// Comme `resolve`, plus la liste des adresses à essayer (toutes celles du host mémorisé, ou
+    /// seulement `force` = `--addr`). La clé du host reste celle épinglée.
+    fn resolve_addrs(&self, target: &str, force: Option<String>) -> Result<(Invite, bool, Vec<String>)> {
+        let (mut invite, known) = self.resolve(target)?;
+        let addrs = match force {
+            Some(a) => {
+                let a = grx_core::profiles::validate_addr(&a).map_err(|e| anyhow!("--addr : {e}"))?;
+                invite.addr = a.clone();
+                vec![a]
+            }
+            None if known => self.0.addresses(target).unwrap_or_else(|| vec![invite.addr.clone()]),
+            None => vec![invite.addr.clone()],
+        };
+        let shown = if addrs.len() > 1 { format!("{} (puis {})", addrs[0], addrs[1..].join(", ")) } else { addrs[0].clone() };
+        println!("Connexion à {shown} — empreinte attendue : {}", fingerprint(&invite.host_key));
+        Ok((invite, known, addrs))
     }
 
     fn remember(&mut self, invite: &Invite, save_as: Option<String>) -> Result<()> {
@@ -234,6 +308,63 @@ fn read_target(target: String) -> Result<String> {
         return Err(anyhow!("aucune cible reçue sur l'entrée standard"));
     }
     Ok(line)
+}
+
+/// `grx-client hosts …` : liste et modification des hosts mémorisés.
+fn hosts_cmd(store: &mut ProfileStore, cmd: HostsCmd) -> Result<()> {
+    let missing = |n: &str| anyhow!("host inconnu : « {n} » (voir `grx-client hosts`)");
+    let show = |store: &ProfileStore, name: &str| {
+        println!("Adresses de « {name} » : {}", store.addresses(name).unwrap_or_default().join(", "));
+        println!("L'identité du host (empreinte) ne change pas : pas besoin de réappairer.");
+    };
+    match cmd {
+        HostsCmd::List => {
+            for h in store.hosts() {
+                let fp = h.fingerprint().unwrap_or_default();
+                let a = h.addresses();
+                let more = if a.len() > 1 { format!(" +{}", a.len() - 1) } else { String::new() };
+                println!("{:<16} {:<32} {fp}", h.name, format!("{}{more}", a[0]));
+                for x in a.iter().skip(1) {
+                    println!("{:<16}   puis {x}", "");
+                }
+            }
+        }
+        HostsCmd::Edit { name, addrs } => {
+            if !store.set_addresses(&name, &addrs)? {
+                return Err(missing(&name));
+            }
+            show(store, &name);
+        }
+        HostsCmd::AddAddr { name, addr, first } => {
+            if !store.add_address(&name, &addr, first)? {
+                return Err(missing(&name));
+            }
+            show(store, &name);
+        }
+        HostsCmd::RemoveAddr { name, addr } => {
+            if !store.remove_address(&name, &addr)? {
+                return Err(missing(&name));
+            }
+            show(store, &name);
+        }
+        HostsCmd::Rename { old, new } => {
+            let new = new.trim();
+            if new.is_empty() {
+                bail!("le nom ne peut pas être vide");
+            }
+            if !store.rename(&old, new)? {
+                return Err(missing(&old));
+            }
+            println!("« {old} » renommé en « {new} ».");
+        }
+        HostsCmd::Remove { name } => {
+            if !store.remove(&name)? {
+                return Err(missing(&name));
+            }
+            println!("« {name} » oublié.");
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -259,16 +390,10 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::FetchOpenh264 { .. } => unreachable!("traité avant"),
         Cmd::Info => println!("Empreinte de ce client : {}", identity.fingerprint()),
-        Cmd::Hosts => {
-            for h in store.0.hosts() {
-                let fp = h.fingerprint().unwrap_or_default();
-                println!("{:<16} {:<28} {fp}", h.name, h.addr);
-            }
-        }
-        Cmd::Connect { target, save_as, secs } => {
-            let (invite, known) = store.resolve(&read_target(target)?)?;
-            println!("Connexion à {} — empreinte attendue : {}", invite.addr, fingerprint(&invite.host_key));
-            let conn = ClientConnection::connect(&identity, &invite, ConnectOptions::default())?;
+        Cmd::Hosts { cmd } => hosts_cmd(&mut store.0, cmd.unwrap_or(HostsCmd::List))?,
+        Cmd::Connect { target, save_as, secs, addr } => {
+            let (invite, known, addrs) = store.resolve_addrs(&read_target(target)?, addr)?;
+            let conn = ClientConnection::connect(&identity, &invite, ConnectOptions { addrs, ..Default::default() })?;
             println!(
                 "Authentifié auprès de « {} » ({}), session {:08x}",
                 conn.host_name(),
@@ -299,6 +424,7 @@ fn main() -> Result<()> {
         Cmd::Play {
             target,
             save_as,
+            addr,
             no_input,
             no_audio,
             volume,
@@ -323,12 +449,11 @@ fn main() -> Result<()> {
             disable_decoder,
             fail_decoder_after,
         } => {
-            let (invite, known) = store.resolve(&read_target(target)?)?;
-            println!("Connexion à {} — empreinte attendue : {}", invite.addr, fingerprint(&invite.host_key));
+            let (invite, known, addrs) = store.resolve_addrs(&read_target(target)?, addr)?;
             let code = play::run(
                 &identity,
                 &invite,
-                ConnectOptions::default(),
+                ConnectOptions { addrs, ..Default::default() },
                 play::PlayOpts {
                     no_input,
                     no_audio,
@@ -387,6 +512,43 @@ fn main() -> Result<()> {
                 std::process::exit(code);
             }
         }
+        Cmd::Request { addr, save_as, wait, expect_fingerprint } => {
+            let addr = read_target(addr)?;
+            let opts = request::RequestOpts {
+                name: ConnectOptions::default().name,
+                wait: Duration::from_secs(wait.max(5)),
+                expect_fingerprint,
+            };
+            println!("GRX-REQ client {}", identity.fingerprint());
+            println!("Demande d'accès à {addr}. Empreinte de ce client : {}", identity.fingerprint());
+            let outcome = request::request_access(&identity, &addr, &opts, |ev| match ev {
+                request::RequestEvent::HostKey { fingerprint } => {
+                    println!("GRX-REQ host {fingerprint}");
+                    println!("Empreinte du host : {fingerprint} (comparez-la avec celle affichée sur le host)");
+                }
+                request::RequestEvent::Pending { host_name } => {
+                    println!("GRX-REQ pending {host_name}");
+                    println!("Demande reçue par « {host_name} » : en attente de validation sur le host…");
+                }
+                request::RequestEvent::NoReply => {
+                    println!("GRX-REQ noreply");
+                    println!("Le host ne répond plus (demandes refermées ?) : nouvelles tentatives…");
+                }
+            })?;
+            match outcome {
+                request::RequestOutcome::Accepted { host_key, host_name } => {
+                    let invite = Invite { addr: addr.clone(), host_key, token: None };
+                    let name = store.0.remember(&invite, save_as.filter(|s| !s.trim().is_empty()))?;
+                    println!("GRX-REQ accepted {name}");
+                    println!("Accès accordé par « {host_name} ». Host mémorisé sous le nom « {name} » : grx-client play \"{name}\"");
+                }
+                request::RequestOutcome::Denied { host_name } => {
+                    println!("GRX-REQ denied");
+                    eprintln!("Demande refusée par « {host_name} ».");
+                    std::process::exit(4);
+                }
+            }
+        }
         Cmd::Gamepads { secs, sim_gamepad, rumble_test } => gamepads::probe(secs, sim_gamepad, rumble_test),
         Cmd::Decoders => {
             use grx_core::codec_neg::VideoCodec;
@@ -397,10 +559,9 @@ fn main() -> Result<()> {
                 [VideoCodec::Hevc, VideoCodec::H264, VideoCodec::Av1].into_iter().filter(|c| ok.contains(*c)).map(|c| c.arg()).collect();
             println!("{}", serde_json::json!({ "decodable": list, "details": d.summary() }));
         }
-        Cmd::Bench { target, secs, save, save_as, codec, sim_loss, no_input, no_keyframe_request, quiet } => {
-            let (invite, known) = store.resolve(&read_target(target)?)?;
-            println!("Connexion à {} — empreinte attendue : {}", invite.addr, fingerprint(&invite.host_key));
-            let opts = ConnectOptions { sim_loss, ..Default::default() };
+        Cmd::Bench { target, secs, save, save_as, codec, sim_loss, no_input, no_keyframe_request, quiet, addr } => {
+            let (invite, known, addrs) = store.resolve_addrs(&read_target(target)?, addr)?;
+            let opts = ConnectOptions { sim_loss, addrs, ..Default::default() };
             let ok = bench::run(
                 &identity,
                 &invite,

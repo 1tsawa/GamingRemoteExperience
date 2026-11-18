@@ -4,14 +4,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
-use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone};
 use grx_core::{Error as CoreError, Invite};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_PORT: u16 = 7777;
+/// Port UDP par défaut du host (celui de HTTP/3 : souvent ouvert sur les réseaux filtrés).
+pub const DEFAULT_PORT: u16 = 443;
+/// Ancien port par défaut (≤ 0.2.3), proposé en raccourci.
+pub const LEGACY_PORT: u16 = 7777;
 pub const MAX_NAME_LEN: usize = 40;
 
 // ---------------------------------------------------------------------------------------------
@@ -50,48 +52,14 @@ impl Ttl {
 // Adresses et liens
 // ---------------------------------------------------------------------------------------------
 
-/// Vérifie une adresse publique `hôte:port` (IPv4, `[IPv6]:port` ou nom DNS) et la renvoie nettoyée.
-pub fn validate_addr(input: &str) -> Result<String, String> {
-    let s = input.trim();
-    if s.is_empty() {
-        return Err("Indiquez l'adresse publique du host (ex. 203.0.113.5:7777 ou monpc.duckdns.org:7777).".into());
-    }
-    if s.contains("://") || s.contains('/') || s.chars().any(char::is_whitespace) {
-        return Err("L'adresse doit être de la forme hôte:port, sans « grx:// », sans « / » ni espace.".into());
-    }
-    let (host, port) = s
-        .rsplit_once(':')
-        .ok_or_else(|| "Le port est manquant : écrivez hôte:port (ex. 203.0.113.5:7777).".to_string())?;
-    let port: u16 = port
-        .parse()
-        .ok()
-        .filter(|p| *p != 0)
-        .ok_or_else(|| "Port invalide (nombre entre 1 et 65535 attendu).".to_string())?;
-    if host.is_empty() {
-        return Err("L'hôte est manquant avant le « : ».".into());
-    }
-    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        let ip: Ipv6Addr = inner.parse().map_err(|_| "Adresse IPv6 invalide entre crochets.".to_string())?;
-        if ip.is_unspecified() {
-            return Err("« :: » n'est pas une adresse joignable par un client.".into());
-        }
-    } else {
-        if host.contains(':') {
-            return Err("Une adresse IPv6 doit être écrite entre crochets : [::1]:7777.".into());
-        }
-        if host.parse::<IpAddr>().map(|ip| ip.is_unspecified()).unwrap_or(false) {
-            return Err("0.0.0.0 est l'adresse d'écoute du host, pas une adresse joignable par un client : utilisez l'IP ou le nom DNS du PC.".into());
-        }
-        let ok = host.len() <= 253
-            && host.split('.').all(|l| {
-                !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            });
-        if !ok {
-            return Err("Hôte invalide : lettres, chiffres, « - » et « . » uniquement.".into());
-        }
-    }
-    Ok(format!("{host}:{port}"))
+/// Remplace le port de `bind` en gardant l'IP (`0.0.0.0` si illisible ; `[::]` reste entre crochets).
+pub fn rebind_port(bind: &str, port: u16) -> String {
+    let ip = bind.trim().rsplit_once(':').map(|(ip, _)| ip.trim()).filter(|ip| !ip.is_empty()).unwrap_or("0.0.0.0");
+    format!("{ip}:{port}")
 }
+
+/// Vérifie une adresse `hôte:port` (IPv4, `[IPv6]:port` ou nom DNS) : partagée avec `grx-client`.
+pub use grx_core::profiles::validate_addr;
 
 /// Informations affichées à l'utilisateur pour un lien valide.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -477,6 +445,15 @@ mod tests {
         assert_eq!(format_date(ms, &Utc), "02/01/2024 03:04");
         assert_eq!(format_date(ms, &FixedOffset::east_opt(3600).unwrap()), "02/01/2024 04:04");
         assert_eq!(format_date(u64::MAX, &Utc), "—");
+    }
+
+    #[test]
+    fn rebind_port_keeps_ip() {
+        assert_eq!(rebind_port("0.0.0.0:7777", 443), "0.0.0.0:443");
+        assert_eq!(rebind_port("[::]:7777", 443), "[::]:443");
+        assert_eq!(rebind_port("192.168.1.20:9000", 7777), "192.168.1.20:7777");
+        assert_eq!(rebind_port("", 443), "0.0.0.0:443");
+        assert_eq!(rebind_port("n'importe quoi", 443), "0.0.0.0:443");
     }
 
     fn row(name: &str, fp: &str, added: u64, vo: bool) -> ClientRow {

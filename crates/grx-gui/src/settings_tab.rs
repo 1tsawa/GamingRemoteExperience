@@ -358,7 +358,7 @@ impl App {
             }
             ui.add_enabled_ui(!running, |ui| {
                 egui::Grid::new("set-host").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    ui.label("Écoute (ip:port)").on_hover_text("--bind : [::]:7777 = IPv4 + IPv6");
+                    ui.label("Écoute (ip:port)").on_hover_text("--bind : [::]:443 = IPv4 + IPv6");
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut o.bind).desired_width(170.0).font(egui::TextStyle::Monospace));
                         if ui.small_button("IPv4").on_hover_text("0.0.0.0 : IPv4 seulement").clicked() {
@@ -367,6 +367,7 @@ impl App {
                         if ui.small_button("IPv4 + IPv6").on_hover_text("[::] : double pile").clicked() {
                             o.bind = rebind(&o.bind, "[::]");
                         }
+                        port_presets(ui, &mut o.bind);
                     });
                     ui.end_row();
                     ui.label("Images / seconde (max)").on_hover_text("--fps");
@@ -447,7 +448,27 @@ impl App {
     }
 }
 
-/// Remplace l'IP de `bind` en gardant le port (7777 si illisible).
+/// Boutons « Port 443 » (défaut) / « Port 7777 » (ancien défaut) : changent le port d'écoute en gardant l'IP.
+pub fn port_presets(ui: &mut egui::Ui, bind: &mut String) {
+    if ui
+        .small_button("Port 443")
+        .on_hover_text(
+            "UDP 443 : le port de HTTP/3 (QUIC), souvent autorisé par les réseaux filtrés (Wi-Fi public, entreprise).              Ne passe pas un réseau qui n'autorise que TCP 443 ou impose un proxy. Pensez à la règle du pare-feu Windows              pour ce port (bouton « Voir la commande ») et à régénérer les invitations.",
+        )
+        .clicked()
+    {
+        *bind = crate::logic::rebind_port(bind, 443);
+    }
+    if ui
+        .small_button(format!("Port {}", crate::logic::LEGACY_PORT))
+        .on_hover_text("Ancien port par défaut (jusqu'à 0.2.3) : à garder si votre box redirige déjà ce port.")
+        .clicked()
+    {
+        *bind = crate::logic::rebind_port(bind, crate::logic::LEGACY_PORT);
+    }
+}
+
+/// Remplace l'IP de `bind` en gardant le port (443 si illisible).
 fn rebind(bind: &str, ip: &str) -> String {
     let port = bind.trim().rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(crate::logic::DEFAULT_PORT);
     format!("{ip}:{port}")
@@ -461,6 +482,6 @@ mod tests {
     fn rebind_keeps_port() {
         assert_eq!(rebind("0.0.0.0:9000", "[::]"), "[::]:9000");
         assert_eq!(rebind("[::]:7778", "0.0.0.0"), "0.0.0.0:7778");
-        assert_eq!(rebind("n'importe quoi", "[::]"), "[::]:7777");
+        assert_eq!(rebind("n'importe quoi", "[::]"), "[::]:443");
     }
 }

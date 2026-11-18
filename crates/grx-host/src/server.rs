@@ -23,7 +23,8 @@ use anyhow::{Context, Result};
 use grx_core::session::{peek_sid, MAX_INIT_LEN, MIN_INIT_LEN};
 use grx_core::util::{is_transient_recv_error, now_ms};
 use grx_core::secure::{access as secure_access, notice as secure_notice, HostSituation, SecureNotice};
-use grx_core::{fingerprint, HostAuth, Role, Session, PKT_DATA, PKT_INIT};
+use grx_core::pairing::{self, PairStatus};
+use grx_core::{fingerprint, HostAuth, InitOutcome, Role, Session, PKT_DATA, PKT_INIT, PKT_KEY_REQ};
 use grx_transport::bitrate::BitrateConfig;
 use grx_transport::wire::{parse_path_response, path_challenge};
 use grx_transport::{Config, Endpoint, Event, Micros, Stats};
@@ -201,6 +202,13 @@ impl Active {
 pub struct Server {
     sock: UdpSocket,
     auth: HostAuth,
+    /// Clé de sonde de joignabilité du host (dérivée de sa clé privée), voir `grx_core::pairing`.
+    probe: pairing::ProbeKey,
+    /// Horodatage de la dernière sonde acceptée (anti-rejeu).
+    probe_last_ts: u64,
+    /// Dernière demande d'accès journalisée (le client relance toutes les 2 s : une ligne par
+    /// changement d'état, pas par relance).
+    last_pair_log: Option<([u8; 32], PairStatus)>,
     opts: RunOpts,
     active: Option<Active>,
     pending: Option<Pending>,
@@ -211,18 +219,42 @@ pub struct Server {
     trust_failures: u32,
 }
 
-/// Socket UDP du host. Une adresse IPv6 (`[::]:7777`) est ouverte en double pile (IPv4 + IPv6) :
-/// sous Windows `IPV6_V6ONLY` vaut vrai par défaut, on le désactive explicitement.
+/// Socket UDP du host. Une adresse IPv6 (`[::]:443`) est ouverte en double pile (IPv4 + IPv6) :
+/// sous Windows `IPV6_V6ONLY` vaut vrai par défaut, on le désactive explicitement. Port déjà pris
+/// (autre programme, plage réservée par Windows) : message clair proposant un autre port.
 pub fn bind_socket(addr: SocketAddr) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP)).context("socket UDP")?;
     if addr.is_ipv6() {
         let _ = s.set_only_v6(false);
     }
-    s.bind(&addr.into()).with_context(|| format!("bind {addr}"))?;
+    if let Err(e) = s.bind(&addr.into()) {
+        return Err(bind_error(addr, e));
+    }
     let _ = s.set_recv_buffer_size(4 << 20);
     let _ = s.set_send_buffer_size(4 << 20);
     Ok(s.into())
+}
+
+/// Erreur de `bind` explicite : port occupé ou interdit → proposer un autre port.
+fn bind_error(addr: SocketAddr, e: std::io::Error) -> anyhow::Error {
+    let port = addr.port();
+    let other = if port == 7777 { 443 } else { 7777 };
+    let alt = SocketAddr::new(addr.ip(), other);
+    match e.kind() {
+        // WSAEADDRINUSE (10048) ; WSAEACCES (10013) = port réservé (plage exclue par Windows,
+        // Hyper-V/WSL) ou pris en exclusivité par un autre programme.
+        ErrorKind::AddrInUse | ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "le port UDP {port} est déjà utilisé ou réservé sur ce PC ({e}). Choisissez un autre port : \
+             `grx-host run --bind {alt}` (ou réglage « Écoute » de grx-gui), puis régénérez les invitations. \
+             Pour voir qui l'occupe : `netstat -ano -p udp | findstr :{port}` ; plages réservées : \
+             `netsh int ipv4 show excludedportrange protocol=udp`."
+        ),
+        ErrorKind::AddrNotAvailable => {
+            anyhow::anyhow!("l'adresse {} n'appartient pas à ce PC ({e}) : utilisez 0.0.0.0:{port} ou [::]:{port}", addr.ip())
+        }
+        _ => anyhow::anyhow!("bind {addr} : {e}"),
+    }
 }
 
 /// Sert sur une socket déjà liée (voir [`bind_socket`]) jusqu'à Ctrl+C.
@@ -252,9 +284,13 @@ pub fn serve(sock: UdpSocket, mut auth: HostAuth, opts: RunOpts, quit: Arc<Atomi
 impl Server {
     fn new(sock: UdpSocket, auth: HostAuth, opts: RunOpts) -> Self {
         let now = Instant::now();
+        let probe = auth.identity().probe_key();
         Self {
             sock,
             auth,
+            probe,
+            probe_last_ts: 0,
+            last_pair_log: None,
             opts,
             active: None,
             pending: None,
@@ -403,7 +439,32 @@ impl Server {
         match pkt.first() {
             Some(&PKT_INIT) => self.handle_init(pkt, from),
             Some(&PKT_DATA) => self.handle_data(pkt, from),
+            Some(&PKT_KEY_REQ) => self.handle_key_req(pkt, from),
             _ => {}
+        }
+    }
+
+    /// Demande de clé publique (première connexion sans invitation, ou test de joignabilité par
+    /// le propriétaire du host). Silence si les demandes sont fermées et que la sonde n'est pas
+    /// la nôtre. Réponse plus petite que la requête : pas d'amplification.
+    fn handle_key_req(&mut self, pkt: &[u8], from: SocketAddr) {
+        let Some((probe, ts)) = pairing::parse_key_request(pkt) else { return };
+        if !self.limiter.allow(from.ip(), Instant::now()) {
+            self.counters.init_rate_limited += 1;
+            return;
+        }
+        let own = self.probe.check(&probe, ts, now_ms(), &mut self.probe_last_ts);
+        if !own {
+            // Relecture bon marché (date/longueur) : l'ouverture se décide dans la GUI ou la CLI.
+            if self.auth.trust.refresh().is_err() || !self.auth.trust.requests_open(now_ms()) {
+                return;
+            }
+        }
+        let resp = pairing::key_response(&self.auth.identity().public());
+        if let Err(e) = self.sock.send_to(&resp, from) {
+            self.warn(|| format!("! envoi de la clé : {e}"));
+        } else if !own {
+            self.warn(|| format!("? clé du host envoyée à {from} (demande d'accès)"));
         }
     }
 
@@ -429,9 +490,25 @@ impl Server {
             .as_ref()
             .filter(|a| a.last_rx.elapsed() < TAKEOVER_GUARD)
             .map(|a| a.sess.peer_key());
-        let res = self.auth.accept_if(pkt, now_ms(), |k| guard.is_none_or(|g| g == *k));
+        let res = self.auth.accept_or_pair(pkt, now_ms(), &from.to_string(), |k| guard.is_none_or(|g| g == *k));
         match res {
-            Ok((resp, sess)) => {
+            Ok(InitOutcome::Pairing { resp, status, key, name }) => {
+                // Réponse chiffrée au demandeur, aucune session.
+                if let Err(e) = self.sock.send_to(&resp, from) {
+                    self.warn(|| format!("! envoi de la réponse de demande : {e}"));
+                    return;
+                }
+                if self.last_pair_log.replace((key, status)) == Some((key, status)) {
+                    return;
+                }
+                let what = match status {
+                    PairStatus::Pending => "en attente de validation sur ce host",
+                    PairStatus::Denied => "refusée",
+                    PairStatus::Accepted => "acceptée",
+                };
+                self.warn(|| format!("? demande d'accès de « {name} » ({}) depuis {from} : {what}", fingerprint(&key)));
+            }
+            Ok(InitOutcome::Session(resp, sess)) => {
                 if let Err(e) = self.sock.send_to(&resp, from) {
                     self.warn(|| format!("! envoi RESP : {e}"));
                     return;
@@ -1224,6 +1301,82 @@ mod tests {
         srv.active.as_mut().unwrap().last_rx = Instant::now().checked_sub(Duration::from_secs(4)).unwrap();
         assert!(b.connect(&mut srv, Some(&t2)));
         assert!(srv.pending.is_some());
+    }
+
+    /// Port déjà pris : message clair qui propose un autre port.
+    #[test]
+    fn bind_busy_port_gives_clear_message() {
+        let a = bind_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = a.local_addr().unwrap();
+        let e = bind_socket(addr).expect_err("deuxième bind refusé").to_string();
+        assert!(e.contains("déjà utilisé") && e.contains("--bind 127.0.0.1:7777"), "{e}");
+    }
+
+    fn recv_one(c: &Client) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 4096];
+        c.sock.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+    }
+
+    /// Demande de clé : silence si fermé, réponse si ouvert ou si c'est la sonde du host.
+    #[test]
+    fn key_request_answered_only_when_open_or_own_probe() {
+        let mut srv = server();
+        let c = Client::new();
+        let host_key = srv.auth.identity().public();
+        srv.handle_packet(&pairing::key_request(None), c.addr);
+        assert!(recv_one(&c).is_none(), "demandes fermées : le host doit rester muet");
+        // Une sonde qui n'est pas la sienne ne suffit pas.
+        srv.handle_packet(&pairing::key_request(Some((&[9u8; 16], now_ms()))), c.addr);
+        assert!(recv_one(&c).is_none());
+        // Sa propre sonde (test de joignabilité) : réponse même fermé.
+        let req = pairing::probe_request(&srv.probe, now_ms());
+        srv.handle_packet(&req, c.addr);
+        assert_eq!(recv_one(&c).and_then(|p| pairing::parse_key_response(&p)), Some(host_key));
+        // La même sonde rejouée : silence.
+        srv.handle_packet(&req, c.addr);
+        assert!(recv_one(&c).is_none(), "sonde rejouée");
+        // Ouvert : n'importe qui obtient la clé.
+        srv.auth.trust.set_requests_open_until(now_ms() + 60_000).unwrap();
+        srv.handle_packet(&pairing::key_request(None), c.addr);
+        assert_eq!(recv_one(&c).and_then(|p| pairing::parse_key_response(&p)), Some(host_key));
+        // Paquet mal formé : ignoré.
+        srv.handle_packet(&pairing::key_request(None)[..40], c.addr);
+        assert!(recv_one(&c).is_none());
+    }
+
+    /// Une demande d'accès reçoit un statut chiffré, ne crée pas de session et ne déloge pas la
+    /// session active ; une fois validée, la connexion normale marche.
+    #[test]
+    fn access_request_never_creates_or_kicks_a_session() {
+        let mut srv = server();
+        let t1 = invite(&mut srv);
+        let mut a = Client::new();
+        assert!(a.connect(&mut srv, Some(&t1)));
+        a.send_first_data(&mut srv);
+        let active_sid = srv.active.as_ref().unwrap().sess.sid();
+
+        srv.auth.trust.set_requests_open_until(now_ms() + 60_000).unwrap();
+        let mut b = Client::new();
+        let ask = |b: &Client, srv: &mut Server| {
+            thread::sleep(Duration::from_millis(3));
+            let (hs, init) = ClientHandshake::start_pairing(&b.id, srv.auth.identity().public(), "b", now_ms()).unwrap();
+            srv.handle_packet(&init, b.addr);
+            let mut buf = vec![0u8; 4096];
+            let n = b.sock.recv(&mut buf).expect("réponse à la demande");
+            hs.finish_pairing(&buf[..n]).unwrap().0
+        };
+        assert_eq!(ask(&b, &mut srv), PairStatus::Pending);
+        assert!(srv.pending.is_none());
+        assert_eq!(srv.active.as_ref().unwrap().sess.sid(), active_sid);
+        let reqs = srv.auth.trust.access_requests(now_ms());
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].addr, b.addr.to_string());
+
+        srv.auth.trust.approve_request(&b.id.fingerprint(), Role::Full, now_ms()).unwrap();
+        assert_eq!(ask(&b, &mut srv), PairStatus::Accepted);
+        assert_eq!(srv.active.as_ref().unwrap().sess.sid(), active_sid, "toujours la session de A");
+        srv.active = None;
+        assert!(b.connect(&mut srv, None), "connexion normale après validation");
     }
 
     #[test]

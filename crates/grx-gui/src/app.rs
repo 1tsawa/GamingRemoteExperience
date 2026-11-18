@@ -20,6 +20,10 @@ use crate::hoststatus::{self, RunStatus, Tone};
 
 #[path = "settings_tab.rs"]
 mod settings_tab;
+#[path = "access_ui.rs"]
+mod access_ui;
+#[path = "host_edit_ui.rs"]
+mod host_edit_ui;
 pub use settings_tab::{DecoderProbe, EncoderProbe};
 use crate::qr::QrMatrix;
 use crate::settings::{self, GuiSettings};
@@ -118,7 +122,8 @@ pub struct App {
     name_text: String,
     name_touched: bool,
     pair_pending: Option<String>,
-    rename: Option<(String, String)>,
+    /// Fenêtre « Modifier » d'un host mémorisé.
+    edit_host: Option<host_edit_ui::EditHostDialog>,
     delete_confirm: Option<String>,
     running_sessions: Vec<(u64, String)>,
 
@@ -137,6 +142,9 @@ pub struct App {
     // Paramètres : sonde des décodeurs de ce PC (`grx-client decoders`), lancée à la demande.
     decoders: DecoderProbe,
     encoders: EncoderProbe,
+
+    /// Demandes d'accès sans invitation (host et client) et test de joignabilité.
+    access: access_ui::AccessUi,
 }
 
 impl App {
@@ -192,7 +200,7 @@ impl App {
             name_text: String::new(),
             name_touched: false,
             pair_pending: None,
-            rename: None,
+            edit_host: None,
             delete_confirm: None,
             running_sessions: Vec::new(),
             quit_confirm: false,
@@ -203,6 +211,7 @@ impl App {
             update: UpdateUi::default(),
             decoders: DecoderProbe::default(),
             encoders: EncoderProbe::default(),
+            access: access_ui::AccessUi::default(),
             opts,
         }
     }
@@ -221,6 +230,12 @@ impl App {
 
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.events.try_recv() {
+            // Le processus `grx-client request` a son propre suivi (pas une session de jeu).
+            if let Event::Session { id, state, .. } = &ev {
+                if self.on_access_req_session(*id, state) {
+                    continue;
+                }
+            }
             match ev {
                 Event::HostIdentity(r) => self.host_fp = Some(r),
                 Event::ClientIdentity(r) => self.client_fp = Some(r),
@@ -347,6 +362,16 @@ impl App {
                     self.name_touched = false;
                 }
                 Event::Elevation(st) => self.elevation = st,
+                Event::Requests(st) => self.on_requests(st),
+                Event::Reachability(lines) => {
+                    self.access.reach_pending = false;
+                    self.access.reach = Some(lines);
+                }
+                Event::AccessReq { id, line } => {
+                    if let Some(r) = self.access.req.as_mut().filter(|r| r.id == id) {
+                        r.apply(line);
+                    }
+                }
                 Event::Update(ev) => {
                     self.update.on_event(ev);
                     if matches!(self.update.state, update::UpdateState::Launched) {
@@ -541,6 +566,7 @@ impl App {
             cols[1].with_layout(Layout::top_down(Align::Min), |ui| self.status_card(ui));
         });
         self.invite_card(ui);
+        self.requests_card(ui);
         self.clients_card(ui);
     }
 
@@ -606,7 +632,10 @@ impl App {
                 ui.add_enabled_ui(!locked, |ui| {
                     egui::Grid::new("host-opts").num_columns(2).show(ui, |ui| {
                         ui.label("Écoute (bind)");
-                        ui.add(TextEdit::singleline(&mut o.bind).desired_width(170.0).font(egui::TextStyle::Monospace));
+                        ui.horizontal(|ui| {
+                            ui.add(TextEdit::singleline(&mut o.bind).desired_width(170.0).font(egui::TextStyle::Monospace));
+                            settings_tab::port_presets(ui, &mut o.bind);
+                        });
                         ui.end_row();
                         ui.label("Codec");
                         egui::ComboBox::from_id_salt("codec").selected_text(o.codec.label()).show_ui(ui, |ui| {
@@ -762,6 +791,14 @@ impl App {
                 ui.label(small_muted("IPv6 active : un lien IPv6 sera proposé avec l'invitation."));
             }
         });
+        // Adresse publique : redirection active du host, sinon celle saisie pour les invitations.
+        let public = rs
+            .upnp
+            .external_addr
+            .clone()
+            .filter(|_| rs.upnp.ok)
+            .or_else(|| Some(self.settings.public_addr.trim().to_string()).filter(|a| !a.is_empty()));
+        self.reachability(ui, rs.port().unwrap_or(DEFAULT_PORT), public);
     }
 
     fn invite_card(&mut self, ui: &mut egui::Ui) {
@@ -770,7 +807,7 @@ impl App {
                 ui.label("Adresse publique du host :");
                 let r = ui.add(
                     TextEdit::singleline(&mut self.settings.public_addr)
-                        .hint_text("ip-ou-dns:7777")
+                        .hint_text("ip-ou-dns:443")
                         .desired_width(260.0)
                         .font(egui::TextStyle::Monospace),
                 );
@@ -1005,6 +1042,7 @@ impl App {
         });
         self.hosts_card(ui);
         self.add_host_card(ui);
+        self.request_access_card(ui);
     }
 
     fn hosts_card(&mut self, ui: &mut egui::Ui) {
@@ -1029,7 +1067,7 @@ impl App {
             }
             let profiles = self.profiles.clone();
             let mut connect: Option<ProfileRow> = None;
-            let mut start_rename: Option<ProfileRow> = None;
+            let mut start_edit: Option<ProfileRow> = None;
             let mut delete: Option<ProfileRow> = None;
             if !profiles.is_empty() {
                 egui::Grid::new("hosts").striped(true).num_columns(4).min_col_width(60.0).show(ui, |ui| {
@@ -1039,14 +1077,17 @@ impl App {
                     ui.end_row();
                     for p in &profiles {
                         ui.label(RichText::new(&p.name).strong());
-                        ui.label(RichText::new(&p.addr).monospace().size(13.5));
+                        let r = ui.label(RichText::new(host_edit_ui::addr_summary(&p.addrs)).monospace().size(13.5));
+                        if p.addrs.len() > 1 {
+                            r.on_hover_text(format!("Essayées dans l'ordre :\n{}", p.addrs.join("\n")));
+                        }
                         ui.label(RichText::new(&p.fingerprint).monospace().size(13.0));
                         ui.horizontal(|ui| {
                             if ui.add(primary_button("Connecter")).clicked() {
                                 connect = Some(p.clone());
                             }
-                            if ui.button("Renommer").clicked() {
-                                start_rename = Some(p.clone());
+                            if ui.button("Modifier…").on_hover_text("Nom et adresses (local, Internet, autre port)").clicked() {
+                                start_edit = Some(p.clone());
                             }
                             if ui.add(danger_button("Supprimer")).clicked() {
                                 delete = Some(p.clone());
@@ -1077,39 +1118,11 @@ impl App {
                 self.notify(Level::Info, format!("Connexion à « {} »…", p.name));
                 self.launch_client(p.name.clone(), args, p.name);
             }
-            if let Some(p) = start_rename {
-                self.rename = Some((p.name.clone(), p.name));
+            if let Some(p) = start_edit {
+                self.edit_host = Some(host_edit_ui::EditHostDialog::new(&p));
             }
             if let Some(p) = delete {
                 self.delete_confirm = Some(p.name);
-            }
-            if let Some((old, buf)) = &mut self.rename {
-                let existing: Vec<String> = self.profiles.iter().map(|p| p.name.clone()).filter(|n| n != old).collect();
-                let check = validate_name(buf, &existing);
-                let mut done = None;
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(format!("Renommer « {old} » en :"));
-                    let r = ui.add(TextEdit::singleline(buf).desired_width(220.0));
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.add_enabled(check.is_ok(), primary_button("Valider")).clicked() || (enter && check.is_ok()) {
-                        done = Some(true);
-                    }
-                    if ui.button("Annuler").clicked() {
-                        done = Some(false);
-                    }
-                });
-                if let Err(m) = &check {
-                    ui.label(colored(m, ERR));
-                }
-                if let Some(ok) = done {
-                    if let (true, Ok(new)) = (ok, check) {
-                        if &new != old {
-                            let _ = self.data_tx.send(DataCmd::RenameHost { old: old.clone(), new });
-                        }
-                    }
-                    self.rename = None;
-                }
             }
         });
     }
@@ -1119,7 +1132,7 @@ impl App {
             ui.label(muted("Collez le lien grx:// reçu du propriétaire du host :"));
             let r = ui.add(
                 TextEdit::multiline(&mut self.link_text)
-                    .hint_text("grx://adresse:7777/clé-du-host/jeton")
+                    .hint_text("grx://adresse:443/clé-du-host/jeton")
                     .desired_rows(2)
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace),
@@ -1231,6 +1244,8 @@ impl App {
     // ----- Dialogues ---------------------------------------------------------------------------
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.approve_dialog(ctx);
+        self.edit_host_dialog(ctx);
         if let Some(r) = self.revoke_confirm.clone() {
             let mut close = false;
             let mut confirm = false;

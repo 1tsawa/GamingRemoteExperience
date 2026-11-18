@@ -5,6 +5,7 @@
 //! installés à côté de `grx-gui.exe`.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod access;
 mod app;
 mod backend;
 mod hoststatus;

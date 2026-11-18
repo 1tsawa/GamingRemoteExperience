@@ -17,6 +17,7 @@ use snow::{Builder, HandshakeState, StatelessTransportState};
 
 use crate::identity::{Identity, PublicKey, NOISE_PARAMS};
 use crate::invite::Token;
+use crate::pairing::PairStatus;
 use crate::trust::TrustStore;
 use crate::{Error, Result};
 
@@ -36,19 +37,38 @@ pub const MIN_INIT_LEN: usize = 1 + 32 + 48 + 16 + 40;
 /// Taille maximale acceptée d'un INIT (nom 64 caractères + jeton : bien en dessous).
 pub const MAX_INIT_LEN: usize = 1024;
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Serialize, Deserialize)]
 struct InitPayload {
     v: u16,
     ts_ms: u64,
     name: String,
     token: Option<String>,
+    /// Demande d'accès sans invitation (voir `pairing`) : le host répond par un statut, sans
+    /// créer de session. Absent = poignée de main normale (format inchangé pour les anciens hosts).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pair: bool,
+    /// Rembourrage d'un INIT de demande : la réponse ne doit jamais être plus grosse (pas
+    /// d'amplification par adresse source usurpée). Ignoré par le host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pad: String,
 }
+
+/// Taille minimale d'un INIT de demande d'accès (rembourré) : plus grosse que toute réponse
+/// d'appairage possible (nom du host de 64 caractères UTF-8 compris).
+pub const PAIR_INIT_LEN: usize = 640;
 
 #[derive(Serialize, Deserialize)]
 struct RespPayload {
     v: u16,
     sid: u32,
     name: String,
+    /// Réponse à une demande d'accès (`pair: true`) : aucune session n'existe (sid 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pair: Option<PairStatus>,
 }
 
 fn clean_name(s: &str) -> String {
@@ -191,16 +211,45 @@ impl ClientHandshake {
         token: Option<&Token>,
         now_ms: u64,
     ) -> Result<(Self, Vec<u8>)> {
+        Self::start_inner(id, host_key, name, token, now_ms, false)
+    }
+
+    /// Demande d'accès sans invitation (ou vérification qu'elle a été acceptée) : à terminer
+    /// avec [`finish_pairing`](Self::finish_pairing).
+    pub fn start_pairing(id: &Identity, host_key: PublicKey, name: &str, now_ms: u64) -> Result<(Self, Vec<u8>)> {
+        Self::start_inner(id, host_key, name, None, now_ms, true)
+    }
+
+    fn start_inner(
+        id: &Identity,
+        host_key: PublicKey,
+        name: &str,
+        token: Option<&Token>,
+        now_ms: u64,
+        pair: bool,
+    ) -> Result<(Self, Vec<u8>)> {
         let mut hs = Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(id.secret())?
             .remote_public_key(&host_key)?
             .build_initiator()?;
-        let payload = serde_json::to_vec(&InitPayload {
+        let mut init = InitPayload {
             v: PROTO_VERSION,
             ts_ms: now_ms,
             name: clean_name(name),
             token: token.map(|t| t.to_b32()),
-        })?;
+            pair,
+            pad: String::new(),
+        };
+        let mut payload = serde_json::to_vec(&init)?;
+        if pair {
+            // INIT = type (1) + e (32) + s chiffrée (48) + charge + étiquette (16).
+            let want = PAIR_INIT_LEN - (1 + 32 + 48 + 16);
+            let overhead = r#","pad":"""#.len();
+            if payload.len() + overhead < want {
+                init.pad = "0".repeat(want - payload.len() - overhead);
+                payload = serde_json::to_vec(&init)?;
+            }
+        }
         let mut buf = vec![0u8; 1024];
         let n = hs.write_message(&payload, &mut buf)?;
         let mut pkt = Vec::with_capacity(1 + n);
@@ -209,7 +258,7 @@ impl ClientHandshake {
         Ok((Self { hs, host_key }, pkt))
     }
 
-    pub fn finish(mut self, pkt: &[u8]) -> Result<Session> {
+    fn read_resp(&mut self, pkt: &[u8]) -> Result<RespPayload> {
         if pkt.first() != Some(&PKT_RESP) {
             return Err(Error::BadPacket("réponse attendue"));
         }
@@ -222,11 +271,35 @@ impl ClientHandshake {
         if !self.hs.is_handshake_finished() {
             return Err(Error::BadPacket("poignée de main incomplète"));
         }
+        Ok(resp)
+    }
+
+    pub fn finish(mut self, pkt: &[u8]) -> Result<Session> {
+        let resp = self.read_resp(pkt)?;
+        if resp.pair.is_some() || resp.sid == 0 {
+            return Err(Error::BadPacket("réponse d'appairage à une poignée de main normale"));
+        }
         into_session(self.hs, resp.sid, self.host_key, clean_name(&resp.name))
+    }
+
+    /// Termine une demande d'accès : statut décidé par le host et nom du host. La réponse est
+    /// authentifiée par la clé du host utilisée dans [`start_pairing`](Self::start_pairing).
+    pub fn finish_pairing(mut self, pkt: &[u8]) -> Result<(PairStatus, String)> {
+        let resp = self.read_resp(pkt)?;
+        let st = resp.pair.ok_or(Error::BadPacket("statut d'appairage absent"))?;
+        Ok((st, clean_name(&resp.name)))
     }
 }
 
 // ───────────────────────────── côté host ─────────────────────────────
+
+/// Résultat d'un INIT accepté par le host.
+pub enum InitOutcome {
+    /// Poignée de main normale : réponse à envoyer et session établie.
+    Session(Vec<u8>, Session),
+    /// Demande d'accès (`pair: true`) : réponse à envoyer, AUCUNE session.
+    Pairing { resp: Vec<u8>, status: PairStatus, key: PublicKey, name: String },
+}
 
 pub struct HostAuth {
     identity: Identity,
@@ -236,11 +309,48 @@ pub struct HostAuth {
     /// Tout INIT horodaté AVANT cette date est refusé : un INIT capturé avant le (re)démarrage du
     /// host ne peut pas être rejoué (`last_ts` n'est qu'en mémoire).
     min_ts_ms: u64,
+    /// Seau global des NOUVELLES demandes d'accès (voir `pairing_reply`).
+    new_requests: MsBucket,
+}
+
+/// Seau à jetons en millisecondes (débit `1 / every_ms`, capacité `burst`).
+struct MsBucket {
+    tokens: f64,
+    last_ms: u64,
+}
+
+/// Nouvelles demandes d'accès : 4 d'affilée, puis 1 toutes les 5 s.
+const NEW_REQ_BURST: f64 = 4.0;
+const NEW_REQ_EVERY_MS: f64 = 5_000.0;
+
+impl MsBucket {
+    fn new() -> Self {
+        Self { tokens: NEW_REQ_BURST, last_ms: 0 }
+    }
+
+    fn take(&mut self, now_ms: u64) -> bool {
+        let dt = now_ms.saturating_sub(self.last_ms) as f64;
+        self.last_ms = self.last_ms.max(now_ms);
+        self.tokens = (self.tokens + dt / NEW_REQ_EVERY_MS).min(NEW_REQ_BURST);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl HostAuth {
     pub fn new(identity: Identity, trust: TrustStore, name: &str) -> Self {
-        Self { identity, trust, name: clean_name(name), last_ts: HashMap::new(), min_ts_ms: 0 }
+        Self {
+            identity,
+            trust,
+            name: clean_name(name),
+            last_ts: HashMap::new(),
+            min_ts_ms: 0,
+            new_requests: MsBucket::new(),
+        }
     }
 
     /// À appeler au démarrage du host avec l'heure courante (`now_ms()`).
@@ -268,6 +378,25 @@ impl HostAuth {
         now_ms: u64,
         admit: impl FnOnce(&PublicKey) -> bool,
     ) -> Result<(Vec<u8>, Session)> {
+        match self.accept_or_pair(pkt, now_ms, "", admit)? {
+            InitOutcome::Session(r, s) => Ok((r, s)),
+            InitOutcome::Pairing { .. } => Err(Error::Unauthorized),
+        }
+    }
+
+    /// Comme [`accept_if`](Self::accept_if), et traite aussi les demandes d'accès (`pair: true`,
+    /// voir `pairing`) : client autorisé → `accepted`, refusé récemment → `denied`, demandes
+    /// ouvertes → demande enregistrée (`peer` = adresse affichée sur le host) et `pending`,
+    /// sinon silence (`Unauthorized`). Une demande ne crée jamais de session et n'est pas soumise
+    /// à `admit` (elle ne peut pas déloger la session active). Demandes fermées : silence pour
+    /// tout client non autorisé (même refusé) ; un client autorisé reçoit toujours `accepted`.
+    pub fn accept_or_pair(
+        &mut self,
+        pkt: &[u8],
+        now_ms: u64,
+        peer: &str,
+        admit: impl FnOnce(&PublicKey) -> bool,
+    ) -> Result<InitOutcome> {
         if pkt.first() != Some(&PKT_INIT) {
             return Err(Error::BadPacket("INIT attendu"));
         }
@@ -301,6 +430,9 @@ impl HostAuth {
         if self.last_ts.get(&client_key).is_some_and(|&last| init.ts_ms <= last) {
             return Err(Error::BadTimestamp);
         }
+        if init.pair {
+            return self.pairing_reply(hs, client_key, &init, now_ms, peer, pkt.len());
+        }
         if !admit(&client_key) {
             return Err(Error::Busy);
         }
@@ -324,13 +456,56 @@ impl HostAuth {
                 break s;
             }
         };
-        let resp = serde_json::to_vec(&RespPayload { v: PROTO_VERSION, sid, name: self.name.clone() })?;
+        let resp = serde_json::to_vec(&RespPayload { v: PROTO_VERSION, sid, name: self.name.clone(), pair: None })?;
         let mut buf = vec![0u8; 512];
         let m = hs.write_message(&resp, &mut buf)?;
         let mut out = Vec::with_capacity(1 + m);
         out.push(PKT_RESP);
         out.extend_from_slice(&buf[..m]);
-        Ok((out, into_session(hs, sid, client_key, client_name)?))
+        Ok(InitOutcome::Session(out, into_session(hs, sid, client_key, client_name)?))
+    }
+
+    fn pairing_reply(
+        &mut self,
+        mut hs: HandshakeState,
+        key: PublicKey,
+        init: &InitPayload,
+        now_ms: u64,
+        peer: &str,
+        init_len: usize,
+    ) -> Result<InitOutcome> {
+        self.trust.refresh()?;
+        let name = clean_name(&init.name);
+        let status = if self.trust.is_authorized(&key) {
+            PairStatus::Accepted
+        } else if !self.trust.requests_open(now_ms) {
+            // Fermées : silence total envers tout client non autorisé, même déjà refusé.
+            return Err(Error::Unauthorized);
+        } else if self.trust.is_request_denied(&key, now_ms) {
+            PairStatus::Denied
+        } else {
+            PairStatus::Pending
+        };
+        let resp = serde_json::to_vec(&RespPayload { v: PROTO_VERSION, sid: 0, name: self.name.clone(), pair: Some(status) })?;
+        let mut buf = vec![0u8; 1024];
+        let m = hs.write_message(&resp, &mut buf)?;
+        let mut out = Vec::with_capacity(1 + m);
+        out.push(PKT_RESP);
+        out.extend_from_slice(&buf[..m]);
+        // Jamais de réponse plus grosse que la requête (INIT non rembourré : silence).
+        if out.len() > init_len {
+            return Err(Error::BadPacket("demande d'accès non rembourrée"));
+        }
+        if status == PairStatus::Pending {
+            // Les clés ne coûtent rien à fabriquer : une NOUVELLE demande (écriture de trust.json)
+            // passe par un seau global, en plus des seaux par IP du serveur.
+            if !self.trust.has_request(&key) && !self.new_requests.take(now_ms) {
+                return Err(Error::Unauthorized);
+            }
+            self.trust.note_request(&key, &name, peer, now_ms)?;
+        }
+        self.last_ts.insert(key, init.ts_ms);
+        Ok(InitOutcome::Pairing { resp: out, status, key, name })
     }
 }
 
@@ -527,6 +702,152 @@ mod tests {
         assert!(!h.trust.is_authorized(&c.public()));
         // Ni le jeton ni l'horodatage n'ont été consommés : le même INIT passe ensuite.
         assert!(h.accept_if(&i1, T0, |k| *k == c.public()).is_ok());
+    }
+
+    fn pair_once(h: &mut HostAuth, c: &Identity, now: u64) -> Result<PairStatus> {
+        let (hs, init) = ClientHandshake::start_pairing(c, h.identity().public(), "portable", now)?;
+        match h.accept_or_pair(&init, now, "192.0.2.7:5000", |_| false)? {
+            InitOutcome::Pairing { resp, status, key, name } => {
+                assert_eq!(key, c.public());
+                assert_eq!(name, "portable");
+                let (st, host_name) = hs.finish_pairing(&resp)?;
+                assert_eq!(st, status);
+                assert_eq!(host_name, "host-pc");
+                Ok(st)
+            }
+            InitOutcome::Session(..) => panic!("une demande ne doit jamais créer de session"),
+        }
+    }
+
+    #[test]
+    fn pairing_request_flow() {
+        let mut h = host();
+        let c = Identity::generate();
+        // Demandes fermées : silence, rien n'est enregistré.
+        assert!(matches!(pair_once(&mut h, &c, T0), Err(Error::Unauthorized)));
+        assert!(h.trust.access_requests(T0).is_empty());
+
+        h.trust.set_requests_open_until(T0 + 60_000).unwrap();
+        // Ouvertes : en attente, même si une autre clé a une session (admit = faux).
+        assert_eq!(pair_once(&mut h, &c, T0 + 1).unwrap(), PairStatus::Pending);
+        let reqs = h.trust.access_requests(T0 + 1);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].addr, "192.0.2.7:5000");
+        assert!(!h.trust.is_authorized(&c.public()));
+
+        // Une poignée de main normale reste refusée tant que ce n'est pas validé.
+        let (_, init) = ClientHandshake::start(&c, h.identity().public(), "portable", None, T0 + 2).unwrap();
+        assert!(matches!(h.accept(&init, T0 + 2), Err(Error::Unauthorized)));
+
+        // Validation sur le host : « accepté », même demandes refermées, puis connexion normale.
+        let fp = crate::fingerprint(&c.public());
+        assert_eq!(h.trust.approve_request(&fp, crate::Role::Full, T0 + 3).unwrap().as_deref(), Some("portable"));
+        h.trust.set_requests_open_until(0).unwrap();
+        assert_eq!(pair_once(&mut h, &c, T0 + 4).unwrap(), PairStatus::Accepted);
+        let (c_hs, init) = ClientHandshake::start(&c, h.identity().public(), "portable", None, T0 + 5).unwrap();
+        let (resp, _) = h.accept(&init, T0 + 5).unwrap();
+        c_hs.finish(&resp).unwrap();
+    }
+
+    #[test]
+    fn pairing_denied_and_replay() {
+        let mut h = host();
+        let c = Identity::generate();
+        h.trust.set_requests_open_until(T0 + 60_000).unwrap();
+        assert_eq!(pair_once(&mut h, &c, T0).unwrap(), PairStatus::Pending);
+        h.trust.deny_request(&crate::fingerprint(&c.public()), T0 + 1).unwrap();
+        assert_eq!(pair_once(&mut h, &c, T0 + 2).unwrap(), PairStatus::Denied);
+        // Demandes refermées : même le client refusé n'obtient plus rien (silence).
+        h.trust.set_requests_open_until(0).unwrap();
+        assert!(matches!(pair_once(&mut h, &c, T0 + 2_500), Err(Error::Unauthorized)));
+        h.trust.set_requests_open_until(T0 + 60_000).unwrap();
+        // Rejeu d'un INIT de demande : refusé (horodatage).
+        let (_, init) = ClientHandshake::start_pairing(&c, h.identity().public(), "portable", T0 + 3).unwrap();
+        h.accept_or_pair(&init, T0 + 3, "x", |_| true).unwrap();
+        assert!(matches!(h.accept_or_pair(&init, T0 + 4, "x", |_| true), Err(Error::BadTimestamp)));
+    }
+
+    #[test]
+    fn pairing_reply_is_not_a_session_and_normal_reply_is_not_pairing() {
+        let mut h = host();
+        let c = Identity::generate();
+        h.trust.set_requests_open_until(T0 + 60_000).unwrap();
+        let (hs, init) = ClientHandshake::start_pairing(&c, h.identity().public(), "c", T0).unwrap();
+        let InitOutcome::Pairing { resp, .. } = h.accept_or_pair(&init, T0, "x", |_| true).unwrap() else { panic!() };
+        // Un client qui attend une session refuse une réponse d'appairage.
+        let (hs2, _) = ClientHandshake::start(&c, h.identity().public(), "c", None, T0).unwrap();
+        drop(hs2);
+        assert!(hs.finish(&resp).is_err());
+        // Et l'INIT normal d'un client autorisé ne produit jamais de statut d'appairage.
+        let tok = h.trust.create_invite(60_000, T0).unwrap();
+        let (c_hs, init) = ClientHandshake::start(&c, h.identity().public(), "c", Some(&tok), T0 + 1).unwrap();
+        let (resp, _) = h.accept(&init, T0 + 1).unwrap();
+        assert!(c_hs.finish_pairing(&resp).is_err());
+    }
+
+    #[test]
+    fn pairing_reply_never_bigger_than_request() {
+        let mut h = host();
+        // Nom de host maximal en UTF-8 multi-octets : la réponse reste plus petite que l'INIT.
+        h.name = "é".repeat(64);
+        h.trust.set_requests_open_until(T0 + 60_000).unwrap();
+        let c = Identity::generate();
+        let (_, init) = ClientHandshake::start_pairing(&c, h.identity().public(), &"ü".repeat(64), T0).unwrap();
+        assert!(init.len() >= PAIR_INIT_LEN && init.len() <= MAX_INIT_LEN);
+        let InitOutcome::Pairing { resp, .. } = h.accept_or_pair(&init, T0, "x", |_| true).unwrap() else { panic!() };
+        assert!(resp.len() <= init.len(), "{} > {}", resp.len(), init.len());
+        // INIT de demande non rembourré (client modifié) : silence.
+        let c2 = Identity::generate();
+        let mut hs = Builder::new(NOISE_PARAMS.parse().unwrap())
+            .local_private_key(c2.secret())
+            .unwrap()
+            .remote_public_key(&h.identity().public())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let p = serde_json::to_vec(&InitPayload { v: PROTO_VERSION, ts_ms: T0, name: String::new(), token: None, pair: true, pad: String::new() }).unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = hs.write_message(&p, &mut buf).unwrap();
+        let mut small = vec![PKT_INIT];
+        small.extend_from_slice(&buf[..n]);
+        assert!(h.accept_or_pair(&small, T0, "x", |_| true).is_err());
+        assert!(!h.trust.has_request(&c2.public()), "rien n'est enregistré");
+    }
+
+    #[test]
+    fn new_access_requests_are_throttled_globally() {
+        let mut h = host();
+        h.trust.set_requests_open_until(T0 + 600_000).unwrap();
+        let mut ok = 0;
+        for i in 0..10 {
+            let c = Identity::generate();
+            if pair_once_named(&mut h, &c, T0 + i).is_ok() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, NEW_REQ_BURST as usize, "rafale bornée");
+        // Une demande déjà connue se relance sans consommer le seau.
+        let reqs = h.trust.access_requests(T0 + 20);
+        assert_eq!(reqs.len(), NEW_REQ_BURST as usize);
+        // Après 5 s, une nouvelle passe.
+        assert!(pair_once_named(&mut h, &Identity::generate(), T0 + 5_100).is_ok());
+    }
+
+    fn pair_once_named(h: &mut HostAuth, c: &Identity, now: u64) -> Result<PairStatus> {
+        let (hs, init) = ClientHandshake::start_pairing(c, h.identity().public(), "x", now)?;
+        match h.accept_or_pair(&init, now, "192.0.2.7:5000", |_| false)? {
+            InitOutcome::Pairing { resp, .. } => Ok(hs.finish_pairing(&resp)?.0),
+            InitOutcome::Session(..) => panic!("jamais de session"),
+        }
+    }
+
+    #[test]
+    fn pairing_flag_keeps_old_init_format() {
+        // Sans `pair`, le JSON de l'INIT est identique à l'ancien (les anciens hosts le lisent).
+        let v = serde_json::to_string(&InitPayload { v: 1, ts_ms: 0, name: String::new(), token: None, pair: false, pad: String::new() }).unwrap();
+        assert_eq!(v, r#"{"v":1,"ts_ms":0,"name":"","token":null}"#);
+        let r = serde_json::to_string(&RespPayload { v: 1, sid: 5, name: "h".into(), pair: None }).unwrap();
+        assert_eq!(r, r#"{"v":1,"sid":5,"name":"h"}"#);
     }
 
     #[test]

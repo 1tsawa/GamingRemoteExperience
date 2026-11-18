@@ -92,6 +92,28 @@ enum SimulateArg {
     Cycle,
 }
 
+#[derive(Subcommand)]
+enum RequestsCmd {
+    /// Accepte les demandes pendant N minutes (0 = sans limite). Le host répond alors aux inconnus
+    /// (clé publique et statut de leur demande) : à n'ouvrir que le temps d'ajouter un client.
+    Open {
+        #[arg(long, default_value_t = 15)]
+        minutes: u64,
+    },
+    /// Ferme les demandes (défaut : le host reste muet envers les inconnus)
+    Close,
+    /// Liste les demandes en attente et refusées
+    List,
+    /// Accepte une demande (empreinte COMPLÈTE, comparez-la avec celle affichée par le client)
+    Approve {
+        fingerprint: String,
+        #[arg(long, value_enum, default_value = "full")]
+        role: RoleArg,
+    },
+    /// Refuse une demande (le client reçoit « refusé » pendant 1 h)
+    Deny { fingerprint: String },
+}
+
 #[derive(Parser)]
 #[command(name = "grx-host", version, about = "Hôte GamingRemoteExperience")]
 struct Cli {
@@ -108,12 +130,12 @@ enum Cmd {
     Info,
     /// Génère un lien d'invitation à usage unique
     Invite {
-        /// Adresse publique que le client utilisera (ex: 203.0.113.5:7777, monpc.duckdns.org:7777,
-        /// [2a01:…]:7777) ou `auto` : redirection active du host lancé, sinon IP externe de la box
+        /// Adresse publique que le client utilisera (ex: 203.0.113.5:443, monpc.duckdns.org:443,
+        /// [2a01:…]:443) ou `auto` : redirection active du host lancé, sinon IP externe de la box
         #[arg(long)]
         addr: String,
         /// Port utilisé avec `--addr auto` quand aucun host n'est lancé
-        #[arg(long, default_value_t = 7777)]
+        #[arg(long, default_value_t = 443)]
         port: u16,
         /// Durée de validité en minutes (plafonnée à 1440 = 24 h)
         #[arg(long, default_value_t = 10)]
@@ -123,6 +145,10 @@ enum Cmd {
     List,
     /// Révoque un client par préfixe d'empreinte (4 caractères minimum)
     Revoke { fingerprint: String },
+    /// Demandes d'accès sans invitation (le client tape seulement IP:port) : ouvrir, fermer,
+    /// lister, accepter, refuser
+    #[command(subcommand)]
+    Requests(RequestsCmd),
     /// Change le rôle d'un client : `view-only`, `full` ou `total`. Une session en cours est coupée.
     SetRole { fingerprint: String, #[arg(value_enum)] role: RoleArg },
     /// Télécharge depuis Cisco le codec OpenH264 (encodeur H.264 logiciel de secours, « OpenH264
@@ -140,7 +166,7 @@ enum Cmd {
     Elevation(ElevationCmd),
     /// Affiche les commandes (administrateur) pour autoriser grx-host dans le pare-feu Windows
     FirewallHelp {
-        #[arg(long, default_value_t = 7777)]
+        #[arg(long, default_value_t = 443)]
         port: u16,
     },
     /// Sonde les encodeurs vidéo par test réel (création + 2 images 256x256 + validation du flux)
@@ -156,8 +182,9 @@ enum Cmd {
     },
     /// Écoute les connexions
     Run {
-        /// Adresse d'écoute ; `[::]:7777` = IPv4 + IPv6 (double pile)
-        #[arg(long, default_value = "0.0.0.0:7777")]
+        /// Adresse d'écoute (UDP) ; `[::]:443` = IPv4 + IPv6 (double pile). 443 = port de HTTP/3,
+        /// souvent ouvert sur les réseaux filtrés ; aucun droit administrateur requis sous Windows
+        #[arg(long, default_value = "0.0.0.0:443")]
         bind: SocketAddr,
         /// N'ouvre PAS automatiquement le port sur la box (UPnP / PCP / NAT-PMP)
         #[arg(long)]
@@ -320,6 +347,57 @@ fn main() -> Result<()> {
                     grx_core::Role::Total => "contrôle total",
                 };
                 println!("{fp}  {label:<14}  {}", c.name);
+            }
+        }
+        Cmd::Requests(cmd) => {
+            let now = now_ms();
+            let host_fp = auth.identity().fingerprint();
+            let t = &mut auth.trust;
+            match cmd {
+                RequestsCmd::Open { minutes } => {
+                    let until = if minutes == 0 {
+                        grx_core::trust::REQUESTS_ALWAYS_OPEN
+                    } else {
+                        now.saturating_add(minutes.saturating_mul(60_000))
+                    };
+                    t.set_requests_open_until(until)?;
+                    if minutes == 0 {
+                        println!("Demandes d'accès ouvertes sans limite de durée.");
+                    } else {
+                        println!("Demandes d'accès ouvertes pendant {minutes} min.");
+                    }
+                    println!("Empreinte de ce host (à comparer avec celle affichée par le client) : {host_fp}");
+                }
+                RequestsCmd::Close => {
+                    t.set_requests_open_until(0)?;
+                    println!("Demandes d'accès fermées.");
+                }
+                RequestsCmd::List => {
+                    let until = t.requests_open_until();
+                    if t.requests_open(now) {
+                        if until == grx_core::trust::REQUESTS_ALWAYS_OPEN {
+                            println!("Demandes : ouvertes (sans limite)");
+                        } else {
+                            println!("Demandes : ouvertes encore {} min", (until - now).div_ceil(60_000));
+                        }
+                    } else {
+                        println!("Demandes : fermées");
+                    }
+                    for r in t.access_requests(now) {
+                        let st = if r.denied { "refusée" } else { "en attente" };
+                        println!("{}  {st:<10}  {:<22}  {}", r.fingerprint(), r.addr, r.name);
+                    }
+                }
+                RequestsCmd::Approve { fingerprint, role } => match t.approve_request(&fingerprint, role.role(), now)? {
+                    Some(name) => println!("« {name} » accepté : il peut maintenant se connecter."),
+                    None => bail!("aucune demande avec cette empreinte (empreinte complète requise, voir `requests list`)"),
+                },
+                RequestsCmd::Deny { fingerprint } => {
+                    if !t.deny_request(&fingerprint, now)? {
+                        bail!("aucune demande avec cette empreinte (empreinte complète requise)");
+                    }
+                    println!("Demande refusée.");
+                }
             }
         }
         Cmd::Revoke { fingerprint } => {
@@ -752,7 +830,7 @@ mod tests {
             _ => panic!(),
         }
         match Cli::try_parse_from(["grx-host", "invite", "--addr", "auto"]).unwrap().cmd {
-            Cmd::Invite { addr, port, .. } => assert_eq!((addr.as_str(), port), ("auto", 7777)),
+            Cmd::Invite { addr, port, .. } => assert_eq!((addr.as_str(), port), ("auto", 443)),
             _ => panic!(),
         }
         match Cli::try_parse_from(["grx-host", "firewall-help", "--port", "9000"]).unwrap().cmd {

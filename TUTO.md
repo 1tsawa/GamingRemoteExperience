@@ -61,7 +61,7 @@ Laissez la fenêtre ouverte pendant le test. La fermer arrête le host.
 
 ```powershell
 # Terminal 1 : lancer le host (garder ouvert ; Ctrl+C pour arrêter)
-.\grx-host.exe run --bind [::]:7777 --block-win-key
+.\grx-host.exe run --bind [::]:443 --block-win-key
 
 # Terminal 2 : créer l'invitation (adresse publique détectée toute seule)
 .\grx-host.exe invite --addr auto --ttl-min 60
@@ -75,7 +75,17 @@ Autres commandes utiles :
 .\grx-host.exe revoke ABCD       # révoquer un client (début de son empreinte)
 .\grx-host.exe set-role ABCD view-only   # spectateur (ou: full, ou: total)
 .\grx-host.exe firewall-help     # commande à lancer si le pare-feu bloque
+.\grx-host.exe requests open --minutes 15   # demandes d'accès sans lien (voir plus bas)
 ```
+
+> **Port par défaut : UDP 443** (depuis 0.2.4, avant : 7777). C'est le port de HTTP/3 : il passe sur
+> la plupart des réseaux filtrés (Wi-Fi public, entreprise). Aucun droit administrateur n'est
+> nécessaire pour l'utiliser sous Windows. Vos réglages déjà enregistrés (port 7777 dans grx-gui)
+> sont conservés : pour passer à 443, bouton **Port 443** à côté de « Écoute », puis mettez à jour
+> la redirection de la box si vous l'aviez faite à la main. Côté client, ajoutez simplement la
+> nouvelle adresse au host mémorisé (voir « Modifier un host mémorisé ») : **pas besoin de
+> réappairer**. Si le port 443 est déjà pris sur le PC host, le host l'explique au démarrage et
+> propose un autre port (`--bind 0.0.0.0:7777`).
 
 Options utiles de `run` :
 
@@ -92,6 +102,28 @@ Options utiles de `run` :
 
 > **Pare-feu Windows** : au premier lancement, Windows peut demander « Autoriser l'accès ». Cochez **Privé** et validez.
 > En cas de doute, `grx-host.exe firewall-help` affiche la commande à lancer en administrateur.
+
+### Demandes d'accès (sans lien d'invitation)
+
+Pratique quand votre ami est à côté de vous, ou au téléphone : il tape seulement l'adresse du host.
+
+1. Host : onglet **Host**, carte **Demandes d'accès** → **Ouvrir 15 min** (ou `grx-host requests open`).
+   Fermées (par défaut), le host ne répond à aucun inconnu.
+2. Client : onglet **Client**, carte **Demander l'accès** → tapez `IP:port` (ex. `192.168.1.20:443` à
+   la maison, `monpc.duckdns.org:443` depuis Internet) → **Envoyer la demande**. Il voit l'**empreinte
+   du host** et **la sienne**.
+3. Host : la demande apparaît avec l'**empreinte du client**. **Comparez les deux empreintes de
+   vive voix** (celle du client chez vous, celle du host chez lui) : c'est ce qui garantit que
+   personne ne s'est intercalé. Puis **Accepter…** (rôle Complet ou Lecture seule) ou **Refuser**.
+   En ligne de commande : `grx-host requests list`, puis `grx-host requests approve <empreinte complète>`
+   (ou `deny`).
+4. Le client mémorise le host et se connecte. Refermez les demandes (**Fermer**) : elles se
+   referment aussi seules à la fin du délai.
+
+En ligne de commande côté client : `.\grx-client.exe request 192.168.1.20:443 --save-as pc-ludo`.
+
+Le bouton **Tester la joignabilité** (carte de statut, host démarré) vérifie que le host répond sur
+ce PC, sur l'IP locale et sur l'adresse publique, sans ouvrir les demandes.
 
 ---
 
@@ -114,6 +146,28 @@ Options utiles de `run` :
 # Fois suivantes
 .\grx-client.exe play pc-ludo --stats
 ```
+
+### Modifier un host mémorisé (même host en local et à distance, changement de port)
+
+Un host mémorisé, c'est son **identité** (son empreinte) plus une **liste d'adresses** essayées dans
+l'ordre : la première qui répond sert. Changer les adresses ne demande **jamais** de réappairer,
+et une mauvaise adresse ne peut pas usurper le host (seul le vrai host sait répondre).
+
+- GUI : **Hosts mémorisés** → **Modifier…** : nom, adresses (ajouter, supprimer, monter/descendre).
+  La liste affiche l'adresse principale et « +N » s'il y en a d'autres.
+- Ligne de commande :
+
+```powershell
+.\grx-client.exe hosts                                   # liste (avec toutes les adresses)
+.\grx-client.exe hosts edit pc-ludo --addr 192.168.1.20:443 --addr monpc.duckdns.org:443
+.\grx-client.exe hosts add-addr pc-ludo monpc.duckdns.org:7777          # à la fin (--first : en tête)
+.\grx-client.exe hosts remove-addr pc-ludo monpc.duckdns.org:7777
+.\grx-client.exe hosts rename pc-ludo salon
+.\grx-client.exe play pc-ludo --addr 10.0.0.5:443        # force une adresse, pour cette fois
+```
+
+Exemple : à la maison `192.168.1.20:443` en premier, dehors `monpc.duckdns.org:443` en second. La
+console indique « Connecté via … ».
 
 ### Pendant la session
 
@@ -244,15 +298,17 @@ Le PC de développement n'a qu'un GPU NVIDIA : les voies **Intel/AMD** sont simu
 
 | Problème | Solution |
 |---|---|
-| Le client affiche « aucune réponse » | Le host n'est pas lancé, l'adresse est fausse, le lien a déjà servi, ou le client a été révoqué (le host ne répond jamais aux inconnus). Créez une nouvelle invitation. |
-| Le statut UPnP du host est en échec | Vérifiez que l'UPnP est activé dans l'interface de la box. Sinon, créez une redirection manuelle UDP 7777 vers l'IP locale du PC host. |
+| Le client affiche « aucune réponse » | Le host n'est pas lancé, l'adresse est fausse (ancien port 7777 ? ajoutez la nouvelle adresse : « Modifier… »), le lien a déjà servi, ou le client a été révoqué (le host ne répond jamais aux inconnus). Créez une nouvelle invitation. |
+| Le host refuse de démarrer : « port UDP 443 déjà utilisé ou réservé » | Un autre programme (ou une plage réservée par Windows/Hyper-V) occupe ce port : choisissez-en un autre (`--bind 0.0.0.0:7777`, ou bouton **Port 7777** dans grx-gui) et régénérez les invitations. |
+| « Demander l'accès » : le host ne répond pas | Les demandes sont fermées sur le host (carte **Demandes d'accès** → Ouvrir), ou mauvaise adresse/port, ou redirection de box absente. |
+| Le statut UPnP du host est en échec | Vérifiez que l'UPnP est activé dans l'interface de la box. Sinon, créez une redirection manuelle UDP 443 (le port d'écoute) vers l'IP locale du PC host. |
 | Ça marche en local mais pas depuis Internet | Pare-feu : `grx-host.exe firewall-help`. Vérifiez que le réseau Windows est en **Privé**. |
 | Décodeur HEVC : « aucun décodeur matériel HEVC utilisable » au démarrage du client | Pas grave : le host passe en **H.264 automatiquement** (host récent en `--codec auto`). Pour retrouver HEVC : installez l'extension gratuite **« HEVC Video Extensions from Device Manufacturer »** (Microsoft Store), ou placez les DLL FFmpeg LGPL (`avcodec-62.dll`, `avutil-60.dll`, `swresample-6.dll`) à côté de `grx-client.exe`. La console du client liste ses décodeurs (`Décodeurs vidéo de ce PC`). |
 | « Décodeur vidéo … indisponible sur ce PC » (code 4) | La connexion fonctionne, c'est le décodage qui échoue : host ancien sans négociation (mettez-le à jour ou lancez-le avec `--codec h264`), ou pilote graphique à mettre à jour si c'est H.264. |
 | Le décodeur casse en pleine session | Le client renégocie tout seul vers H.264 (« renégociation » dans sa console) sans couper la session. |
 | GPU du client à 100 % (Gestionnaire des tâches : « Video Decode » / « Video Processing »), grosse latence — vu sur portables Intel Arc | Mettez le client à jour (0.2.3 : une seule conversion couleur par image, sortie du décodeur au format du flux, FFmpeg D3D11VA préféré sur GPU Intel, débit max par défaut 30 Mb/s). Lancez `grx-client play <host> --stats` et envoyez les lignes `diag :` : `voie` (décodeur utilisé), `Blt/s` (doit valoir ≈ img/s), `Present/s`, `ProcessOutput/s` (≈ 2 × img/s), `resets`, `IDR reçues/demandées/s` (≈ 0 en régime établi), `décodeurs créés` (1), `reçu` (Mb/s). Pistes : `play --decoder software` pour comparer, ou forcer H.264 côté host (`run --codec h264`). |
 | Image saccadée, pertes élevées | Lancez le host avec `--max-bitrate 15 --fps 30` et réessayez. Préférez un câble Ethernet côté host. |
-| L'adresse publique a changé | Recréez une invitation, ou utilisez un nom DuckDNS (`--addr monpc.duckdns.org:7777`). |
+| L'adresse publique a changé | Côté client : **Modifier…** le host et mettez la nouvelle adresse (pas besoin de réappairer). Mieux : un nom DuckDNS (`--addr monpc.duckdns.org:443`). |
 | Une touche reste « enfoncée » côté host | Fermez le client : le host relâche tout à la déconnexion. |
 | La manette n'est pas vue par le jeu | `grx-client gamepads` côté client doit la lister ; côté host, installez ViGEmBus (la console du host affiche « manettes virtuelles … »). Une manette PlayStation en DualShock 4 virtuelle n'est pas reconnue par certains jeux : revenez à `--gamepad-as xbox`. |
 
@@ -260,6 +316,7 @@ Le PC de développement n'a qu'un GPU NVIDIA : les voies **Intel/AMD** sont simu
 
 - Le lien d'invitation est un **secret à usage unique** : ne le publiez pas.
 - **Comparez toujours l'empreinte** du host lors de la première connexion.
+- Demandes d'accès : ouvrez-les le temps d'ajouter un client, comparez les **deux** empreintes avant d'accepter, puis refermez.
 - Révoquez les clients dont vous ne vous servez plus (`grx-host.exe list` puis `revoke`).
 - Arrêtez le host quand vous ne l'utilisez pas : l'arrêt referme le port sur la box.
 

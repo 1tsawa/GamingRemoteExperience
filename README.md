@@ -28,17 +28,17 @@ cargo build --release -p grx-host -p grx-client     # binaires dans target\relea
 **Sur le PC à contrôler (host)**
 
 ```powershell
-# 1. Lancer le host : il ouvre tout seul le port UDP 7777 sur la box (UPnP), voir plus bas
-target\release\grx-host.exe run --bind [::]:7777
+# 1. Lancer le host : il ouvre tout seul le port UDP 443 sur la box (UPnP), voir plus bas
+target\release\grx-host.exe run --bind [::]:443
 #    options : --codec auto|hevc|h264|av1 (défaut auto : négocié)  --fps 60  --max-bitrate 30  --fill  --no-input  --no-audio
 #              --display N (écran capturé au départ, 1 = le plus à gauche ; défaut : principal)
 #              --encoder auto|nvidia|amd|intel|software  --chroma auto|420|444
-#              --no-upnp  --external-port 7777  --upnp-lease 3600
+#              --no-upnp  --external-port 443  --upnp-lease 3600
 
 # 2. Dans une autre console : invitation à usage unique avec l'adresse publique détectée
 target\release\grx-host.exe invite --addr auto
-# -> affiche  grx://<IP publique>:7777/<clé du host>/<jeton>  (+ variante IPv6)
-#    ou une adresse fixe : --addr MON_IP_OU_DNS:7777
+# -> affiche  grx://<IP publique>:443/<clé du host>/<jeton>  (+ variante IPv6)
+#    ou une adresse fixe : --addr MON_IP_OU_DNS:443
 ```
 
 **Sur le PC client**
@@ -70,12 +70,12 @@ Vérifiez que l'empreinte affichée par `invite` est celle que le client voit à
 
 Seul le **host** doit être joignable ; le client n'a rien à ouvrir. Il n'y a pas de serveur de NAT traversal : le host demande lui-même la redirection à la box.
 
-- **UPnP automatique (par défaut)** : `grx-host run` cherche la box (UPnP IGD, puis PCP/NAT-PMP en repli, ≤ 3 s), redirige le port UDP externe 7777 (ou `--external-port N`) vers ce PC avec un bail d'1 h renouvelé à mi-vie, et **supprime la redirection à l'arrêt** (Ctrl+C). Si le port est déjà redirigé vers une autre machine, il prend 7778…7781 puis un port aléatoire : régénérez l'invitation. Tout se passe dans un thread : un échec (UPnP désactivé sur la box…) est journalisé et le host continue en local. `--no-upnp` désactive tout (redirection manuelle sur la box). Si le host est tué brutalement, la redirection expire seule à la fin du bail.
-- **`invite --addr auto`** : prend l'adresse de la redirection du host lancé (`status.json` du dossier de données), sinon lit l'IP externe sur la box et utilise `--port` (7777) en rappelant de lancer le host. Message explicite si la box n'a pas d'IP publique.
+- **UPnP automatique (par défaut)** : `grx-host run` cherche la box (UPnP IGD, puis PCP/NAT-PMP en repli, ≤ 3 s), redirige le port UDP externe = port d'écoute, 443 par défaut (ou `--external-port N`) vers ce PC avec un bail d'1 h renouvelé à mi-vie, et **supprime la redirection à l'arrêt** (Ctrl+C). Si le port est déjà redirigé vers une autre machine, il prend les 4 ports suivants (444…447) puis un port aléatoire : régénérez l'invitation. Tout se passe dans un thread : un échec (UPnP désactivé sur la box…) est journalisé et le host continue en local. `--no-upnp` désactive tout (redirection manuelle sur la box). Si le host est tué brutalement, la redirection expire seule à la fin du bail.
+- **`invite --addr auto`** : prend l'adresse de la redirection du host lancé (`status.json` du dossier de données), sinon lit l'IP externe sur la box et utilise `--port` (443) en rappelant de lancer le host. Message explicite si la box n'a pas d'IP publique.
 - **CGNAT / double NAT** : si l'IP « externe » de la box est privée (10/8, 172.16/12, 192.168/16) ou en 100.64/10, l'UPnP ne suffira pas (le host et `invite` le disent). Solutions : IPv4 publique « full-stack » auprès du FAI, box/routeur amont en mode bridge, IPv6, ou VPN (Tailscale…).
-- **IPv6** : avec `--bind [::]:7777` le host écoute en IPv4 **et** IPv6 ; `invite --addr auto` affiche aussi le lien `grx://[2a01:…]:7777/…` (adresse IPv6 globale stable de la machine, lue localement). En IPv6 il n'y a pas de NAT : il suffit d'autoriser le port UDP dans le pare-feu Windows (certaines box filtrent aussi l'IPv6 entrant : option « pare-feu IPv6 » de la box).
-- **Pare-feu Windows** : grx-host ne le modifie jamais. Au démarrage il vérifie (lecture seule) qu'une règle autorise `grx-host.exe` en entrée UDP et affiche sinon la commande à lancer en administrateur ; `grx-host firewall-help [--port 7777]` l'imprime (variantes PowerShell et `netsh`). Si vous avez refusé la fenêtre « Autoriser l'accès » de Windows, une règle de **blocage** existe : la commande pour la retirer est aussi affichée.
-- **IP publique dynamique** : l'IP de la box change parfois et les liens `grx://IP:port` deviennent caducs. Un nom DuckDNS gratuit (`monpc.duckdns.org`, mis à jour par le client DuckDNS ou la box) règle ça : `grx-host invite --addr monpc.duckdns.org:7777`. Les clients déjà appairés peuvent aussi relancer `play` avec un nouveau lien.
+- **IPv6** : avec `--bind [::]:443` le host écoute en IPv4 **et** IPv6 ; `invite --addr auto` affiche aussi le lien `grx://[2a01:…]:7777/…` (adresse IPv6 globale stable de la machine, lue localement). En IPv6 il n'y a pas de NAT : il suffit d'autoriser le port UDP dans le pare-feu Windows (certaines box filtrent aussi l'IPv6 entrant : option « pare-feu IPv6 » de la box).
+- **Pare-feu Windows** : grx-host ne le modifie jamais. Au démarrage il vérifie (lecture seule) qu'une règle autorise `grx-host.exe` en entrée UDP et affiche sinon la commande à lancer en administrateur ; `grx-host firewall-help [--port 443]` l'imprime (variantes PowerShell et `netsh`). Si vous avez refusé la fenêtre « Autoriser l'accès » de Windows, une règle de **blocage** existe : la commande pour la retirer est aussi affichée.
+- **IP publique dynamique** : l'IP de la box change parfois et les liens `grx://IP:port` deviennent caducs. Un nom DuckDNS gratuit (`monpc.duckdns.org`, mis à jour par le client DuckDNS ou la box) règle ça : `grx-host invite --addr monpc.duckdns.org:443`. Les clients déjà appairés ajoutent simplement la nouvelle adresse au host mémorisé (`grx-client hosts add-addr`, ou « Modifier… » dans grx-gui), sans réappairer.
 - **État** : pendant l'exécution, `status.json` (dossier de données du host) contient `{pid, bind, started_ms, upnp: {ok, state, method, external_addr, lease_secs, error, warnings}, ipv6, firewall}` ; il est supprimé à l'arrêt. Diagnostic de la box : `cargo run -p grx-portmap --example probe -- info|list|get <port>`.
 
 ### Raccourcis du client `play`

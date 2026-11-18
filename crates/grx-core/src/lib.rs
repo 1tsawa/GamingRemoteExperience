@@ -8,6 +8,7 @@
 pub mod error;
 pub mod identity;
 pub mod invite;
+pub mod pairing;
 pub mod codec_neg;
 pub mod displays;
 pub mod elevation;
@@ -23,5 +24,6 @@ pub use error::{Error, Result};
 pub use identity::{fingerprint, Identity, PublicKey};
 pub use invite::{Invite, Token};
 pub use profiles::{Profile, ProfileStore};
-pub use session::{ClientHandshake, HostAuth, Session, PKT_DATA, PKT_INIT, PKT_RESP};
+pub use pairing::{PairStatus, PKT_KEY_REQ, PKT_KEY_RESP};
+pub use session::{ClientHandshake, HostAuth, InitOutcome, Session, PKT_DATA, PKT_INIT, PKT_RESP};
 pub use trust::{Role, TrustStore};

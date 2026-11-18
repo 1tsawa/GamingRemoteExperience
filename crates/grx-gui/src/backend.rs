@@ -20,6 +20,7 @@ use grx_core::util::{b32_decode, default_data_dir, now_ms};
 use grx_core::{fingerprint, Error as CoreError, Identity, Invite, ProfileStore, PublicKey, TrustStore};
 use zeroize::Zeroize;
 
+use crate::access::{self, ReachLine, ReqLine, RequestsState};
 use crate::hoststatus::{self, RunStatus};
 use crate::logic::{sanitize_display, ClientRow, LogBuffer};
 use crate::settings::{self, GuiSettings};
@@ -74,7 +75,10 @@ pub enum Level {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProfileRow {
     pub name: String,
+    /// Adresse principale (essayée en premier).
     pub addr: String,
+    /// Toutes les adresses, dans l'ordre d'essai.
+    pub addrs: Vec<String>,
     pub fingerprint: String,
 }
 
@@ -137,6 +141,12 @@ pub enum Event {
     Update(crate::update::UpdateEvent),
     /// État du mode Contrôle total (tâche planifiée).
     Elevation(ElevationState),
+    /// Demandes d'accès sans invitation (host) : ouverture et liste.
+    Requests(RequestsState),
+    /// Résultat du test de joignabilité du host.
+    Reachability(Vec<ReachLine>),
+    /// Progression d'une demande d'accès lancée par ce client (`grx-client request`).
+    AccessReq { id: u64, line: ReqLine },
 }
 
 #[derive(Clone)]
@@ -172,9 +182,18 @@ pub enum DataCmd {
     SetRole { fingerprint: String, name: String, role: grx_core::Role },
     Revoke { fingerprint: String, name: String },
     RenameHost { old: String, new: String },
+    /// Fenêtre « Modifier » : nom et adresses (déjà validés) d'un host mémorisé.
+    EditHost { old: String, new: String, addrs: Vec<String> },
     DeleteHost(String),
     DetectLocalIp { port: u16 },
     SaveSettings(GuiSettings),
+    /// Ouvre (date de fin, ou `REQUESTS_ALWAYS_OPEN`) ou ferme (0) les demandes d'accès.
+    SetRequestsOpen { until_ms: u64 },
+    ApproveRequest { fingerprint: String, name: String, role: grx_core::Role },
+    DenyRequest { fingerprint: String, name: String },
+    ForgetRequest { fingerprint: String },
+    /// Test de joignabilité : sonde du host envoyée au port local et à l'adresse publique.
+    Reachability { port: u16, public: Option<String> },
 }
 
 type FileStamp = Option<(SystemTime, u64)>;
@@ -255,6 +274,7 @@ fn profile_rows(s: &ProfileStore) -> Vec<ProfileRow> {
         .map(|p| ProfileRow {
             name: p.name.clone(),
             addr: p.addr.clone(),
+            addrs: p.addresses(),
             fingerprint: p.fingerprint().unwrap_or_else(|| "clé corrompue".into()),
         })
         .collect()
@@ -282,16 +302,17 @@ pub fn spawn_data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
 
 fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
     // Identités (la clé privée est lue puis effacée de la mémoire par Identity ; seule la clé publique reste).
-    let host_pub: Option<PublicKey> = match Identity::load_or_create(&paths.host_dir.join("identity.json")) {
-        Ok(id) => {
-            sink.send(Event::HostIdentity(Ok(id.fingerprint())));
-            Some(id.public())
-        }
-        Err(e) => {
-            sink.send(Event::HostIdentity(Err(core_err("Identité du host illisible", &e))));
-            None
-        }
-    };
+    let (host_pub, host_probe): (Option<PublicKey>, Option<grx_core::pairing::ProbeKey>) =
+        match Identity::load_or_create(&paths.host_dir.join("identity.json")) {
+            Ok(id) => {
+                sink.send(Event::HostIdentity(Ok(id.fingerprint())));
+                (Some(id.public()), Some(id.probe_key()))
+            }
+            Err(e) => {
+                sink.send(Event::HostIdentity(Err(core_err("Identité du host illisible", &e))));
+                (None, None)
+            }
+        };
     match Identity::load_or_create(&paths.client_dir.join("identity.json")) {
         Ok(id) => sink.send(Event::ClientIdentity(Ok(id.fingerprint()))),
         Err(e) => sink.send(Event::ClientIdentity(Err(core_err("Identité du client illisible", &e)))),
@@ -303,6 +324,7 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
 
     let mut trust: Option<TrustStore> = None;
     let mut last_rows: Option<Vec<ClientRow>> = None;
+    let mut last_requests: Option<RequestsState> = None;
     let mut last_trust_err: Option<String> = None;
     let mut profiles: Option<ProfileStore> = None;
     let mut last_hosts_stamp: Option<FileStamp> = None;
@@ -310,6 +332,7 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
     // Charge (ou recharge) la liste de confiance et la pousse à l'UI si elle a changé.
     let poll_trust = |trust: &mut Option<TrustStore>,
                       last_rows: &mut Option<Vec<ClientRow>>,
+                      last_reqs: &mut Option<RequestsState>,
                       last_err: &mut Option<String>,
                       sink: &Sink| {
         let result: Result<(), CoreError> = match trust {
@@ -324,6 +347,15 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
                     if last_rows.as_ref() != Some(&rows) {
                         *last_rows = Some(rows.clone());
                         sink.send(Event::Clients(Ok(rows)));
+                    }
+                    // Recalculé à chaque tour : les demandes expirent avec le temps.
+                    let reqs = RequestsState {
+                        open_until_ms: t.requests_open_until(),
+                        rows: access::request_rows(&t.access_requests(now_ms())),
+                    };
+                    if last_reqs.as_ref() != Some(&reqs) {
+                        *last_reqs = Some(reqs.clone());
+                        sink.send(Event::Requests(reqs));
                     }
                 }
             }
@@ -346,7 +378,16 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
 
         if let Some(cmd) = cmd {
             // Les mutations exigent une liste de confiance chargée.
-            let needs_trust = matches!(cmd, DataCmd::CreateInvite { .. } | DataCmd::SetRole { .. } | DataCmd::Revoke { .. });
+            let needs_trust = matches!(
+                cmd,
+                DataCmd::CreateInvite { .. }
+                    | DataCmd::SetRole { .. }
+                    | DataCmd::Revoke { .. }
+                    | DataCmd::SetRequestsOpen { .. }
+                    | DataCmd::ApproveRequest { .. }
+                    | DataCmd::DenyRequest { .. }
+                    | DataCmd::ForgetRequest { .. }
+            );
             if needs_trust && trust.is_none() {
                 match TrustStore::load(&trust_path) {
                     Ok(t) => trust = Some(t),
@@ -389,7 +430,7 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
                         ),
                         Err(e) => sink.notice(Level::Error, core_err("Changement de rôle impossible", &e)),
                     }
-                    poll_trust(&mut trust, &mut last_rows, &mut last_trust_err, &sink);
+                    poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
                 }
                 DataCmd::Revoke { fingerprint, name } => {
                     let t = trust.as_mut().expect("chargé ci-dessus");
@@ -398,7 +439,7 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
                         Ok(_) => sink.notice(Level::Success, format!("« {name} » révoqué : sa session en cours est coupée.")),
                         Err(e) => sink.notice(Level::Error, core_err("Révocation impossible", &e)),
                     }
-                    poll_trust(&mut trust, &mut last_rows, &mut last_trust_err, &sink);
+                    poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
                 }
                 DataCmd::RenameHost { old, new } => {
                     with_profiles(&mut profiles, &paths.client_dir, &sink, |p| match p.rename(&old, &new) {
@@ -406,6 +447,18 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
                         Ok(false) => sink.notice(Level::Error, format!("« {old} » n'existe plus.")),
                         Err(CoreError::BadInvite(m)) => sink.notice(Level::Error, m),
                         Err(e) => sink.notice(Level::Error, core_err("Renommage impossible", &e)),
+                    });
+                    last_hosts_stamp = None; // force l'envoi de la liste
+                }
+                DataCmd::EditHost { old, new, addrs } => {
+                    with_profiles(&mut profiles, &paths.client_dir, &sink, |p| match p.edit(&old, &new, &addrs) {
+                        Ok(true) => sink.notice(
+                            Level::Success,
+                            format!("« {new} » enregistré ({} adresse(s)). Même host, pas besoin de réappairer.", addrs.len()),
+                        ),
+                        Ok(false) => sink.notice(Level::Error, format!("« {old} » n'existe plus.")),
+                        Err(CoreError::BadInvite(m)) => sink.notice(Level::Error, m),
+                        Err(e) => sink.notice(Level::Error, core_err("Modification impossible", &e)),
                     });
                     last_hosts_stamp = None; // force l'envoi de la liste
                 }
@@ -427,6 +480,62 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
                     Ok(ip) => sink.send(Event::LocalIp(format!("{ip}:{port}"))),
                     Err(e) => sink.notice(Level::Error, format!("IP locale introuvable : {e}")),
                 },
+                DataCmd::SetRequestsOpen { until_ms } => {
+                    let t = trust.as_mut().expect("chargé ci-dessus");
+                    match t.set_requests_open_until(until_ms) {
+                        Ok(()) if until_ms == 0 => sink.notice(Level::Info, "Demandes d'accès fermées : le host ne répond plus aux inconnus."),
+                        Ok(()) => sink.notice(
+                            Level::Success,
+                            "Demandes d'accès ouvertes. Le client choisit « Demander l'accès » et tape l'adresse du host ; sa demande apparaîtra ici.",
+                        ),
+                        Err(e) => sink.notice(Level::Error, core_err("Ouverture des demandes impossible", &e)),
+                    }
+                    poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
+                }
+                DataCmd::ApproveRequest { fingerprint, name, role } => {
+                    let t = trust.as_mut().expect("chargé ci-dessus");
+                    match t.approve_request(&fingerprint, role, now_ms()) {
+                        Ok(Some(_)) => sink.notice(Level::Success, format!("« {name} » accepté : sa connexion démarre de son côté.")),
+                        Ok(None) => sink.notice(Level::Error, format!("La demande de « {name} » a expiré : il doit redemander.")),
+                        Err(e) => sink.notice(Level::Error, core_err("Validation impossible", &e)),
+                    }
+                    poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
+                }
+                DataCmd::DenyRequest { fingerprint, name } => {
+                    let t = trust.as_mut().expect("chargé ci-dessus");
+                    match t.deny_request(&fingerprint, now_ms()) {
+                        Ok(true) => sink.notice(Level::Info, format!("Demande de « {name} » refusée (retenue 1 h).")),
+                        Ok(false) => sink.notice(Level::Error, format!("La demande de « {name} » n'existe plus.")),
+                        Err(e) => sink.notice(Level::Error, core_err("Refus impossible", &e)),
+                    }
+                    poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
+                }
+                DataCmd::ForgetRequest { fingerprint } => {
+                    let t = trust.as_mut().expect("chargé ci-dessus");
+                    if let Err(e) = t.forget_request(&fingerprint) {
+                        sink.notice(Level::Error, core_err("Suppression impossible", &e));
+                    }
+                    poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
+                }
+                DataCmd::Reachability { port, public } => {
+                    let (Some(key), Some(probe)) = (host_pub, host_probe) else {
+                        sink.notice(Level::Error, "Test impossible : identité du host indisponible.");
+                        continue;
+                    };
+                    let sink = sink.clone();
+                    // Jusqu'à ~2 s par cible : fil dédié.
+                    std::thread::spawn(move || {
+                        let local = detect_local_ip().ok();
+                        let lines = access::reach_targets(local.as_deref(), port, public.as_deref())
+                            .into_iter()
+                            .map(|(label, addr, hint)| {
+                                let result = access::probe_addr(&addr, &probe, &key);
+                                ReachLine { label, addr, result, hint }
+                            })
+                            .collect();
+                        sink.send(Event::Reachability(lines));
+                    });
+                }
                 DataCmd::SaveSettings(s) => {
                     if let Err(e) = settings::save(&settings_path, &s) {
                         sink.notice(Level::Error, format!("Préférences non enregistrées : {e}"));
@@ -435,7 +544,7 @@ fn data_worker(paths: Paths, sink: Sink, rx: Receiver<DataCmd>) {
             }
         }
 
-        poll_trust(&mut trust, &mut last_rows, &mut last_trust_err, &sink);
+        poll_trust(&mut trust, &mut last_rows, &mut last_requests, &mut last_trust_err, &sink);
 
         // hosts.json : rechargé quand la date ou la taille change (aussi quand `grx-client` y écrit).
         let stamp = stamp_of(&hosts_path);
@@ -981,14 +1090,18 @@ pub struct ClientSessions {
     next_id: Arc<AtomicU64>,
     pub kill_all: Arc<AtomicBool>,
     pub active: Arc<AtomicUsize>,
+    /// Processus à arrêter (bouton « Annuler » d'une demande d'accès).
+    kill_ids: Arc<Mutex<Vec<u64>>>,
 }
 
 impl ClientSessions {
     /// Lance `grx-client` avec `args`. `stdin_line` (lien ou nom) est écrit sur son entrée standard
     /// puis effacé de la mémoire : le jeton n'apparaît pas dans la ligne de commande.
-    pub fn launch(&self, exe: PathBuf, args: Vec<String>, mut stdin_line: String, name: String, sink: Sink) {
+    pub fn launch(&self, exe: PathBuf, args: Vec<String>, mut stdin_line: String, name: String, sink: Sink) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let ret = id;
         let kill = self.kill_all.clone();
+        let kill_ids = self.kill_ids.clone();
         let active = self.active.clone();
         active.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
@@ -1025,13 +1138,30 @@ impl ClientSessions {
             let dirty = Arc::new(AtomicBool::new(false));
             let mut readers = Vec::new();
             if let Some(o) = child.stdout.take() {
-                readers.push(spawn_reader_joinable(o, log.clone(), dirty.clone()));
+                // Les lignes `GRX-REQ` (demande d'accès) sont relayées à l'UI au fil de l'eau.
+                let (sink, log, dirty) = (sink.clone(), log.clone(), dirty.clone());
+                readers.push(std::thread::spawn(move || {
+                    for line in BufReader::new(o).lines().map_while(Result::ok) {
+                        if let Some(l) = access::parse_req_line(&line) {
+                            sink.send(Event::AccessReq { id, line: l });
+                        }
+                        if let Ok(mut lg) = log.lock() {
+                            lg.push(&line);
+                        }
+                        dirty.store(true, Ordering::Relaxed);
+                    }
+                }));
             }
             if let Some(e) = child.stderr.take() {
                 readers.push(spawn_reader_joinable(e, log.clone(), dirty.clone()));
             }
             let status = loop {
-                if kill.load(Ordering::SeqCst) {
+                let cancel = kill_ids.lock().map(|mut v| {
+                    let hit = v.contains(&id);
+                    v.retain(|i| *i != id);
+                    hit
+                });
+                if kill.load(Ordering::SeqCst) || cancel.unwrap_or(false) {
                     let _ = child.kill();
                 }
                 match child.try_wait() {
@@ -1049,6 +1179,14 @@ impl ClientSessions {
                 Err(e) => exit(Some(format!("Suivi du processus impossible : {e}")), None, tail),
             }
         });
+        ret
+    }
+
+    /// Arrête le processus `id` (sans effet s'il est déjà terminé).
+    pub fn cancel(&self, id: u64) {
+        if let Ok(mut v) = self.kill_ids.lock() {
+            v.push(id);
+        }
     }
 }
 

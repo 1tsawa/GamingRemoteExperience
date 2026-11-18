@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+- Demandes d'accès sans invitation (client : `IP:port` ; host : ouverture limitée dans le temps, liste avec empreinte, Accepter/Refuser) : `grx-client request`, `grx-host requests`, cartes grx-gui. Fermées = silence total ; aucune session avant acceptation ; empreintes affichées des deux côtés (clé du host reçue en confiance au premier usage).
+- Sécurité des demandes : INIT de demande rembourré (réponse jamais plus grosse), seau global des nouvelles demandes, file bornée (16), refusé = silence une fois fermé, journal dédoublonné.
+- Test de joignabilité (GUI) : sonde du host horodatée, à usage unique (±30 s, anti-rejeu).
+- Port par défaut UDP 443 (au lieu de 7777) : `run --bind`, `invite --port`, `firewall-help`, UPnP, grx-gui ; réglages existants conservés ; message clair si le port est occupé/réservé.
+- Hosts mémorisés à plusieurs adresses ordonnées (`addrs`, rétrocompatible avec `addr`) : essai dans l'ordre, « Connecté via … », `play/connect/bench --addr` ; `grx-client hosts edit|add-addr|remove-addr|rename|remove` ; grx-gui « Modifier… » (nom, adresses, ordre, validation), liste « adresse +N ».
+
 ## 0.2.3
 
 - Client : une seule conversion YUV→RGB (VideoProcessorBlt) par image ; curseur/calque/redimensionnement recopient l'image RGB, re-présentations plafonnées à la fréquence de l'écran (≤ 120 Hz).

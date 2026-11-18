@@ -106,10 +106,60 @@ struct PendingInvite {
     expires_ms: u64,
 }
 
+/// Demande d'accès reçue sans invitation (voir `pairing`), en attente d'une décision sur le host.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AccessRequest {
+    /// Clé publique du client (base32).
+    pub key: String,
+    /// Nom annoncé par le client (non vérifié).
+    pub name: String,
+    /// Dernière adresse IP:port d'où la demande est arrivée.
+    pub addr: String,
+    pub first_ms: u64,
+    /// Dernière relance du client (il redemande toutes les ~2 s ; écrit au plus toutes les 15 s).
+    pub last_ms: u64,
+    /// Refusée : le client reçoit « refusé » jusqu'à expiration (`DENIED_TTL_MS`).
+    #[serde(default)]
+    pub denied: bool,
+}
+
+impl AccessRequest {
+    pub fn fingerprint(&self) -> String {
+        b32_decode(&self.key).and_then(|v| <[u8; 32]>::try_from(v).ok()).map(|k| fingerprint(&k)).unwrap_or_default()
+    }
+
+    fn expired(&self, now_ms: u64) -> bool {
+        let ttl = if self.denied { DENIED_TTL_MS } else { REQUEST_TTL_MS };
+        now_ms.saturating_sub(self.last_ms) > ttl
+    }
+}
+
+/// Demandes conservées au plus (les plus anciennes sont oubliées).
+pub const MAX_ACCESS_REQUESTS: usize = 16;
+/// Une demande que le client ne relance plus est oubliée après 10 min.
+pub const REQUEST_TTL_MS: u64 = 10 * 60 * 1000;
+/// Un refus est retenu 1 h (le client reçoit « refusé » au lieu de redemander).
+pub const DENIED_TTL_MS: u64 = 60 * 60 * 1000;
+/// `last_ms` n'est réécrit sur disque qu'au-delà de cet écart (le client relance toutes les 2 s).
+const REQUEST_TOUCH_MS: u64 = 15 * 1000;
+/// Valeur de `requests_open_until_ms` pour « ouvert sans limite de durée ».
+pub const REQUESTS_ALWAYS_OPEN: u64 = u64::MAX;
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Data {
     clients: Vec<AuthorizedClient>,
     invites: Vec<PendingInvite>,
+    /// Demandes d'accès sans invitation (ignorées, et perdues à la réécriture, par une version ancienne).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    requests: Vec<AccessRequest>,
+    /// Les demandes d'accès sont acceptées (le host répond aux inconnus) jusqu'à cette date ;
+    /// 0 = fermées (défaut : le host reste muet envers les inconnus).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    requests_open_until_ms: u64,
 }
 
 /// Empreinte bon marché du fichier (date de modification + longueur) pour détecter un changement.
@@ -274,6 +324,136 @@ impl TrustStore {
 
     pub fn clients(&self) -> &[AuthorizedClient] {
         &self.data.clients
+    }
+
+    // ───────────── demandes d'accès sans invitation ─────────────
+
+    /// Les demandes d'accès sont-elles ouvertes à cette date ?
+    pub fn requests_open(&self, now_ms: u64) -> bool {
+        now_ms < self.data.requests_open_until_ms
+    }
+
+    /// Date de fermeture des demandes (0 = fermées, [`REQUESTS_ALWAYS_OPEN`] = sans limite).
+    pub fn requests_open_until(&self) -> u64 {
+        self.data.requests_open_until_ms
+    }
+
+    /// Ouvre (date future, ou [`REQUESTS_ALWAYS_OPEN`]) ou ferme (0) les demandes d'accès.
+    pub fn set_requests_open_until(&mut self, until_ms: u64) -> Result<()> {
+        self.mutate(|d| {
+            let changed = d.requests_open_until_ms != until_ms;
+            d.requests_open_until_ms = until_ms;
+            Ok(((), changed))
+        })
+    }
+
+    /// Demandes non expirées (en attente et refusées), les plus récentes d'abord.
+    pub fn access_requests(&self, now_ms: u64) -> Vec<AccessRequest> {
+        let mut v: Vec<_> = self.data.requests.iter().filter(|r| !r.expired(now_ms)).cloned().collect();
+        v.sort_by_key(|r| std::cmp::Reverse(r.first_ms));
+        v
+    }
+
+    /// Une demande (en attente ou refusée, non expirée) existe-t-elle pour cette clé ?
+    pub fn has_request(&self, key: &PublicKey) -> bool {
+        let k = b32_encode(key);
+        self.data.requests.iter().any(|r| r.key == k)
+    }
+
+    /// Le host a-t-il refusé (récemment) cette clé ?
+    pub fn is_request_denied(&self, key: &PublicKey, now_ms: u64) -> bool {
+        let k = b32_encode(key);
+        self.data.requests.iter().any(|r| r.key == k && r.denied && !r.expired(now_ms))
+    }
+
+    /// Enregistre (ou rafraîchit) la demande d'accès d'une clé inconnue. N'écrit sur disque que
+    /// si la demande est nouvelle, a changé d'adresse ou de nom, ou n'a pas été touchée depuis 15 s.
+    pub fn note_request(&mut self, key: &PublicKey, name: &str, addr: &str, now_ms: u64) -> Result<()> {
+        let k = b32_encode(key);
+        // Chemin rapide sans verrou exclusif ni écriture (relances toutes les 2 s).
+        if let Some(r) = self.data.requests.iter().find(|r| r.key == k && !r.denied) {
+            if r.name == name && r.addr == addr && now_ms.saturating_sub(r.last_ms) < REQUEST_TOUCH_MS {
+                return Ok(());
+            }
+        }
+        self.mutate(|d| {
+            d.requests.retain(|r| !r.expired(now_ms));
+            if let Some(r) = d.requests.iter_mut().find(|r| r.key == k) {
+                if r.denied {
+                    return Ok(((), false));
+                }
+                r.name = name.to_string();
+                r.addr = addr.to_string();
+                r.last_ms = now_ms;
+                return Ok(((), true));
+            }
+            if d.requests.len() >= MAX_ACCESS_REQUESTS {
+                // On oublie la demande en attente la plus ancienne (sinon le refus le plus ancien).
+                let victim = d
+                    .requests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| !r.denied)
+                    .min_by_key(|(_, r)| r.last_ms)
+                    .or_else(|| d.requests.iter().enumerate().min_by_key(|(_, r)| r.last_ms))
+                    .map(|(i, _)| i);
+                if let Some(i) = victim {
+                    d.requests.remove(i);
+                }
+            }
+            d.requests.push(AccessRequest {
+                key: k.clone(),
+                name: name.to_string(),
+                addr: addr.to_string(),
+                first_ms: now_ms,
+                last_ms: now_ms,
+                denied: false,
+            });
+            Ok(((), true))
+        })
+    }
+
+    /// Accepte la demande dont l'empreinte est EXACTEMENT `fp` : la clé devient un client autorisé
+    /// avec ce rôle. Retourne le nom du client, `None` si la demande n'existe plus.
+    pub fn approve_request(&mut self, fp: &str, role: Role, now_ms: u64) -> Result<Option<String>> {
+        let want = fp.trim().to_uppercase();
+        self.mutate(|d| {
+            let Some(i) = d.requests.iter().position(|r| r.fingerprint() == want && !r.expired(now_ms)) else {
+                return Ok((None, false));
+            };
+            let r = d.requests.remove(i);
+            if !d.clients.iter().any(|c| c.key == r.key) {
+                let mut c = AuthorizedClient { key: r.key, name: r.name.clone(), added_ms: now_ms, view_only: false, role: None };
+                c.set_role(role);
+                d.clients.push(c);
+            }
+            Ok((Some(r.name), true))
+        })
+    }
+
+    /// Refuse la demande dont l'empreinte est EXACTEMENT `fp` (retenue 1 h). `false` si elle
+    /// n'existe plus.
+    pub fn deny_request(&mut self, fp: &str, now_ms: u64) -> Result<bool> {
+        let want = fp.trim().to_uppercase();
+        self.mutate(|d| {
+            let Some(r) = d.requests.iter_mut().find(|r| r.fingerprint() == want && !r.expired(now_ms)) else {
+                return Ok((false, false));
+            };
+            r.denied = true;
+            r.last_ms = now_ms;
+            Ok((true, true))
+        })
+    }
+
+    /// Oublie une demande (en attente ou refusée) : le client pourra redemander.
+    pub fn forget_request(&mut self, fp: &str) -> Result<bool> {
+        let want = fp.trim().to_uppercase();
+        self.mutate(|d| {
+            let before = d.requests.len();
+            d.requests.retain(|r| r.fingerprint() != want);
+            let n = d.requests.len() < before;
+            Ok((n, n))
+        })
     }
 
     pub fn create_invite(&mut self, ttl_ms: u64, now_ms: u64) -> Result<Token> {
@@ -443,3 +623,7 @@ mod tests {
 #[cfg(test)]
 #[path = "trust_role_tests.rs"]
 mod role_tests;
+
+#[cfg(test)]
+#[path = "trust_request_tests.rs"]
+mod request_tests;

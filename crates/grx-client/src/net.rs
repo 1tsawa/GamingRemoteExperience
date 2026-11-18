@@ -57,6 +57,12 @@ pub struct ConnectOptions {
     /// Images vidéo conservées en attente du consommateur avant purge (jusqu'à l'image clé suivante).
     pub video_queue: usize,
     pub audio_queue: usize,
+    /// Adresses du host à essayer dans l'ordre (host mémorisé à plusieurs adresses) ; vide =
+    /// l'adresse de l'invitation. La clé du host est épinglée : une adresse qui mène ailleurs
+    /// échoue à la poignée de main, elle ne peut pas usurper le host.
+    pub addrs: Vec<String>,
+    /// Délai par adresse au premier tour quand il y en a plusieurs (les suivants : `handshake_timeout`).
+    pub first_round_timeout: Duration,
 }
 
 impl Default for ConnectOptions {
@@ -69,6 +75,8 @@ impl Default for ConnectOptions {
             idle_timeout: Duration::from_secs(5),
             video_queue: 120,
             audio_queue: 200,
+            addrs: Vec::new(),
+            first_round_timeout: Duration::from_millis(800),
         }
     }
 }
@@ -146,68 +154,133 @@ pub struct ClientConnection {
     host_fingerprint: String,
     session_id: u32,
     remote: SocketAddr,
+    /// Adresse (telle que mémorisée) qui a servi.
+    addr_used: String,
+}
+
+/// Poignée de main sur `sock` (déjà connectée) jusqu'à `timeout`. `Ok(None)` = pas de réponse.
+fn handshake_once(
+    sock: &UdpSocket,
+    buf: &mut [u8],
+    id: &Identity,
+    inv: &Invite,
+    name: &str,
+    timeout: Duration,
+) -> Result<Option<Session>> {
+    // Le host ignore un INIT rejoué (même horodatage) : chaque essai repart d'une poignée neuve.
+    let (hs, init) = ClientHandshake::start(id, inv.host_key, name, inv.token.as_ref(), now_ms())?;
+    sock.send(&init)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        sock.set_read_timeout(Some(left))?;
+        match sock.recv(buf) {
+            Ok(n) => {
+                if n == 0 || buf[0] != PKT_RESP {
+                    continue; // paquet parasite : on continue d'attendre la réponse
+                }
+                // Réponse indéchiffrable (autre host, paquet forgé) : cette adresse échoue, on
+                // passe à la suivante sans abandonner la connexion.
+                return match hs.finish(&buf[..n]) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(e) => {
+                        eprintln!("! réponse invalide ignorée : {e}");
+                        Ok(None)
+                    }
+                };
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(None),
+            Err(e) if is_transient_recv_error(&e) => {
+                thread::sleep(Duration::from_millis(100)); // port fermé, datagramme tronqué... : essai suivant
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Socket UDP connectée à `addr` (résolution DNS comprise).
+fn socket_for(addr: &str) -> Result<(UdpSocket, SocketAddr)> {
+    let remote = addr
+        .to_socket_addrs()
+        .with_context(|| format!("résolution de {addr}"))?
+        .next()
+        .ok_or_else(|| anyhow!("adresse {addr} introuvable"))?;
+    let sock = UdpSocket::bind(if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
+    sock.connect(remote)?;
+    {
+        let r = socket2::SockRef::from(&sock);
+        let _ = r.set_recv_buffer_size(4 << 20);
+        let _ = r.set_send_buffer_size(1 << 20);
+    }
+    Ok((sock, remote))
 }
 
 impl ClientConnection {
-    /// Poignée de main (bloquante, `handshake_attempts` essais) puis démarrage du thread réseau.
+    /// Poignée de main (bloquante, `handshake_attempts` tours) puis démarrage du thread réseau.
+    ///
+    /// Avec plusieurs adresses (`opts.addrs`), elles sont essayées dans l'ordre, une à la fois (un
+    /// seul INIT en vol : le host ne garde qu'une session en attente), avec un délai court au
+    /// premier tour. La clé du host étant épinglée, seule une réponse du vrai host est acceptée.
     ///
     /// Échoue si le host ne répond pas : il ne répond jamais aux clients non autorisés.
     pub fn connect(id: &Identity, inv: &Invite, opts: ConnectOptions) -> Result<Self> {
-        let remote = inv
-            .addr
-            .to_socket_addrs()
-            .with_context(|| format!("résolution de {}", inv.addr))?
-            .next()
-            .ok_or_else(|| anyhow!("adresse introuvable"))?;
-        let sock = UdpSocket::bind(if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })?;
-        sock.connect(remote)?;
-        {
-            let r = socket2::SockRef::from(&sock);
-            let _ = r.set_recv_buffer_size(4 << 20);
-            let _ = r.set_send_buffer_size(1 << 20);
-        }
-        sock.set_read_timeout(Some(opts.handshake_timeout))?;
-
+        let addrs: Vec<String> = if opts.addrs.is_empty() { vec![inv.addr.clone()] } else { opts.addrs.clone() };
+        let multi = addrs.len() > 1;
         // 64 Kio : un datagramme plus gros que le tampon fait échouer `recv` (WSAEMSGSIZE sous
         // Windows) ; un paquet parasite ne doit jamais faire échouer la connexion.
         let mut buf = vec![0u8; 65536];
-        let mut session = None;
-        // UDP peut perdre un paquet ; le host ignore un INIT rejoué (même horodatage), donc
-        // chaque essai repart d'une poignée de main neuve.
-        for attempt in 1..=opts.handshake_attempts.max(1) {
-            let (hs, init) = ClientHandshake::start(id, inv.host_key, &opts.name, inv.token.as_ref(), now_ms())?;
-            sock.send(&init)?;
-            let deadline = Instant::now() + opts.handshake_timeout;
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                sock.set_read_timeout(Some(left))?;
-                match sock.recv(&mut buf) {
-                    Ok(n) => {
-                        if n == 0 || buf[0] != PKT_RESP {
-                            continue; // paquet parasite : on continue d'attendre la réponse
+        let mut found = None;
+        let mut errors: Vec<String> = Vec::new();
+        let rounds = opts.handshake_attempts.max(1);
+        'rounds: for round in 1..=rounds {
+            let timeout =
+                if multi && round == 1 { opts.first_round_timeout.min(opts.handshake_timeout) } else { opts.handshake_timeout };
+            for addr in &addrs {
+                let (sock, remote) = match socket_for(addr) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if round == 1 {
+                            eprintln!("! {addr} : {e:#}");
+                            errors.push(format!("{addr} : {e:#}"));
                         }
-                        session = Some(hs.finish(&buf[..n]).context("poignée de main invalide")?);
-                        break;
+                        continue;
                     }
-                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
-                    Err(e) if is_transient_recv_error(&e) => {
-                        thread::sleep(Duration::from_millis(100)); // port fermé, datagramme tronqué... : on réessaie
-                        break;
-                    }
-                    Err(e) => return Err(e.into()),
+                };
+                if let Some(sess) = handshake_once(&sock, &mut buf, id, inv, &opts.name, timeout)? {
+                    found = Some((sock, remote, addr.clone(), sess));
+                    break 'rounds;
+                }
+                if multi {
+                    eprintln!("pas de réponse de {addr} (tour {round}/{rounds})");
                 }
             }
-            if session.is_some() {
-                break;
+            if !multi {
+                eprintln!("pas de réponse (essai {round}/{rounds})");
             }
-            eprintln!("pas de réponse (essai {attempt}/{})", opts.handshake_attempts);
         }
-        let Some(sess) = session else {
-            bail!("aucune réponse : host éteint, mauvaise adresse, ou client non autorisé (le host ne répond jamais aux inconnus)");
+        let Some((sock, remote, addr_used, sess)) = found else {
+            if multi {
+                bail!(
+                    "aucune réponse sur les {} adresses de ce host ({}) : host éteint, adresses périmées, ou client non autorisé \
+                     (le host ne répond jamais aux inconnus)",
+                    addrs.len(),
+                    addrs.join(", ")
+                );
+            }
+            match errors.pop() {
+                Some(e) => bail!("{e}"),
+                None => bail!(
+                    "aucune réponse : host éteint, mauvaise adresse, ou client non autorisé (le host ne répond jamais aux inconnus)"
+                ),
+            }
         };
+        if multi {
+            println!("Connecté via {addr_used}");
+        }
         sock.set_nonblocking(true)?;
 
         let host_name = sess.peer_name().to_string();
@@ -233,7 +306,12 @@ impl ClientConnection {
         let thread = thread::Builder::new()
             .name("grx-client-net".into())
             .spawn(move || net_loop(sh, sock, sess, cmd_rx, opts))?;
-        Ok(Self { shared, cmd_tx, thread: Some(thread), host_name, host_fingerprint, session_id, remote })
+        Ok(Self { shared, cmd_tx, thread: Some(thread), host_name, host_fingerprint, session_id, remote, addr_used })
+    }
+
+    /// Adresse (telle que mémorisée ou saisie) par laquelle la connexion s'est faite.
+    pub fn addr_used(&self) -> &str {
+        &self.addr_used
     }
 
     pub fn host_name(&self) -> &str {
@@ -647,5 +725,74 @@ mod tests {
         assert!(conn.is_connected(), "la connexion a été fermée : {:?}", conn.state());
         drop(conn);
         th.join().unwrap();
+    }
+
+    /// Host mémorisé à plusieurs adresses : une muette, une qui répond n'importe quoi, puis le
+    /// vrai host. La connexion passe par la troisième et l'indique.
+    #[test]
+    fn multi_address_skips_mute_and_bogus_addresses() {
+        let mute = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bogus = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let host_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mute_addr, bogus_addr, host_addr) =
+            (mute.local_addr().unwrap(), bogus.local_addr().unwrap(), host_sock.local_addr().unwrap());
+        let host_id = Identity::generate();
+        let host_key = host_id.public();
+        let client = Identity::generate();
+        let mut auth = HostAuth::new(host_id, TrustStore::in_memory(), "vrai-host");
+        let tok = auth.trust.create_invite(60_000, now_ms()).unwrap();
+        // Pré-autorise le client (comme un host déjà appairé).
+        let (_, init) = ClientHandshake::start(&client, host_key, "c", Some(&tok), now_ms()).unwrap();
+        auth.accept(&init, now_ms()).unwrap();
+        thread::sleep(Duration::from_millis(2));
+
+        let bog = thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            let _ = bogus.set_read_timeout(Some(Duration::from_secs(5)));
+            if let Ok((_, from)) = bogus.recv_from(&mut buf) {
+                let mut junk = vec![0x55u8; 120];
+                junk[0] = PKT_RESP;
+                let _ = bogus.send_to(&junk, from);
+            }
+        });
+        let th = thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            let (n, from) = host_sock.recv_from(&mut buf).unwrap();
+            let (resp, _sess) = auth.accept(&buf[..n], now_ms()).unwrap();
+            host_sock.send_to(&resp, from).unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let invite = Invite { addr: mute_addr.to_string(), host_key, token: None };
+        let opts = ConnectOptions {
+            addrs: vec![mute_addr.to_string(), bogus_addr.to_string(), host_addr.to_string()],
+            first_round_timeout: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        let conn = ClientConnection::connect(&client, &invite, opts).expect("connexion via la 3e adresse");
+        assert_eq!(conn.addr_used(), host_addr.to_string());
+        assert_eq!(conn.remote_addr(), host_addr);
+        assert!(t0.elapsed() < Duration::from_secs(2), "délai court par adresse : {:?}", t0.elapsed());
+        drop(conn);
+        drop(mute);
+        bog.join().unwrap();
+        th.join().unwrap();
+    }
+
+    /// Aucune adresse ne répond : erreur claire qui les cite toutes.
+    #[test]
+    fn multi_address_all_silent_lists_them() {
+        let a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (aa, ba) = (a.local_addr().unwrap().to_string(), b.local_addr().unwrap().to_string());
+        let invite = Invite { addr: aa.clone(), host_key: Identity::generate().public(), token: None };
+        let opts = ConnectOptions {
+            addrs: vec![aa.clone(), ba.clone()],
+            handshake_attempts: 1,
+            first_round_timeout: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let e = ClientConnection::connect(&Identity::generate(), &invite, opts).err().map(|e| e.to_string()).expect("échec attendu");
+        assert!(e.contains(&aa) && e.contains(&ba), "{e}");
     }
 }
