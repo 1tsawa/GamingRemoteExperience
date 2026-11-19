@@ -17,6 +17,7 @@ use grx_render::winit::event::{ElementState, MouseButton as WinButton, MouseScro
 use grx_render::winit::keyboard::{KeyCode, PhysicalKey};
 use grx_render::{Align, Color, Font, OverlayScene, Rect};
 
+use crate::overlay_cursor::OverlayHover;
 use crate::overlay_layout::{frac_of, place, Frac, Preset, MARGIN};
 use crate::overlay_prefs::OverlayPrefs;
 
@@ -226,6 +227,8 @@ const PADS_H: f32 = 18.0;
 const REVEAL_ZONE: f32 = 48.0;
 const FLOAT_W: f32 = 132.0;
 const FLOAT_H: f32 = 26.0;
+/// Marge cliquable autour du bouton flottant (plus généreuse que son dessin).
+const FLOAT_HIT_PAD: f32 = 6.0;
 
 const BW_STEPS_MBPS: [u32; 16] = [2, 3, 5, 8, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 150, 200];
 const FPS_CHOICES: [u32; 4] = [30, 60, 120, 144];
@@ -295,6 +298,9 @@ pub struct Overlay {
     pub stats_pos: Frac,
     pub button_pos: Frac,
     move_drag: Option<MoveDrag>,
+    /// Un bouton de souris enfoncé a été transmis au host (glisser dans le jeu) : le bouton
+    /// flottant n'apparaît pas et ne capte rien tant qu'il n'est pas relâché.
+    pub host_drag: bool,
 }
 
 impl Overlay {
@@ -339,6 +345,7 @@ impl Overlay {
             stats_pos: DEFAULT_STATS_POS,
             button_pos: DEFAULT_BUTTON_POS,
             move_drag: None,
+            host_drag: false,
         }
     }
 
@@ -401,6 +408,44 @@ impl Overlay {
         }
     }
 
+    /// Ce qu'il y a sous la souris locale (curseur local/distant, icône : voir `overlay_cursor`).
+    pub fn hover(&self) -> OverlayHover {
+        if self.wants_move_cursor() {
+            return OverlayHover::Move;
+        }
+        if self.move_drag.is_some() || self.drag.is_some() {
+            return OverlayHover::Clickable; // appui sur le bouton flottant / curseur de réglage tenu
+        }
+        match self.hit() {
+            None => OverlayHover::None,
+            Some(Hit::Title | Hit::Stats) => OverlayHover::Move,
+            Some(Hit::Panel) => OverlayHover::Inert,
+            Some(Hit::Row(r) | Hit::Slider(r) | Hit::Preset(r, _)) if !self.row_enabled(r) => OverlayHover::Inert,
+            Some(Hit::Mute) if !self.row_enabled(Row::Volume) => OverlayHover::Inert,
+            Some(_) => OverlayHover::Clickable,
+        }
+    }
+
+    /// Menu fermé : la souris est sur le bouton flottant (ses événements ne vont pas au host).
+    fn over_float(&self) -> bool {
+        !self.menu_open && self.hit() == Some(Hit::FloatButton)
+    }
+
+    /// Clic d'un autre bouton que le gauche ou molette : à garder pour l'overlay ?
+    pub fn owns_pointer(&self) -> bool {
+        self.menu_open || self.over_float() || self.move_drag.is_some()
+    }
+
+    /// Centre du menu en pixels physiques (le curseur local y est placé quand le menu s'ouvre
+    /// depuis la capture souris, où sa position réelle est inconnue de l'utilisateur), et position
+    /// du curseur mise à jour en conséquence.
+    pub fn place_cursor_on_menu(&mut self) -> (f64, f64) {
+        let p = self.panel_rect();
+        let (x, y) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+        self.cursor = Some((x, y));
+        ((x * self.scale) as f64, (y * self.scale) as f64)
+    }
+
     /// Taille de la fenêtre en pixels physiques + facteur DPI.
     pub fn set_view(&mut self, phys_w: u32, phys_h: u32, scale: f64) {
         self.scale = if scale.is_finite() && scale > 0.1 { scale as f32 } else { 1.0 };
@@ -417,7 +462,7 @@ impl Overlay {
         if self.move_drag.is_some_and(|d| d.target == Target::Button) {
             return true;
         }
-        self.button_enabled && !self.menu_open && !self.capture && self.cursor.is_some_and(|(x, y)| self.in_reveal_zone(x, y))
+        self.button_enabled && !self.menu_open && !self.capture && !self.host_drag && self.cursor.is_some_and(|(x, y)| self.in_reveal_zone(x, y))
     }
 
     /// Près du bouton, ou dans la bande du bord de fenêtre auquel il est collé (haut par défaut).
@@ -593,7 +638,8 @@ impl Overlay {
                 if let Some(row) = self.drag {
                     return (true, self.slide(row, x));
                 }
-                (self.menu_open, vec![])
+                // Survol du bouton flottant : le host ne reçoit pas ces mouvements.
+                (self.menu_open || self.over_float(), vec![])
             }
             Ev::Leave => {
                 self.cursor = None;
@@ -611,7 +657,7 @@ impl Overlay {
             Ev::Down(x, y) => {
                 self.cursor = Some((x, y));
                 if !self.menu_open {
-                    if self.float_visible() && self.float_rect().contains(x, y) {
+                    if self.float_visible() && self.float_hit_rect().contains(x, y) {
                         self.start_move(Target::Button, x, y);
                         return (true, vec![]);
                     }
@@ -621,7 +667,7 @@ impl Overlay {
             }
             Ev::Wheel(d) => {
                 if !self.menu_open {
-                    return (false, vec![]);
+                    return (self.over_float(), vec![]);
                 }
                 let row = match self.hit() {
                     Some(Hit::Row(r) | Hit::Slider(r) | Hit::Preset(r, _)) => Some(r),
@@ -1043,13 +1089,18 @@ impl Overlay {
         Rect::new(x, y, FLOAT_W, FLOAT_H)
     }
 
+    /// Zone cliquable du bouton flottant (un peu plus large que son dessin).
+    fn float_hit_rect(&self) -> Rect {
+        self.float_rect().inset(-FLOAT_HIT_PAD, -FLOAT_HIT_PAD)
+    }
+
     fn hit(&self) -> Option<Hit> {
         self.cursor.and_then(|(x, y)| self.hit_at(x, y))
     }
 
     fn hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         if !self.menu_open {
-            return (self.float_visible() && self.float_rect().contains(x, y)).then_some(Hit::FloatButton);
+            return (self.float_visible() && self.float_hit_rect().contains(x, y)).then_some(Hit::FloatButton);
         }
         let p = self.panel_rect();
         if !p.contains(x, y) {
@@ -1462,6 +1513,8 @@ pub struct OverlayInput {
     alt: bool,
     winit_mods: (bool, bool, bool),
     swallowed: HashSet<KeyCode>,
+    /// Boutons de souris dont l'appui est parti au host (non consommé), voir `Overlay::host_drag`.
+    host_buttons: HashSet<WinButton>,
 }
 
 /// Résultat d'un événement de fenêtre.
@@ -1492,6 +1545,7 @@ impl OverlayInput {
                 // Un relâchement perdu ne doit pas laisser un glisser en cours.
                 ov.drag = None;
                 ov.move_drag = None;
+                self.host_buttons.clear();
             }
             WindowEvent::Resized(sz) => ov.set_view(sz.width, sz.height, s),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -1507,7 +1561,11 @@ impl OverlayInput {
                 _ if *state == ElementState::Released => ev(ov, Ev::Up, &mut out),
                 _ => {}
             },
-            WindowEvent::MouseInput { .. } => out.consumed = ov.menu_open,
+            // Clic droit/milieu… : jamais au host sur le bouton flottant ni menu ouvert. Menu
+            // fermé, un relâchement passe toujours (le host ne doit pas garder un bouton enfoncé).
+            WindowEvent::MouseInput { state, .. } => {
+                out.consumed = ov.menu_open || (*state == ElementState::Pressed && ov.owns_pointer())
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let d = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
@@ -1569,6 +1627,18 @@ impl OverlayInput {
             }
             _ => {}
         }
+        // Suivi des boutons tenus côté host (après la décision « consommé »).
+        if let WindowEvent::MouseInput { state, button, .. } = we {
+            if *state == ElementState::Released || ov.menu_open {
+                self.host_buttons.remove(button);
+            } else if !out.consumed {
+                self.host_buttons.insert(*button);
+            }
+        }
+        if ov.menu_open {
+            self.host_buttons.clear(); // l'ouverture du menu relâche tout côté host
+        }
+        ov.host_drag = !self.host_buttons.is_empty();
         out
     }
 }
@@ -1819,3 +1889,7 @@ mod tests {
 #[cfg(test)]
 #[path = "overlay_codec_tests.rs"]
 mod codec_tests;
+
+#[cfg(test)]
+#[path = "overlay_hover_tests.rs"]
+mod hover_tests;

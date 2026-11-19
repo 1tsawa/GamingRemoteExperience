@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6
+
+- Overlay : curseur Windows local affiché au survol du bouton flottant et menu ouvert (main / déplacer), curseur distant masqué pendant ce temps ; zone du bouton élargie de 6 px.
+- Overlay : mouvements, molette et clic droit sur le bouton flottant ne partent plus au host ; bouton ignoré pendant un glisser en jeu.
+- Capture relative + Ctrl+Maj+M : curseur placé au centre du menu.
+
 ## 0.2.5
 
 - Abandon du port 7777 : migration automatique vers UDP 443 des réglages host (`gui.json`, host élevé `host-options.json`) et des adresses des hosts mémorisés côté client (`hosts.json`, une seule fois).

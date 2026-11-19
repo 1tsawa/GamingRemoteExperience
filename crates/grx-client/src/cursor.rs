@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use grx_render::winit::event::WindowEvent;
 use grx_render::winit::window::Window;
 use grx_render::{CursorShape, PresenterEvent, PresenterHandle, RemoteCursor};
+use crate::overlay_cursor::OverlayHover;
 use grx_transport::cursor::{is_shape_chunk, seq_newer, CursorPos, FifoCache, Shape, ShapeAssembler, SHAPE_CACHE};
 
 /// Le client garde un peu plus de formes que le host n'en suppose (marge, même ordre FIFO).
@@ -211,32 +212,39 @@ pub fn spawn_forwarder(
 /// Masque le curseur Windows local au-dessus de l'image vidéo dès qu'un curseur distant est
 /// reçu (il est dessiné à sa place) ; le laisse visible sur les bandes noires. En mode capture,
 /// la visibilité reste gérée par `input.rs` (curseur local masqué, curseur distant affiché).
+/// Sur l'overlay (survol d'un élément interactif, menu ouvert), c'est l'inverse : curseur local
+/// visible et curseur distant non dessiné, voir [`crate::overlay_cursor::decide`].
 pub struct LocalCursorHider {
     inbox: Arc<CursorInbox>,
     handle: PresenterHandle,
     over_video: bool,
     captured: bool,
     applied: Option<bool>,
+    remote_suppressed: bool,
 }
 
 impl LocalCursorHider {
     pub fn new(inbox: Arc<CursorInbox>, handle: PresenterHandle) -> Self {
-        LocalCursorHider { inbox, handle, over_video: false, captured: false, applied: None }
+        LocalCursorHider { inbox, handle, over_video: false, captured: false, applied: None, remote_suppressed: false }
     }
 
-    /// Visibilité voulue pour le curseur local (`None` : ne pas y toucher, mode capture).
+    /// Visibilité voulue pour le curseur local hors overlay (`None` : ne pas y toucher, mode capture).
+    #[cfg(test)]
     pub fn desired(remote_active: bool, over_video: bool, captured: bool) -> Option<bool> {
-        if captured {
-            None
-        } else {
-            Some(!(remote_active && over_video))
-        }
+        crate::overlay_cursor::decide(crate::overlay_cursor::CursorInputs {
+            remote_active,
+            over_video,
+            captured,
+            ..Default::default()
+        })
+        .local_visible
     }
 
-    /// À appeler pour chaque événement, après `InputHandler::handle` (`capture` = son résultat).
-    pub fn update(&mut self, ev: &PresenterEvent, win: &Window, capture: Option<bool>) {
-        if let Some(c) = capture {
-            self.captured = c;
+    /// À appeler pour chaque événement, une fois l'overlay et `InputHandler` passés
+    /// (`captured` = état effectif de la capture souris, `menu_open`/`hover` = état de l'overlay).
+    pub fn update(&mut self, ev: &PresenterEvent, win: &Window, captured: bool, menu_open: bool, hover: OverlayHover) {
+        if captured != self.captured {
+            self.captured = captured;
             self.applied = None; // input.rs vient de changer la visibilité
         }
         match ev {
@@ -246,11 +254,22 @@ impl LocalCursorHider {
             PresenterEvent::Window(WindowEvent::CursorLeft { .. }) => self.over_video = false,
             _ => {}
         }
-        if let Some(v) = Self::desired(self.inbox.active(), self.over_video, self.captured) {
+        let d = crate::overlay_cursor::decide(crate::overlay_cursor::CursorInputs {
+            menu_open,
+            hover,
+            captured: self.captured,
+            remote_active: self.inbox.active(),
+            over_video: self.over_video,
+        });
+        if let Some(v) = d.local_visible {
             if self.applied != Some(v) {
                 win.set_cursor_visible(v);
                 self.applied = Some(v);
             }
+        }
+        if self.remote_suppressed == d.draw_remote {
+            self.remote_suppressed = !d.draw_remote;
+            self.handle.set_remote_cursor_suppressed(self.remote_suppressed);
         }
     }
 }

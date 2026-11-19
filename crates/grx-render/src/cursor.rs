@@ -101,6 +101,9 @@ pub(crate) struct CursorShared {
     cur: Mutex<Option<RemoteCursor>>,
     /// Un réveil du thread de fenêtre est déjà demandé (coalescence des mises à jour).
     pending: AtomicBool,
+    /// Curseur distant momentanément non dessiné (le client affiche le curseur local au-dessus
+    /// de son overlay), voir [`crate::PresenterHandle::set_remote_cursor_suppressed`].
+    suppressed: AtomicBool,
     /// Latences « mise à jour sur le host -> dessin » (µs), voir [`crate::PresenterHandle::take_cursor_latency_stats`].
     pub(crate) latencies: Mutex<Vec<u32>>,
 }
@@ -110,6 +113,14 @@ impl CursorShared {
     pub(crate) fn set(&self, c: Option<RemoteCursor>) -> bool {
         *self.cur.lock().unwrap() = c;
         !self.pending.swap(true, Ordering::AcqRel)
+    }
+    /// Masque/réaffiche le curseur distant sans perdre son état ; `true` si le thread de fenêtre
+    /// doit être réveillé (changement effectif et aucun réveil déjà demandé).
+    pub(crate) fn set_suppressed(&self, on: bool) -> bool {
+        self.suppressed.swap(on, Ordering::AcqRel) != on && !self.pending.swap(true, Ordering::AcqRel)
+    }
+    fn is_suppressed(&self) -> bool {
+        self.suppressed.load(Ordering::Acquire)
     }
     pub(crate) fn clear_pending(&self) {
         self.pending.store(false, Ordering::Release);
@@ -309,7 +320,7 @@ impl CursorLayer {
         if self.failed {
             return;
         }
-        let Some(c) = self.shared.as_ref().and_then(|s| s.get()) else { return };
+        let Some(c) = self.shared.as_ref().filter(|s| !s.is_suppressed()).and_then(|s| s.get()) else { return };
         let rect = crate::blit::fit_rect(vid_w, vid_h, w, h);
         let Some(q) = cursor_quad(&c, rect) else { return };
         if let Err(e) = self.draw_inner(dev, ctx, bb, w, h, rect, q, &c) {
@@ -478,5 +489,20 @@ mod tests {
         s.clear_pending();
         assert!(s.set(None));
         assert!(s.get().is_none());
+    }
+
+    #[test]
+    fn suppression_keeps_state_and_wakes_only_on_change() {
+        let s = CursorShared::default();
+        s.set(Some(cur(0.5, 0.5, 4, 4)));
+        s.clear_pending();
+        assert!(!s.is_suppressed());
+        assert!(s.set_suppressed(true), "changement : réveil");
+        assert!(s.is_suppressed());
+        s.clear_pending();
+        assert!(!s.set_suppressed(true), "inchangé : pas de réveil");
+        assert!(s.get().is_some(), "l'état du curseur est conservé");
+        assert!(s.set_suppressed(false));
+        assert!(!s.is_suppressed());
     }
 }

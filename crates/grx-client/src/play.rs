@@ -317,21 +317,28 @@ pub fn run(
         open_at_start: p.open_overlay,
         prefs_path: p.prefs_path.clone(),
         saved_prefs: start_prefs,
-        move_cursor: false,
+        icon: Default::default(),
     };
     let run_res = presenter.run(move |ev, win| {
-        if let PresenterEvent::Ready = ev {
-            let captured = glue.ready(win, &ui_hook, &mut handler);
-            win.set_title(&ui_hook.title());
-            if let (Some(h), Some(c)) = (hider.as_mut(), captured) {
-                h.update(ev, win, Some(c));
+        // Curseur local ou distant selon l'overlay (voir `overlay_cursor.rs`), après tout le reste.
+        let mut sync_cursor = |win: &grx_render::winit::window::Window, handler: &InputHandler| {
+            let (menu_open, hover) = {
+                let ov = ui_hook.ov.lock().unwrap();
+                (ov.menu_open, ov.hover())
+            };
+            if let Some(h) = hider.as_mut() {
+                h.update(ev, win, handler.is_captured(), menu_open, hover);
             }
+        };
+        if let PresenterEvent::Ready = ev {
+            glue.ready(win, &ui_hook, &mut handler);
+            win.set_title(&ui_hook.title());
+            sync_cursor(win, &handler);
             return false;
         }
         // Overlay d'abord : ce qu'il consomme n'atteint jamais l'InputHandler (donc le host).
         let ov_out = glue.event(ev, &ui_hook);
         let r = if ov_out.consumed { Default::default() } else { handler.handle(ev, win) };
-        let menu_open = ui_hook.ov.lock().unwrap().menu_open;
         if r.toggle_stats {
             ui_hook.show_stats.fetch_xor(true, Ordering::Relaxed);
         }
@@ -341,10 +348,8 @@ pub fn run(
         if r.toggle_stats || r.capture.is_some() {
             win.set_title(&ui_hook.title());
         }
-        if let (Some(h), false) = (hider.as_mut(), menu_open) {
-            h.update(ev, win, r.capture);
-        }
-        glue.after(ov_out.actions, r.capture, ev, win, &ui_hook, &mut handler, hider.as_mut());
+        glue.after(ov_out.actions, r.capture, win, &ui_hook, &mut handler);
+        sync_cursor(win, &handler);
         // Manettes au neutre sans focus ou menu ouvert.
         if let PresenterEvent::Window(grx_render::winit::event::WindowEvent::Focused(f)) = ev {
             ui_hook.focused.store(*f, Ordering::Relaxed);
@@ -930,13 +935,13 @@ struct OverlayGlue {
     prefs_path: Option<std::path::PathBuf>,
     /// Dernières préférences écrites (on n'écrit que ce qui a changé).
     saved_prefs: crate::overlay_prefs::OverlayPrefs,
-    /// Curseur « déplacer » actuellement affiché.
-    move_cursor: bool,
+    /// Icône du curseur local actuellement demandée (main sur l'overlay, « déplacer »…).
+    icon: crate::overlay_cursor::CursorIcon,
 }
 
 impl OverlayGlue {
-    /// Renvoie l'état de capture souris appliqué au démarrage (préférence mémorisée), s'il y en a un.
-    fn ready(&mut self, win: &grx_render::winit::window::Window, ui: &Ui, handler: &mut InputHandler) -> Option<bool> {
+    /// Applique l'état de départ (capture souris mémorisée, menu ouvert par option).
+    fn ready(&mut self, win: &grx_render::winit::window::Window, ui: &Ui, handler: &mut InputHandler) {
         self.kbd = Some(crate::kbdlock::KeyboardLock::new(self.kbd_tx.take(), crate::kbdlock::hwnd_of(win)));
         let mut ov = ui.ov.lock().unwrap();
         let sz = win.inner_size();
@@ -957,20 +962,18 @@ impl OverlayGlue {
             self.conn.send_control(&st.encode());
         }
         // Capture souris mémorisée (avant une éventuelle ouverture du menu, qui la suspend).
-        let captured = (ov.capture && ov.input_enabled).then(|| {
+        if ov.capture && ov.input_enabled {
             let c = handler.set_capture_mode(true, win);
             ov.capture = c;
             ui.captured.store(c, Ordering::Relaxed);
-            c
-        });
+        }
         if self.open_at_start {
             let a = ov.open_menu();
             drop(ov);
-            self.after(a, None, &PresenterEvent::Ready, win, ui, handler, None);
-            return captured;
+            self.after(a, None, win, ui, handler);
+            return;
         }
         self.handle.set_overlay(ov.scene());
-        captured
     }
 
     fn event(&mut self, ev: &PresenterEvent, ui: &Ui) -> crate::overlay::Outcome {
@@ -989,23 +992,19 @@ impl OverlayGlue {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn after(
         &mut self,
         actions: Vec<crate::overlay::Action>,
         capture: Option<bool>,
-        ev: &PresenterEvent,
         win: &grx_render::winit::window::Window,
         ui: &Ui,
         handler: &mut InputHandler,
-        hider: Option<&mut crate::cursor::LocalCursorHider>,
     ) {
         use crate::overlay::Action;
         let mut ov = ui.ov.lock().unwrap();
         if let Some(c) = capture {
             ov.capture = c;
         }
-        let mut hider = hider;
         for a in actions {
             match a {
                 Action::SetFullscreen(on) => self.handle.set_fullscreen(on),
@@ -1041,9 +1040,18 @@ impl OverlayGlue {
                 Action::MenuOpened => {
                     // Le host ne doit rien garder d'enfoncé (Ctrl/Maj du raccourci compris).
                     handler.release_all();
-                    ov.capture = handler.is_captured();
+                    let was_captured = handler.is_captured();
+                    ov.capture = was_captured;
                     handler.set_capture_mode(false, win);
                     win.set_cursor_visible(true);
+                    if was_captured {
+                        // En capture, la position réelle du curseur (masqué, confiné) est
+                        // inconnue de l'utilisateur : on le pose au centre du menu.
+                        let (x, y) = ov.place_cursor_on_menu();
+                        if let Err(e) = win.set_cursor_position(grx_render::winit::dpi::PhysicalPosition::new(x, y)) {
+                            eprintln!("overlay : curseur non replacé sur le menu : {e}");
+                        }
+                    }
                     if let Some(k) = self.kbd.as_mut() {
                         k.set_suspended(true);
                     }
@@ -1056,20 +1064,22 @@ impl OverlayGlue {
                     ov.capture = handler.set_capture_mode(want, win);
                     ui.captured.store(ov.capture, Ordering::Relaxed);
                     win.set_title(&ui.title());
-                    if let Some(h) = hider.as_deref_mut() {
-                        h.update(ev, win, Some(ov.capture));
-                    }
                 }
             }
         }
         ov.fullscreen = win.fullscreen().is_some();
         self.handle.set_overlay(ov.scene());
-        // Curseur adapté au survol d'une poignée de déplacement.
-        let mv = ov.wants_move_cursor();
-        if mv != self.move_cursor {
+        // Icône du curseur local : main sur un élément cliquable, « déplacer » sur une poignée.
+        let icon = crate::overlay_cursor::icon_for(if ov.menu_open || !ov.capture { ov.hover() } else { Default::default() });
+        if icon != self.icon {
+            use crate::overlay_cursor::CursorIcon as I;
             use grx_render::winit::window::CursorIcon;
-            win.set_cursor(if mv { CursorIcon::Move } else { CursorIcon::Default });
-            self.move_cursor = mv;
+            win.set_cursor(match icon {
+                I::Default => CursorIcon::Default,
+                I::Pointer => CursorIcon::Pointer,
+                I::Move => CursorIcon::Move,
+            });
+            self.icon = icon;
         }
         // Préférences : écrites quand elles changent, jamais pendant un glisser (écriture au relâchement).
         if let Some(path) = self.prefs_path.as_deref() {

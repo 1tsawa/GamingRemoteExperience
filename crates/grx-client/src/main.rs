@@ -6,6 +6,7 @@ mod input;
 mod kbdlock;
 mod net;
 mod overlay;
+mod overlay_cursor;
 mod overlay_layout;
 mod overlay_prefs;
 mod play;

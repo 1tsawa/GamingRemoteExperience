@@ -227,6 +227,14 @@ impl PresenterHandle {
         }
     }
 
+    /// Suspend (`true`) ou rétablit le dessin du curseur distant sans perdre son état (le client
+    /// montre le curseur Windows local tant que la souris est sur son overlay). Redessine aussitôt.
+    pub fn set_remote_cursor_suppressed(&self, on: bool) {
+        if self.shared.cursor.set_suppressed(on) {
+            self.cmd(Command::CursorChanged);
+        }
+    }
+
     /// Latences « mise à jour du curseur sur le host -> dessin » depuis le dernier appel
     /// (horloges host/client supposées synchrones).
     pub fn take_cursor_latency_stats(&self) -> LatencyStats {
