@@ -2,8 +2,8 @@
 //! `invite --addr auto` et par l'interface graphique). Écrit atomiquement, supprimé à l'arrêt.
 //!
 //! ```json
-//! { "pid": 1234, "bind": "0.0.0.0:7777", "started_ms": 1731400000000,
-//!   "upnp": { "ok": true, "state": "ok", "method": "upnp", "external_addr": "198.51.100.7:7777",
+//! { "pid": 1234, "bind": "0.0.0.0:443", "started_ms": 1731400000000,
+//!   "upnp": { "ok": true, "state": "ok", "method": "upnp", "external_addr": "198.51.100.7:443",
 //!             "lease_secs": 3600, "error": null, "warnings": [] },
 //!   "ipv6": ["2a01:…"], "firewall": { "state": "missing", "detail": "…" } }
 //! ```

@@ -239,7 +239,8 @@ pub fn bind_socket(addr: SocketAddr) -> Result<UdpSocket> {
 /// Erreur de `bind` explicite : port occupé ou interdit → proposer un autre port.
 fn bind_error(addr: SocketAddr, e: std::io::Error) -> anyhow::Error {
     let port = addr.port();
-    let other = if port == 7777 { 443 } else { 7777 };
+    // 443 par défaut ; s'il est pris (serveur web/HTTP/3 local…), 8443 (alternative courante).
+    let other = if port == 443 { 8443 } else { 443 };
     let alt = SocketAddr::new(addr.ip(), other);
     match e.kind() {
         // WSAEADDRINUSE (10048) ; WSAEACCES (10013) = port réservé (plage exclue par Windows,
@@ -1309,7 +1310,9 @@ mod tests {
         let a = bind_socket("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = a.local_addr().unwrap();
         let e = bind_socket(addr).expect_err("deuxième bind refusé").to_string();
-        assert!(e.contains("déjà utilisé") && e.contains("--bind 127.0.0.1:7777"), "{e}");
+        assert!(e.contains("déjà utilisé") && e.contains("--bind 127.0.0.1:443"), "{e}");
+        let e = bind_error("0.0.0.0:443".parse().unwrap(), std::io::ErrorKind::AddrInUse.into()).to_string();
+        assert!(e.contains("--bind 0.0.0.0:8443") && !e.contains("7777"), "{e}");
     }
 
     fn recv_one(c: &Client) -> Option<Vec<u8>> {

@@ -22,6 +22,32 @@ use crate::{Error, Result};
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct Profiles {
     pub hosts: Vec<Profile>,
+    /// Les adresses en `:7777` (ancien port par défaut) ont déjà été migrées vers `:443` : la
+    /// migration n'a lieu qu'une fois (une adresse en 7777 ajoutée ensuite à la main est gardée).
+    #[serde(default)]
+    pub migrated_443: bool,
+}
+
+impl Profiles {
+    /// Migration unique de l'ancien port par défaut : chaque adresse `hôte:7777` devient
+    /// `hôte:443` (ordre conservé, doublons retirés). `true` si le fichier doit être réécrit.
+    fn migrate_old_port(&mut self) -> bool {
+        if self.migrated_443 {
+            return false;
+        }
+        for h in &mut self.hosts {
+            let mut list: Vec<String> = Vec::new();
+            for a in h.addresses() {
+                let a = crate::oldport::migrate_addr(&a).unwrap_or(a);
+                if !list.iter().any(|o| o.eq_ignore_ascii_case(&a)) {
+                    list.push(a);
+                }
+            }
+            h.set_addresses(list);
+        }
+        self.migrated_443 = true;
+        true
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -136,13 +162,35 @@ impl ProfileStore {
 
     /// Charge `<dir>/hosts.json`. Fichier absent = liste vide ; fichier illisible ou JSON invalide = erreur
     /// (on n'écrase jamais silencieusement un fichier qu'on ne sait pas lire).
+    ///
+    /// Un fichier pas encore migré (ancien port 7777, voir [`Profiles`]) est réécrit une fois,
+    /// sous verrou exclusif et de façon atomique ; un échec d'écriture n'empêche pas la lecture
+    /// (la migration reste appliquée en mémoire et sera écrite à la prochaine modification).
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join(Self::FILE);
-        let profiles = Self::read(&path)?;
+        let (mut profiles, needs_write) = Self::read_raw(&path)?;
+        if needs_write {
+            if let Ok(_lock) = FileLock::acquire(&path, true) {
+                // Relecture sous verrou : un autre processus a pu écrire entre-temps.
+                if let Ok((p, still_needed)) = Self::read_raw(&path) {
+                    if still_needed {
+                        if let Ok(json) = serde_json::to_vec_pretty(&p) {
+                            let _ = write_atomic(&path, &json);
+                        }
+                    }
+                    profiles = p;
+                }
+            }
+        }
         Ok(Self { path, profiles })
     }
 
     fn read(path: &Path) -> Result<Profiles> {
+        Self::read_raw(path).map(|(p, _)| p)
+    }
+
+    /// Lecture + normalisation ; `bool` = fichier existant à réécrire (migration du port).
+    fn read_raw(path: &Path) -> Result<(Profiles, bool)> {
         match std::fs::read(path) {
             Ok(b) => {
                 let mut p: Profiles = serde_json::from_slice(&b)?;
@@ -155,9 +203,13 @@ impl ProfileStore {
                         h.set_addresses(l);
                     }
                 }
-                Ok(p)
+                let migrated = p.migrate_old_port();
+                Ok((p, migrated))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Profiles::default()),
+            // Pas de fichier : rien à migrer (le premier enregistrement écrira le marqueur).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok((Profiles { migrated_443: true, ..Profiles::default() }, false))
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -376,3 +428,7 @@ mod tests {
 #[cfg(test)]
 #[path = "profiles_addrs_tests.rs"]
 mod addrs_tests;
+
+#[cfg(test)]
+#[path = "profiles_port_tests.rs"]
+mod port_tests;

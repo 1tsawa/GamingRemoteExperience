@@ -4,7 +4,7 @@
 //! ```no_run
 //! # use std::time::Duration;
 //! let mut m = grx_portmap::PortMapper::default()
-//!     .open("0.0.0.0:7777".parse().unwrap(), 7777, Duration::from_secs(3600), "grx-host")?;
+//!     .open("0.0.0.0:443".parse().unwrap(), 443, Duration::from_secs(3600), "grx-host")?;
 //! println!("joignable sur {} via {}", m.external, m.method);
 //! m.renew()?;   // à mi-vie : grx_portmap::plan::renew_delay(m.lease)
 //! m.close()?;   // (ou Drop)

@@ -8,19 +8,19 @@ fn old_file_without_addrs_reads_and_stays_compatible() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let k = crate::util::b32_encode(&Identity::generate().public());
-    let json = format!(r#"{{"hosts":[{{"name":"a","addr":"1.2.3.4:7777","host_key":"{}"}}]}}"#, k);
+    let json = format!(r#"{{"hosts":[{{"name":"a","addr":"1.2.3.4:9000","host_key":"{}"}}]}}"#, k);
     std::fs::write(dir.join("hosts.json"), json).unwrap();
 
     let mut s = ProfileStore::load(&dir).unwrap();
-    assert_eq!(s.addresses("a"), Some(vec!["1.2.3.4:7777".to_string()]));
+    assert_eq!(s.addresses("a"), Some(vec!["1.2.3.4:9000".to_string()]));
 
-    s.set_addresses("a", &["192.168.1.20:443", "1.2.3.4:7777"]).unwrap();
+    s.set_addresses("a", &["192.168.1.20:443", "1.2.3.4:9000"]).unwrap();
     let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hosts.json")).unwrap()).unwrap();
     assert_eq!(raw["hosts"][0]["addr"], "192.168.1.20:443");
     let addrs_arr = raw["hosts"][0]["addrs"].as_array().unwrap();
     assert_eq!(addrs_arr.len(), 2);
     assert_eq!(addrs_arr[0], "192.168.1.20:443");
-    assert_eq!(addrs_arr[1], "1.2.3.4:7777");
+    assert_eq!(addrs_arr[1], "1.2.3.4:9000");
 
     s.set_addresses("a", &["10.0.0.1:80"]).unwrap();
     let raw2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hosts.json")).unwrap()).unwrap();

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5
+
+- Abandon du port 7777 : migration automatique vers UDP 443 des réglages host (`gui.json`, host élevé `host-options.json`) et des adresses des hosts mémorisés côté client (`hosts.json`, une seule fois).
+- Bouton « Port 7777 » retiré ; message « port occupé » propose 443 (ou 8443).
+
 ## 0.2.4
 
 - Demandes d'accès sans invitation (client : `IP:port` ; host : ouverture limitée dans le temps, liste avec empreinte, Accepter/Refuser) : `grx-client request`, `grx-host requests`, cartes grx-gui. Fermées = silence total ; aucune session avant acceptation ; empreintes affichées des deux côtés (clé du host reçue en confiance au premier usage).

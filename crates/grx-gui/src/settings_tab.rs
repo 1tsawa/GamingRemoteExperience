@@ -448,23 +448,16 @@ impl App {
     }
 }
 
-/// Boutons « Port 443 » (défaut) / « Port 7777 » (ancien défaut) : changent le port d'écoute en gardant l'IP.
+/// Bouton « Port 443 » (défaut) : remet le port d'écoute à 443 en gardant l'IP.
 pub fn port_presets(ui: &mut egui::Ui, bind: &mut String) {
     if ui
         .small_button("Port 443")
         .on_hover_text(
-            "UDP 443 : le port de HTTP/3 (QUIC), souvent autorisé par les réseaux filtrés (Wi-Fi public, entreprise).              Ne passe pas un réseau qui n'autorise que TCP 443 ou impose un proxy. Pensez à la règle du pare-feu Windows              pour ce port (bouton « Voir la commande ») et à régénérer les invitations.",
+            "UDP 443 : le port de HTTP/3 (QUIC), souvent autorisé par les réseaux filtrés (Wi-Fi public, entreprise). Ne passe pas un réseau qui n'autorise que TCP 443 ou impose un proxy. Pensez à la règle du pare-feu Windows pour ce port (bouton « Voir la commande ») et à régénérer les invitations.",
         )
         .clicked()
     {
-        *bind = crate::logic::rebind_port(bind, 443);
-    }
-    if ui
-        .small_button(format!("Port {}", crate::logic::LEGACY_PORT))
-        .on_hover_text("Ancien port par défaut (jusqu'à 0.2.3) : à garder si votre box redirige déjà ce port.")
-        .clicked()
-    {
-        *bind = crate::logic::rebind_port(bind, crate::logic::LEGACY_PORT);
+        *bind = crate::logic::rebind_port(bind, crate::logic::DEFAULT_PORT);
     }
 }
 

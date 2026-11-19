@@ -146,8 +146,8 @@ impl App {
                 }
             }
             ui.label(small_muted(
-                "Exemples : l'IP locale pour jouer à la maison, puis l'adresse publique (ou DuckDNS) pour jouer dehors ; \
-                 ou le nouveau port 443 puis l'ancien 7777 le temps de changer la redirection de la box.",
+                "Exemple : l'IP locale pour jouer à la maison (192.168.1.20:443), puis l'adresse publique \
+                 ou DuckDNS pour jouer dehors (monpc.duckdns.org:443). Port UDP 443 par défaut.",
             ));
             if let Err(e) = &check {
                 ui.label(colored(e, ERR));

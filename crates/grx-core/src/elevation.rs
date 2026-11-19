@@ -32,13 +32,16 @@ pub struct TaskOptions {
 }
 
 impl TaskOptions {
-    /// Lecture stricte : taille bornée, JSON valide, arguments dans la liste blanche.
+    /// Lecture stricte : taille bornée, JSON valide, arguments dans la liste blanche. L'ancien port
+    /// par défaut (7777) est migré vers 443 (voir [`crate::oldport::migrate_run_args`]) ; grx-gui
+    /// réécrit le fichier à partir de ses réglages (eux aussi migrés) au prochain lancement élevé.
     pub fn parse(bytes: &[u8]) -> Result<TaskOptions, String> {
         if bytes.len() > MAX_OPTIONS_BYTES {
             return Err(format!("{OPTIONS_FILE} trop gros ({} octets)", bytes.len()));
         }
-        let o: TaskOptions = serde_json::from_slice(bytes).map_err(|e| format!("{OPTIONS_FILE} illisible : {e}"))?;
+        let mut o: TaskOptions = serde_json::from_slice(bytes).map_err(|e| format!("{OPTIONS_FILE} illisible : {e}"))?;
         validate_run_args(&o.args)?;
+        crate::oldport::migrate_run_args(&mut o.args);
         Ok(o)
     }
 }

@@ -30,9 +30,13 @@ pub fn settings_path(host_dir: &Path) -> PathBuf {
     host_dir.join("gui.json")
 }
 
-/// Fichier absent ou illisible = réglages par défaut (jamais bloquant).
+/// Fichier absent ou illisible = réglages par défaut (jamais bloquant). L'ancien port par défaut
+/// (7777) est migré vers 443 (voir [`HostRunOptions::migrate_old_port`]) ; la migration est écrite
+/// au prochain enregistrement.
 pub fn load(path: &Path) -> GuiSettings {
-    std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let mut s: GuiSettings = std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    s.host.migrate_old_port();
+    s
 }
 
 pub fn save(path: &Path, s: &GuiSettings) -> Result<(), String> {
@@ -51,7 +55,7 @@ mod tests {
         let p = settings_path(&dir);
         assert_eq!(load(&p), GuiSettings::default());
         let s = GuiSettings {
-            public_addr: "1.2.3.4:7777".into(),
+            public_addr: "1.2.3.4:443".into(),
             public_addr_auto: true,
             ttl: Ttl::Hour24,
             host: HostRunOptions { fps: 30, no_input: true, ..Default::default() },
@@ -80,5 +84,21 @@ mod tests {
         assert!(s.client.fullscreen && s.client.no_audio && s.client.volume == 80);
         assert_eq!(s.client.codec, crate::logic::CodecChoice::Auto);
         assert!(!s.update.auto_check);
+    }
+
+    #[test]
+    fn load_migrates_old_port_then_save_persists() {
+        let dir = std::env::temp_dir().join(format!("grx-gui-settings-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = settings_path(&dir);
+        std::fs::write(&p, br#"{"host":{"bind":"192.168.1.20:7777","external_port":7777,"fps":30}}"#).unwrap();
+        let s = load(&p);
+        assert_eq!((s.host.bind.as_str(), s.host.external_port, s.host.fps), ("192.168.1.20:443", 0, 30));
+        save(&p, &s).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(raw["host"]["bind"], "192.168.1.20:443");
+        assert_eq!(raw["host"]["external_port"], 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

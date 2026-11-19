@@ -78,14 +78,12 @@ Autres commandes utiles :
 .\grx-host.exe requests open --minutes 15   # demandes d'accès sans lien (voir plus bas)
 ```
 
-> **Port par défaut : UDP 443** (depuis 0.2.4, avant : 7777). C'est le port de HTTP/3 : il passe sur
-> la plupart des réseaux filtrés (Wi-Fi public, entreprise). Aucun droit administrateur n'est
-> nécessaire pour l'utiliser sous Windows. Vos réglages déjà enregistrés (port 7777 dans grx-gui)
-> sont conservés : pour passer à 443, bouton **Port 443** à côté de « Écoute », puis mettez à jour
-> la redirection de la box si vous l'aviez faite à la main. Côté client, ajoutez simplement la
-> nouvelle adresse au host mémorisé (voir « Modifier un host mémorisé ») : **pas besoin de
-> réappairer**. Si le port 443 est déjà pris sur le PC host, le host l'explique au démarrage et
-> propose un autre port (`--bind 0.0.0.0:7777`).
+> **Port : UDP 443.** C'est le port de HTTP/3 : il passe sur la plupart des réseaux filtrés (Wi-Fi
+> public, entreprise). Aucun droit administrateur n'est nécessaire sous Windows. Seul UDP 443 est
+> utilisé (un autre appareil en TCP 443 sur la box ne gêne pas) et ce port n'a aucun impact sur la
+> fluidité. Les installations qui utilisaient 7777 sont migrées automatiquement vers 443 (host et
+> hosts mémorisés du client). Si l'ancienne redirection manuelle UDP 7777 existe sur la box, elle
+> peut être supprimée. Si le port 443 est déjà pris sur le PC host, le host l'explique au démarrage.
 
 Options utiles de `run` :
 
@@ -160,8 +158,8 @@ et une mauvaise adresse ne peut pas usurper le host (seul le vrai host sait rép
 ```powershell
 .\grx-client.exe hosts                                   # liste (avec toutes les adresses)
 .\grx-client.exe hosts edit pc-ludo --addr 192.168.1.20:443 --addr monpc.duckdns.org:443
-.\grx-client.exe hosts add-addr pc-ludo monpc.duckdns.org:7777          # à la fin (--first : en tête)
-.\grx-client.exe hosts remove-addr pc-ludo monpc.duckdns.org:7777
+.\grx-client.exe hosts add-addr pc-ludo monpc.duckdns.org:443           # à la fin (--first : en tête)
+.\grx-client.exe hosts remove-addr pc-ludo monpc.duckdns.org:443
 .\grx-client.exe hosts rename pc-ludo salon
 .\grx-client.exe play pc-ludo --addr 10.0.0.5:443        # force une adresse, pour cette fois
 ```
@@ -298,8 +296,8 @@ Le PC de développement n'a qu'un GPU NVIDIA : les voies **Intel/AMD** sont simu
 
 | Problème | Solution |
 |---|---|
-| Le client affiche « aucune réponse » | Le host n'est pas lancé, l'adresse est fausse (ancien port 7777 ? ajoutez la nouvelle adresse : « Modifier… »), le lien a déjà servi, ou le client a été révoqué (le host ne répond jamais aux inconnus). Créez une nouvelle invitation. |
-| Le host refuse de démarrer : « port UDP 443 déjà utilisé ou réservé » | Un autre programme (ou une plage réservée par Windows/Hyper-V) occupe ce port : choisissez-en un autre (`--bind 0.0.0.0:7777`, ou bouton **Port 7777** dans grx-gui) et régénérez les invitations. |
+| Le client affiche « aucune réponse » | Le host n'est pas lancé, l'adresse est fausse (corrigez-la : « Modifier… »), le lien a déjà servi, ou le client a été révoqué (le host ne répond jamais aux inconnus). Créez une nouvelle invitation. |
+| Le host refuse de démarrer : « port UDP 443 déjà utilisé ou réservé » | Un autre programme (ou une plage réservée par Windows/Hyper-V) occupe ce port : libérez-le, ou choisissez-en un autre (`--bind 0.0.0.0:<port>`, champ « Écoute » dans grx-gui) et régénérez les invitations. |
 | « Demander l'accès » : le host ne répond pas | Les demandes sont fermées sur le host (carte **Demandes d'accès** → Ouvrir), ou mauvaise adresse/port, ou redirection de box absente. |
 | Le statut UPnP du host est en échec | Vérifiez que l'UPnP est activé dans l'interface de la box. Sinon, créez une redirection manuelle UDP 443 (le port d'écoute) vers l'IP locale du PC host. |
 | Ça marche en local mais pas depuis Internet | Pare-feu : `grx-host.exe firewall-help`. Vérifiez que le réseau Windows est en **Privé**. |

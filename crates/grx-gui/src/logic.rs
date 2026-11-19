@@ -11,9 +11,7 @@ use grx_core::{Error as CoreError, Invite};
 use serde::{Deserialize, Serialize};
 
 /// Port UDP par défaut du host (celui de HTTP/3 : souvent ouvert sur les réseaux filtrés).
-pub const DEFAULT_PORT: u16 = 443;
-/// Ancien port par défaut (≤ 0.2.3), proposé en raccourci.
-pub const LEGACY_PORT: u16 = 7777;
+pub const DEFAULT_PORT: u16 = grx_core::oldport::DEFAULT_PORT;
 pub const MAX_NAME_LEN: usize = 40;
 
 // ---------------------------------------------------------------------------------------------

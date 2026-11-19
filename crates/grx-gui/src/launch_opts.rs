@@ -267,6 +267,24 @@ impl Default for HostRunOptions {
 }
 
 impl HostRunOptions {
+    /// Migration de l'ancien port par défaut (≤ 0.2.3) : écoute en `:7777` → `:443` (IP gardée),
+    /// port externe 7777 → 0 (= même port que l'écoute). `true` si une valeur a changé (écrite au
+    /// prochain enregistrement des réglages).
+    pub fn migrate_old_port(&mut self) -> bool {
+        use grx_core::oldport::OLD_PORT_MIGRATED;
+        let mut changed = false;
+        let port = self.bind.trim().rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok());
+        if port == Some(OLD_PORT_MIGRATED) {
+            self.bind = crate::logic::rebind_port(&self.bind, DEFAULT_PORT);
+            changed = true;
+        }
+        if self.external_port == OLD_PORT_MIGRATED {
+            self.external_port = 0;
+            changed = true;
+        }
+        changed
+    }
+
     /// Valide les options et renvoie l'adresse d'écoute si elle est correcte.
     pub fn validate(&self) -> Result<std::net::SocketAddr, String> {
         let addr = self
@@ -874,6 +892,24 @@ mod tests {
         assert!(o.validate().is_err());
         let o = HostRunOptions { display: 17, ..Default::default() };
         assert!(o.validate().is_err());
+    }
+
+    #[test]
+    fn old_port_migrates_to_443() {
+        let mut o = HostRunOptions { bind: " [::]:7777 ".into(), external_port: 7777, ..Default::default() };
+        assert!(o.migrate_old_port());
+        assert_eq!((o.bind.as_str(), o.external_port), ("[::]:443", 0));
+        assert!(!o.migrate_old_port(), "idempotent");
+        let mut o = HostRunOptions { bind: "192.168.1.20:7777".into(), ..Default::default() };
+        assert!(o.migrate_old_port());
+        assert_eq!(o.bind, "192.168.1.20:443");
+        // Autres ports (écoute ou externe) : inchangés.
+        let mut o = HostRunOptions { bind: "0.0.0.0:9000".into(), external_port: 7790, ..Default::default() };
+        assert!(!o.migrate_old_port());
+        assert_eq!((o.bind.as_str(), o.external_port), ("0.0.0.0:9000", 7790));
+        let mut o = HostRunOptions { bind: "0.0.0.0:17777".into(), ..Default::default() };
+        assert!(!o.migrate_old_port());
+        assert!(!HostRunOptions::default().migrate_old_port());
     }
 
     #[test]

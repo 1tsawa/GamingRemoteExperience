@@ -474,9 +474,13 @@ mod tests {
     fn task_options_roundtrip_on_disk() {
         let tmp = std::env::temp_dir().join(format!("grx-opt-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let args = vec!["--bind".to_string(), "0.0.0.0:7777".into(), "--fps".into(), "60".into(), "--fill".into()];
+        let args = vec!["--bind".to_string(), "0.0.0.0:9000".into(), "--fps".into(), "60".into(), "--fill".into()];
         write_task_options(&tmp, &args).unwrap();
         assert_eq!(read_task_options(&tmp).unwrap(), args);
+        // host-options.json d'une ancienne version (port 7777) : migré vers 443 à la lecture.
+        let old = vec!["--bind".to_string(), "0.0.0.0:7777".into(), "--external-port".into(), "7777".into(), "--fill".into()];
+        write_task_options(&tmp, &old).unwrap();
+        assert_eq!(read_task_options(&tmp).unwrap(), vec!["--bind".to_string(), "0.0.0.0:443".into(), "--fill".into()]);
         // Option interdite refusée à l'écriture.
         assert!(write_task_options(&tmp, &["--data-dir".to_string(), "x".into()]).is_err());
         let _ = std::fs::remove_dir_all(&tmp);

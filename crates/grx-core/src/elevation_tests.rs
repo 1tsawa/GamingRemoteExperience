@@ -84,9 +84,19 @@ fn test_validate_run_args_refuses_too_many_args() {
 
 #[test]
 fn test_task_options_parse_valid_json() {
-    let json = r#"{"args": ["--bind", "0.0.0.0:7777"]}"#;
+    let json = r#"{"args": ["--bind", "0.0.0.0:9000"]}"#;
     let opts = TaskOptions::parse(json.as_bytes()).unwrap();
-    assert_eq!(opts.args, vec!["--bind".to_string(), "0.0.0.0:7777".to_string()]);
+    assert_eq!(opts.args, vec!["--bind".to_string(), "0.0.0.0:9000".to_string()]);
+}
+
+#[test]
+fn test_task_options_parse_migrates_old_port() {
+    let json = r#"{"args": ["--bind", "[::]:7777", "--external-port", "7777", "--fps", "60"]}"#;
+    let opts = TaskOptions::parse(json.as_bytes()).unwrap();
+    assert_eq!(opts.args, vec!["--bind".to_string(), "[::]:443".into(), "--fps".into(), "60".into()]);
+    // Port externe choisi (≠ 7777) : conservé.
+    let opts = TaskOptions::parse(br#"{"args": ["--external-port", "7790"]}"#).unwrap();
+    assert_eq!(opts.args, vec!["--external-port".to_string(), "7790".into()]);
 }
 
 #[test]
